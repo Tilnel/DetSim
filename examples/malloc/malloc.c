@@ -1,15 +1,16 @@
 #include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include <stdlib.h>
 
-void *ptr[16];
+int cnt = 0;
 int main() {
   setbuf(stdout, NULL);
-  for (int i = 0; i < 20; i++) {
-    ptr[i] = malloc(1 << i);
-    printf("hello");
-  }
-  for (int i = 0; i < 20; i++) {
-    free(ptr[i]);
-    printf("hello");
+  while (1) {
+    void *ptr = malloc(rand() & 0xfffff);
+    write(1, "Hello\n", 6);
+    free(ptr);
+    write(1, "Hello\n", 6);
+    cnt++;
   }
 }

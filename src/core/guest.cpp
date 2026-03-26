@@ -11,11 +11,8 @@
  */
 
 #include "guest.h"
-#include "common.h"
-#include "debug.h"
-#include "emu.h"
 #include "monitor.h"
-#include "utils.h"
+#include "dwarf_info.h"
 #include <cstdint>
 #include <fcntl.h>
 #include <fmt/format.h>
@@ -31,8 +28,12 @@
 #include <sys/syscall.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#include <elf.h>
 #include <unistd.h>
 #include <vector>
+
+const uintptr_t scratch_page = 0x0000600000000000;
+const uintptr_t syscall_instr = 0x0000600000000ff0;
 
 /* ======================================================================
  * Section 1: Backtrace (Local Unwinding)
@@ -54,13 +55,13 @@ __attribute__((unused)) void print_call_stack()
     unw_get_reg(&cursor, UNW_REG_IP, &pc);
     if (pc == 0)
       break;
-    printf("0x%lx:", pc);
+    detsim::ui::ui_printf("0x%lx:", pc);
 
     char sym[256];
     if (unw_get_proc_name(&cursor, sym, sizeof(sym), &offset) == 0)
-      printf(" (%s+0x%lx)\n", sym, offset);
+      detsim::ui::ui_printf(" (%s+0x%lx)\n", sym, offset);
     else
-      printf(" -- error: unable to obtain symbol name for this frame\n");
+      detsim::ui::ui_printf(" -- error: unable to obtain symbol name for this frame\n");
   }
 }
 
@@ -98,6 +99,8 @@ def_tracee_get(rsp);
 #define AT_NULL 0
 #define AT_IGNORE 1
 #define AT_SYSINFO_EHDR 33
+#define DETERMINISTIC_RANDOM_0 0xdeadbeefcafebabeULL
+#define DETERMINISTIC_RANDOM_1 0x1122334455667788ULL
 
 void remove_vdso(int pid)
 {
@@ -161,6 +164,96 @@ void remove_vdso(int pid)
       return;
     }
   }
+}
+
+/* 
+ * 定位栈上的 AT_RANDOM
+ * 
+ * execve 后的栈布局（从高地址到低地址）：
+ *   argv[n] = NULL
+ *   argv[n-1] ... argv[0]
+ *   envp[...] ... envp[0] = NULL
+ *   auxv[...] (AT_NULL terminated)
+ *   
+ * auxv 格式：{a_type, a_val} 的数组
+ * AT_RANDOM (25) 的 a_val 指向 16 字节随机数据
+ */
+int patch_at_random(pid_t pid) {
+    struct user_regs_struct regs;
+    
+    if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) < 0) {
+        perror("PTRACE_GETREGS");
+        return -1;
+    }
+    
+    /* x86_64: rsp 指向 argc（如果直接 execve）或返回地址（如果通过 libc） */
+    unsigned long stack_top = regs.rsp;
+    LOG_INFO("[*] Stack top (RSP): 0x%lx", stack_top);
+    
+    /* 
+     * 扫描栈找到 auxv 向量
+     * 策略：从 stack_top 向下扫描，寻找 AT_RANDOM (25) 的 a_type
+     * 或者通过 /proc/pid/auxv 直接读取（更简单可靠）
+     */
+    
+    char auxv_path[64];
+    snprintf(auxv_path, sizeof(auxv_path), "/proc/%d/auxv", pid);
+    
+    FILE *f = fopen(auxv_path, "rb");
+    if (!f) {
+        perror("fopen auxv");
+        return -1;
+    }
+    
+    Elf64_auxv_t auxv;
+    unsigned long random_addr = 0;
+    
+    LOG_INFO("[*] Reading auxv from %s", auxv_path);
+    while (fread(&auxv, sizeof(auxv), 1, f) == 1) {
+        if (auxv.a_type == AT_RANDOM) {
+            random_addr = auxv.a_un.a_val;
+            LOG_INFO("[+] Found AT_RANDOM: addr = 0x%lx", random_addr);
+            break;
+        }
+        if (auxv.a_type == AT_NULL) break;
+    }
+    fclose(f);
+    
+    if (!random_addr) {
+        LOG_ERROR("[-] AT_RANDOM not found in auxv");
+        return -1;
+    }
+    
+    /* 读取原始随机值 */
+    unsigned long orig[2];
+    tracee_read_mem(pid, (void *)random_addr, orig, 16);
+    LOG_INFO("[*] Original AT_RANDOM: 0x%016lx%016lx", orig[0], orig[1]);
+    
+    /* 写入确定性随机值 */
+    unsigned long newval[2] = { DETERMINISTIC_RANDOM_0, DETERMINISTIC_RANDOM_1 };
+    
+    tracee_write_mem(pid, (void *)random_addr, newval, 16);
+    
+    return 0;
+}
+
+void patch_cpu_features_elf(pid_t pid) {
+    unsigned long addr = dwarf_get_global_addr("_dl_x86_cpu_features");
+    if (!addr) {
+      LOG_ERROR("[-] Symbol not found");
+      return;
+    }
+    
+    LOG_INFO("[+] _dl_x86_cpu_features at 0x%lx", addr);
+    
+    unsigned long target = addr + 24;
+    unsigned long current = ptrace(PTRACE_PEEKDATA, pid, target, NULL);
+    
+    unsigned long fixed = (current & ~0x00000000FF000000UL) | 0x0000000000000000UL;
+    
+    ptrace(PTRACE_POKEDATA, pid, target, fixed);
+    
+    LOG_INFO("[+] Patched 0x%lx: 0x%lx -> 0x%lx", target, current, fixed);
 }
 
 /* ======================================================================
@@ -254,12 +347,12 @@ void log_regs(struct user_regs_struct *regs)
 
 void show_regs(struct user_regs_struct *regs)
 {
-  printf("rax = %016llx rbx = %016llx rcx = %016llx rdx = %016llx\n"
+  detsim::ui::ui_printf("rax = %016llx rbx = %016llx rcx = %016llx rdx = %016llx\n"
          "rsp = %016llx rbp = %016llx rdi = %016llx rsi = %016llx\n"
          "r8  = %016llx r9  = %016llx r10 = %016llx rip = %016llx\n",
          regs->rax, regs->rbx, regs->rcx, regs->rdx, regs->rsp, regs->rbp,
          regs->rdi, regs->rsi, regs->r8, regs->r9, regs->r10, regs->rip);
-  printf("orig_rax = %016llx\n", regs->orig_rax);
+  detsim::ui::ui_printf("orig_rax = %016llx\n", regs->orig_rax);
 }
 
 /* ======================================================================
@@ -267,14 +360,14 @@ void show_regs(struct user_regs_struct *regs)
  * ====================================================================== */
 
 #define PTRACE_TRAP_SIG (SIGTRAP | 0x80)
-uint64_t tracee_do_syscall(int pid, int SYS_which, uint64_t rdi, uint64_t rsi,
+uint64_t tracee_do_syscall_in_place(int pid, int SYS_which, uint64_t rdi, uint64_t rsi,
                            uint64_t rdx, uint64_t r10, uint64_t r8, uint64_t r9)
 {
   /* after last syscall exits */
   /* I don't care */
   /* scanf("%*c"); */
 
-  /* printf("%d\n", pid); */
+  /* detsim::ui::ui_printf("%d\n", pid); */
   struct user_regs_struct restore;
   struct user_regs_struct syscall_regs;
 
@@ -282,6 +375,66 @@ uint64_t tracee_do_syscall(int pid, int SYS_which, uint64_t rdi, uint64_t rsi,
   syscall_regs = restore;
 
   syscall_regs.rip -= 2;
+  LOG_TRACE("rip syscall enter: %p", (void *)syscall_regs.rip);
+  syscall_regs.orig_rax = SYS_which;
+  syscall_regs.rax = SYS_which;
+  syscall_regs.rdi = rdi;
+  syscall_regs.rsi = rsi;
+  syscall_regs.rdx = rdx;
+  syscall_regs.r10 = r10;
+  syscall_regs.r8 = r8;
+  syscall_regs.r9 = r9;
+  ptrace_right(PTRACE_SETREGS, pid, NULL, &syscall_regs);
+
+  int wstatus = 0;
+  ptrace_right(PTRACE_SYSCALL, pid, NULL, NULL);
+  waitpid(pid, &wstatus, 0);
+  if (WIFSTOPPED(wstatus) && (WSTOPSIG(wstatus) != PTRACE_TRAP_SIG))
+  {
+    LOG_INFO(
+        "ptrace_syscall has wrong stop status. WIFSTOPPED=%s and WSTOPSIG=%s.",
+        WIFSTOPPED(wstatus) ? "true" : "false", strsignal(WSTOPSIG(wstatus)));
+
+    ptrace_right(PTRACE_SYSCALL, pid, NULL, NULL);
+    waitpid(pid, &wstatus, 0);
+    assert(WIFSTOPPED(wstatus) && (WSTOPSIG(wstatus) == PTRACE_TRAP_SIG));
+  }
+
+  /* before syscall enter */
+  /* syscall modified already */
+  LOG_TRACE("To do syscall:");
+  log_regs(&syscall_regs);
+
+  /* push syscall to exit */
+  ptrace_right(PTRACE_SYSCALL, pid, NULL, NULL);
+  waitpid(pid, &wstatus, 0);
+  assert(WIFSTOPPED(wstatus) && WSTOPSIG(wstatus) == PTRACE_TRAP_SIG);
+
+  ptrace_right(PTRACE_GETREGS, pid, NULL, &syscall_regs);
+  LOG_TRACE("Syscall returns %p", (void *)syscall_regs.rax);
+  LOG_TRACE("rip syscall return: %p", (void *)syscall_regs.rip);
+
+  /* restore for another syscall */
+  ptrace_right(PTRACE_SETREGS, pid, NULL, &restore);
+  /* it may stop */
+
+  return syscall_regs.rax;
+}
+uint64_t tracee_do_syscall(int pid, int SYS_which, uint64_t rdi, uint64_t rsi,
+                           uint64_t rdx, uint64_t r10, uint64_t r8, uint64_t r9)
+{
+  /* after last syscall exits */
+  /* I don't care */
+  /* scanf("%*c"); */
+
+  /* detsim::ui::ui_printf("%d\n", pid); */
+  struct user_regs_struct restore;
+  struct user_regs_struct syscall_regs;
+
+  ptrace_right(PTRACE_GETREGS, pid, NULL, &restore);
+  syscall_regs = restore;
+
+  syscall_regs.rip = syscall_instr;
   LOG_TRACE("rip syscall enter: %p", (void *)syscall_regs.rip);
   syscall_regs.orig_rax = SYS_which;
   syscall_regs.rax = SYS_which;
@@ -337,12 +490,27 @@ void tracee_do_munmap(int pid, uint64_t start, uint64_t end)
   tracee_do_syscall(pid, SYS_munmap, start, end - start, 0, 0, 0, 0);
 }
 
-void *tracee_do_mmap(int pid, uint64_t start, uint64_t end)
+void *tracee_do_mmap(int pid, uint64_t start, uint64_t end, int prot)
 {
   void *ret = (void *)tracee_do_syscall(pid, SYS_mmap, start, end - start,
-                                        PROT_EXEC | PROT_READ | PROT_WRITE,
-                                        MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-  assert(ret != MAP_FAILED);
+                                        prot,
+                                        MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, -1, 0);
+  if (ret == MAP_FAILED) {
+    LOG_ERROR("mmap failed for %p-%p (prot=%x): %s", 
+              (void*)start, (void*)end, prot, strerror(errno));
+  }
+  return ret;
+}
+
+void *tracee_do_mmap_in_place(int pid, uint64_t start, uint64_t end, int prot)
+{
+  void *ret = (void *)tracee_do_syscall_in_place(pid, SYS_mmap, start, end - start,
+                                        prot,
+                                        MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, -1, 0);
+  if (ret == MAP_FAILED) {
+    LOG_ERROR("mmap failed for %p-%p (prot=%x): %s", 
+              (void*)start, (void*)end, prot, strerror(errno));
+  }
   return ret;
 }
 
@@ -399,7 +567,7 @@ void tracee_backtrace(int pid)
 
   do
   {
-    printf("#%d ", frame++);
+    detsim::ui::ui_printf("#%d ", frame++);
     unw_word_t rip, rsp;
     char func[256];
     unw_get_reg(&cursor, UNW_REG_IP, &rip);
@@ -407,11 +575,11 @@ void tracee_backtrace(int pid)
 
     if (unw_get_proc_name(&cursor, func, sizeof(func), NULL) == 0)
     {
-      printf("0x%lx in %s()", (uintptr_t)rip, func);
+      detsim::ui::ui_printf("0x%lx in %s()", (uintptr_t)rip, func);
       resolve_rip_func(ptmc_state.tracee[ptmc_state.cursor].executable, rip);
     }
     else
-      printf("0x%lx in ??\n", (uintptr_t)rip);
+      detsim::ui::ui_printf("0x%lx in ??\n", (uintptr_t)rip);
 
   } while (unw_step(&cursor) > 0);
   _UPT_destroy(ui);
@@ -422,12 +590,10 @@ void tracee_backtrace(int pid)
  * Section 10: Temporary Memory Page
  * ====================================================================== */
 
-const uintptr_t available_memory = 0x0000600000000000;
-
 /* Only once for each process */
 void tracee_reserve_temp_page(int pid)
 {
-  tracee_do_mmap(pid, available_memory, available_memory + PAGE_SIZE);
+  tracee_do_mmap_in_place(pid, scratch_page, scratch_page + PAGE_SIZE);
 }
 
 int tracee_do_open(int pid, const char *filename, uint64_t flags)
@@ -435,10 +601,10 @@ int tracee_do_open(int pid, const char *filename, uint64_t flags)
   /* need tracee memory to place filename */
   /* mappings has been restored */
   /* LOG_TRACE("open filename, flags = %s, %o", filename, flags); */
-  assert(available_memory);
-  tracee_write_mem(pid, (void *)available_memory, filename,
+  assert(scratch_page);
+  tracee_write_mem(pid, (void *)scratch_page, filename,
                    strlen(filename) + 1);
-  return tracee_do_syscall(pid, SYS_open, (uint64_t)available_memory, flags, 0,
+  return tracee_do_syscall(pid, SYS_open, (uint64_t)scratch_page, flags, 0,
                            0, 0, 0);
 }
 

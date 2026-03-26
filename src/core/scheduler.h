@@ -41,7 +41,13 @@ int exec_store(void);
 int load_exec_store(void);
 
 /* Continue execution in auto mode */
-int exec_cont(void);
+int exec_bfs(void);
+
+/* Perform depth-first search from current state */
+int exec_dfs(int depth);
+
+/* Perform random search from current state */
+int exec_rand(int depth);
 
 /* Load a saved state by hash */
 void load(hash_type hash);

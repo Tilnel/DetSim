@@ -27,16 +27,16 @@ extern "C"
     if (raft.state == RAFT_STATE_LEADER)
     {
       if (choice == 0)
-        *tv_out = tv_addmsec(tv, raft.request_timeout + 1);
+        *tv_out = tv;
       else
-        *tv_out = tv_addmsec(tv, raft.request_timeout - 1);
+        *tv_out = tv_addmsec(tv, raft.request_timeout + 1);
     }
     else
     {
       if (choice == 0)
-        *tv_out = tv_addmsec(tv, raft.election_timeout_rand + 1);
+        *tv_out = tv;
       else
-        *tv_out = tv_addmsec(tv, raft.election_timeout_rand - 1);
+        *tv_out = tv_addmsec(tv, raft.election_timeout_rand + 1);
     }
 
     choose_out *out = new choose_out();

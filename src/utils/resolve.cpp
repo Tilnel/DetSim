@@ -1,3 +1,4 @@
+#include "log_wrapper.h"
 #include <dwarf.h>
 #include <elfutils/libdwfl.h>
 #include <stdio.h>
@@ -32,7 +33,7 @@ int resolve_rip_func(const char *exefile, uintptr_t rip)
   Dwfl_Module *mod = dwfl_addrmodule(dwfl, addr);
   if (!mod)
   {
-    printf("\n");
+    detsim::ui::ui_printf("\n");
     dwfl_end(dwfl);
     return 1;
   }
@@ -41,7 +42,7 @@ int resolve_rip_func(const char *exefile, uintptr_t rip)
   const char *funcname = NULL;
   funcname = dwfl_module_addrname(mod, addr);
   if (funcname)
-    printf("%s", funcname);
+    detsim::ui::ui_printf("%s", funcname);
     */
 
   Dwfl_Line *line = dwfl_module_getsrc(mod, addr);
@@ -51,11 +52,11 @@ int resolve_rip_func(const char *exefile, uintptr_t rip)
     int lineno, col;
     file = dwfl_lineinfo(line, &addr, &lineno, &col, NULL, NULL);
     if (file)
-      printf(" :%s:%d\n", file, lineno);
+      detsim::ui::ui_printf(" :%s:%d\n", file, lineno);
   }
   else
   {
-    printf("\n");
+    detsim::ui::ui_printf("\n");
   }
 
   dwfl_end(dwfl);

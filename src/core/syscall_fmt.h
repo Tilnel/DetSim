@@ -14,7 +14,7 @@ struct syscall_info;
 namespace syscall_fmt {
 
 /* Main formatting function - formats a syscall into a human-readable string */
-void format(char *buf, tracee_state *t, syscall_info *info);
+void format(char *buf, int pid, hash_type ts_hash);
 
 } /* namespace syscall_fmt */
 

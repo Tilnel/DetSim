@@ -1,44 +1,42 @@
 /*
- * config.cpp - Configuration parsing implementation
+ * config.cpp - Configuration parsing implementation using modern C++
+ * (nlohmann/json)
  */
 
 #include "config.h"
 #include "common.h"
 #include "debug.h"
-#include "monitor.h"
+#include "emu.h"
 #include "fsstate.h"
 #include "guest.h"
-#include "emu.h"
+#include "monitor.h"
 #include "state_store.h"
-#include <cjson/cJSON.h>
-#include <cjson/cJSON_Utils.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
 #include <dlfcn.h>
-#include <wait.h>
-#include <assert.h>
+#include <filesystem>
+#include <fstream>
 #include <getopt.h>
-#include <vector>
+#include <iostream>
 #include <libgen.h>
 #include <limits.h>
+#include <nlohmann/json.hpp>
+#include <wait.h>
+
+namespace fs = std::filesystem;
+using json = nlohmann::json;
 
 char *cfg_file = (char *)"config.json";
 char *log_file = NULL;
 int loglevel = 0;
 FILE *log_fp = NULL;
+int auto_mode = 0;
+int use_ui = 1; // Default to using UI
+char *batch_file = NULL;
 
-bool should_log(int level)
-{
-  if (level >= loglevel)
-    return true;
-  return false;
-}
+bool should_log(int level) { return level >= loglevel; }
 
 void init_log(const char *log_file)
 {
-  if (log_file == NULL)
+  if (log_file == nullptr)
   {
     log_fp = stdout;
     return;
@@ -47,212 +45,219 @@ void init_log(const char *log_file)
   Assert(log_fp, "Can not open '%s'", log_file);
 }
 
-static char cfg_str[4096];
-
 /* Get absolute path relative to config file directory */
-static std::string resolve_path(const char *path, const char *cfg_dir)
+static std::string resolve_path(const std::string &path,
+                                const fs::path &cfg_dir)
 {
-  if (!path || path[0] == '/') {
-    // Absolute path or empty
-    return std::string(path ? path : "");
+  if (path.empty() || path[0] == '/')
+  {
+    return path;
   }
-  
-  // Relative path: prepend config file directory
-  if (cfg_dir && strlen(cfg_dir) > 0) {
-    return std::string(cfg_dir) + "/" + path;
-  }
-  return std::string(path);
+  return (cfg_dir / path).string();
 }
 
-void read_config(const char *cfg_file)
+/* Load JSON config file */
+static json load_json_file(const char *cfg_file)
 {
-  assert(cfg_file);
-  
-  /* Get the directory of the config file */
-  char cfg_file_copy[PATH_MAX];
-  strncpy(cfg_file_copy, cfg_file, PATH_MAX - 1);
-  cfg_file_copy[PATH_MAX - 1] = '\0';
-  char *cfg_dir = dirname(cfg_file_copy);
-  
-  FILE *cfg_fp = fopen(cfg_file, "r");
-  Assert(cfg_fp, "Can not open '%s'", cfg_file);
+  std::ifstream f(cfg_file);
+  Assert(f.good(), "Cannot open config file: %s", cfg_file);
 
-  size_t nread = fread(cfg_str, 1, sizeof(cfg_str) - 1, cfg_fp);
-  cfg_str[nread] = '\0';  /* Ensure null termination */
-  fclose(cfg_fp);
-  cJSON *cfg = cJSON_Parse(cfg_str);
-  cJSON *Loglevel = cJSON_GetObjectItem(cfg, "Loglevel");
-  loglevel = cJSON_GetNumberValue(Loglevel);
+  try
+  {
+    json cfg;
+    f >> cfg;
+    return cfg;
+  }
+  catch (const json::exception &e)
+  {
+    panic("JSON parse error in %s: %s", cfg_file, e.what());
+    return {}; // unreachable
+  }
+}
 
-  cJSON *Nodes = cJSON_GetObjectItem(cfg, "Nodes");
-  int nodes = cJSON_GetNumberValue(Nodes);
+/* Parse tracee configuration */
+static void parse_tracees(const json &cfg, const fs::path &cfg_dir)
+{
+  auto tracees = cfg.value("Tracee", json::array());
+  int nodes = cfg.value("Nodes", 0);
+
   Assert(nodes == NP,
-         "Build don't support %d processes, please compile with 'NP=%d' and "
+         "Build doesn't support %d processes, please compile with 'NP=%d' and "
          "rebuild",
          nodes, nodes);
-  cJSON *tracee = cJSON_GetObjectItem(cfg, "Tracee");
+
+  Assert(static_cast<int>(tracees.size()) >= nodes,
+         "Tracee array size (%zu) less than Nodes (%d)", tracees.size(), nodes);
 
   for (int i = 0; i < nodes; i++)
   {
-    cJSON *argv = cJSON_GetArrayItem(tracee, i);
-    int argc = cJSON_GetArraySize(argv);
-    Assert(argc <= 5, "More than 5 arguments is not supported");
+    auto argv_json = tracees[i];
+    Assert(argv_json.is_array() && argv_json.size() <= 5,
+           "Tracee %d: invalid arguments (max 5 supported)", i);
 
-    ptmc_state.tracee[i].argc = argc;
-    for (int j = 0; j < argc; j++)
+    ptmc_state.tracee[i].argc = static_cast<int>(argv_json.size());
+
+    for (size_t j = 0; j < argv_json.size(); j++)
     {
-      cJSON *arg = cJSON_GetArrayItem(argv, j);
-      std::string arg_str = cJSON_GetStringValue(arg);
-      
+      std::string arg_str = argv_json[j].get<std::string>();
+
       // First argument (executable) is resolved relative to config dir
-      if (j == 0) {
-        arg_str = resolve_path(arg_str.c_str(), cfg_dir);
+      if (j == 0)
+      {
+        arg_str = resolve_path(arg_str, cfg_dir);
       }
-      
+
       // Store the string persistently
-      char *stored = (char *)malloc(arg_str.length() + 1);
+      char *stored = static_cast<char *>(malloc(arg_str.length() + 1));
       strcpy(stored, arg_str.c_str());
       ptmc_state.tracee[i].argv[j] = stored;
     }
+
     ptmc_state.tracee[i].executable = ptmc_state.tracee[i].argv[0];
-    ptmc_state.tracee[i].argv[argc] = NULL;
+    ptmc_state.tracee[i].argv[ptmc_state.tracee[i].argc] = nullptr;
   }
+}
 
-  cJSON *addrs = cJSON_GetObjectItem(cfg, "Addr");
-  if (addrs)
+/* Parse network addresses */
+static void parse_addrs(const json &cfg)
+{
+  auto addrs = cfg.value("Addr", json::array());
+  if (addrs.empty())
+    return;
+
+  Assert(static_cast<int>(addrs.size()) == NP,
+         "Addr array size (%zu) doesn't match NP (%d)", addrs.size(), NP);
+
+  for (int i = 0; i < NP; i++)
   {
-    int addrs_cnt = cJSON_GetArraySize(addrs);
-    assert(addrs_cnt == NP);
-    for (int j = 0; j < addrs_cnt; j++)
-    {
-      cJSON *addr = cJSON_GetArrayItem(addrs, j);
-      ptmc_state.addrs[j] = std::string(cJSON_GetStringValue(addr));
-    }
+    ptmc_state.addrs[i] = addrs[i].get<std::string>();
   }
+}
 
-  cJSON *shared_files = cJSON_GetObjectItem(cfg, "SharedFiles");
-  if (shared_files)
+/* Parse filesystem mappings */
+static void parse_fsmap(const json &cfg, const fs::path &cfg_dir)
+{
+  std::string workdir = cfg.value("WorkingDir", "/");
+  auto fsmap = cfg.value("FSMap", json::array());
+
+  std::vector<std::pair<std::string, std::string>> mappings;
+  for (const auto &item : fsmap)
   {
-    int shared_files_cnt = cJSON_GetArraySize(shared_files);
-    for (int j = 0; j < shared_files_cnt; j++)
+    if (item.contains("Host") && item.contains("Target"))
     {
-      cJSON *shared_file = cJSON_GetArrayItem(shared_files, j);
-      ptmc_state.shared_files.emplace(
-          std::string(cJSON_GetStringValue(shared_file)));
+      std::string host_path =
+          resolve_path(item["Host"].get<std::string>(), cfg_dir);
+      std::string target_path = item["Target"].get<std::string>();
+      mappings.emplace_back(host_path, target_path);
     }
   }
 
-  /* Working directory for tracees */
-  cJSON *working_dir = cJSON_GetObjectItem(cfg, "WorkingDir");
-  std::string workdir = "/";
-  if (working_dir) {
-    workdir = std::string(cJSON_GetStringValue(working_dir));
-  }
-
-  /* FSMap: array of mappings { "Host": "/path/on/host", "Target": "/" } */
-  cJSON *fsmap = cJSON_GetObjectItem(cfg, "FSMap");
-  std::vector<std::pair<std::string, std::string>> maps;
-  if (fsmap) {
-    int cnt = cJSON_GetArraySize(fsmap);
-    for (int i = 0; i < cnt; i++) {
-      cJSON *item = cJSON_GetArrayItem(fsmap, i);
-      cJSON *host = cJSON_GetObjectItem(item, "Host");
-      cJSON *target = cJSON_GetObjectItem(item, "Target");
-      if (host && target) {
-        std::string host_path = resolve_path(cJSON_GetStringValue(host), cfg_dir);
-        maps.emplace_back(host_path, std::string(cJSON_GetStringValue(target)));
-      }
-    }
-  }
-
-  /* Initialize per-node fs state from mappings and set working dir */
-  for (int i = 0; i < NP; i++) {
-    if (!maps.empty()) {
-      ptmc_state.fs_states[i].init_from_mappings(maps);
+  // Initialize per-node filesystem state
+  for (int i = 0; i < NP; i++)
+  {
+    if (!mappings.empty())
+    {
+      ptmc_state.fs_states[i].init_from_mappings(mappings);
     }
     ptmc_state.fs_states[i].set_cwd(workdir);
   }
+}
 
-  cJSON *assertions = cJSON_GetObjectItem(cfg, "Assertions");
-  if (assertions)
+/* Parse assertions */
+static void parse_assertions(const json &cfg)
+{
+  auto assertions = cfg.value("Assertions", json::array());
+  LOG_DEBUG("Loading %zu assertions", assertions.size());
+
+  for (const auto &assertion : assertions)
   {
-    int assertions_cnt = cJSON_GetArraySize(assertions);
-    LOG_DEBUG("Loading %d assertions", assertions_cnt);
-    for (int j = 0; j < assertions_cnt; j++)
+    std::string assert_str = assertion.get<std::string>();
+    LOG_DEBUG("  Assertion: %s", assert_str.c_str());
+    ptmc_state.assertions.emplace(assert_str);
+  }
+}
+
+/* Compile .cpp to .so if needed, return path to .so */
+static std::string compile_plugin_if_needed(const std::string &src_path,
+                                            const std::string &default_name)
+{
+  // If already a .so file, use it directly
+  if (src_path.size() > 3 && src_path.substr(src_path.size() - 3) == ".so")
+  {
+    LOG_INFO("Loading plugin %s", src_path.c_str());
+    return src_path;
+  }
+
+  // Compile .cpp to .so
+  fs::path src(src_path);
+  std::string obj_name = "./" + src.stem().string() + ".so";
+
+  LOG_INFO("Compiling %s -> %s", src_path.c_str(), obj_name.c_str());
+
+  if (access(obj_name.c_str(), R_OK | X_OK) != 0)
+  {
+    int pid = vfork();
+    if (pid == 0)
     {
-      cJSON *assertion = cJSON_GetArrayItem(assertions, j);
-      std::string assert_str = cJSON_GetStringValue(assertion);
-      LOG_DEBUG("  Assertion %d: %s", j, assert_str.c_str());
-      ptmc_state.assertions.emplace(assert_str);
+      char arg_d[16];
+      snprintf(arg_d, sizeof(arg_d), "-DNP=%d", NP);
+      execlp("g++", "g++", "-O2", arg_d, "-fpic", "-shared", "-I.", "-Isrc",
+             "-Isrc/core", "-Isrc/utils", "-Isrc/subsys", src_path.c_str(),
+             "-o", obj_name.c_str(), nullptr);
+      perror("exec");
+      _exit(1);
+    }
+    else
+    {
+      waitpid(pid, nullptr, 0);
     }
   }
 
-  cJSON *user_check = cJSON_GetObjectItem(cfg, "UserCheck");
-  if (user_check)
-  {
-    char *src = cJSON_GetStringValue(user_check);
-    std::string src_path = resolve_path(src, cfg_dir);
-    std::string obj_path;
-    
-    // If already a .so file, use it directly
-    if (src_path.length() > 3 && src_path.substr(src_path.length() - 3) == ".so") {
-      obj_path = src_path;
-      LOG_INFO("Loading user check plugin %s", obj_path.c_str());
-    } else {
-      // Compile .cpp to .so
-      std::string obj(src, strchr(src, '.'));
-      obj = "./" + obj + ".so";
-      LOG_INFO("Compiling user check sources %s to %s", src_path.c_str(), obj.c_str());
+  return obj_name;
+}
 
-      if (access(obj.c_str(), R_OK | X_OK))
-      {
-        int pid = vfork();
-        if (pid == 0)
-        {
-          char arg_d[10];
-          sprintf(arg_d, "-DNP=%d", NP);
-          execlp("g++", "g++", "-O2", arg_d, "-fpic", "-shared", 
-                 "-I.", "-Isrc", "-Isrc/core", "-Isrc/utils", "-Isrc/subsys",
-                 src_path.c_str(), "-o", obj.c_str(), NULL);
-          perror("exec");
-        }
-        else
-          waitpid(pid, 0, 0);
-      }
-      obj_path = obj;
-    }
-    
-    void *handle = dlopen(obj_path.c_str(), RTLD_LAZY | RTLD_LOCAL);
-    if (!handle)
-    {
-      panic("%s", dlerror());
-    }
-    int (*func)() = (int (*)())dlsym(handle, "check");
-    ptmc_state.user_checks.push_back(func);
-    LOG_INFO("Done");
+/* Parse and load user check plugin */
+static void parse_user_check(const json &cfg, const fs::path &cfg_dir)
+{
+  if (!cfg.contains("UserCheck"))
+    return;
+
+  std::string src = cfg["UserCheck"].get<std::string>();
+  std::string src_path = resolve_path(src, cfg_dir);
+  std::string obj_path = compile_plugin_if_needed(src_path, "check");
+
+  void *handle = dlopen(obj_path.c_str(), RTLD_LAZY | RTLD_LOCAL);
+  if (!handle)
+  {
+    panic("%s", dlerror());
   }
 
-  cJSON *choose_points = cJSON_GetObjectItem(cfg, "ChoosePoint");
-  if (choose_points)
+  auto *func = reinterpret_cast<int (*)()>(dlsym(handle, "check"));
+  ptmc_state.user_checks.push_back(func);
+  LOG_INFO("User check plugin loaded");
+}
+
+/* Parse choose points */
+static void parse_choose_points(const json &cfg)
+{
+  auto choose_points = cfg.value("ChoosePoint", json::array());
+
+  for (const auto &cp : choose_points)
   {
-    int choose_points_cnt = cJSON_GetArraySize(choose_points);
-    for (int j = 0; j < choose_points_cnt; j++)
+    int nr = -1;
+
+    if (cp.contains("syscall"))
     {
-      cJSON *choose_point = cJSON_GetArrayItem(choose_points, j);
-      cJSON *syscall_item = cJSON_GetObjectItem(choose_point, "syscall");
-      int nr = -1;
-      
-      if (cJSON_IsNumber(syscall_item))
+      if (cp["syscall"].is_number())
       {
-        nr = (int)cJSON_GetNumberValue(syscall_item);
+        nr = cp["syscall"].get<int>();
       }
-      else if (cJSON_IsString(syscall_item))
+      else if (cp["syscall"].is_string())
       {
-        /* Convert syscall name to number */
-        const char *syscall_name = cJSON_GetStringValue(syscall_item);
+        std::string syscall_name = cp["syscall"].get<std::string>();
         for (int i = 0; i < 450; i++)
         {
-          if (syscalls[i] && strcmp(syscalls[i], syscall_name) == 0)
+          if (syscalls[i] && strcmp(syscalls[i], syscall_name.c_str()) == 0)
           {
             nr = i;
             break;
@@ -260,135 +265,150 @@ void read_config(const char *cfg_file)
         }
         if (nr == -1)
         {
-          LOG_ERROR("Unknown syscall name: %s", syscall_name);
+          LOG_ERROR("Unknown syscall name: %s", syscall_name.c_str());
           continue;
         }
       }
-      else
-      {
-        LOG_ERROR("Invalid syscall type in ChoosePoint");
-        continue;
-      }
-      
-      int n_choose =
-          cJSON_GetNumberValue(cJSON_GetObjectItem(choose_point, "choose"));
-      choose_many[nr] = n_choose;
     }
-  }
 
-  cJSON *choose_function = cJSON_GetObjectItem(cfg, "ChooseFunc");
-  if (choose_function)
-  {
-    char *src = cJSON_GetStringValue(choose_function);
-    std::string src_path = resolve_path(src, cfg_dir);
-    std::string obj_path;
-    
-    // If already a .so file, use it directly
-    if (src_path.length() > 3 && src_path.substr(src_path.length() - 3) == ".so") {
-      obj_path = src_path;
-      LOG_INFO("Loading user choose plugin %s", obj_path.c_str());
-    } else {
-      // Compile .cpp to .so
-      std::string obj(src, strchr(src, '.'));
-      obj = "./" + obj + ".so";
-      LOG_INFO("Compiling user choose function sources %s to %s", src_path.c_str(), obj.c_str());
-
-      if (access(obj.c_str(), R_OK | X_OK))
-      {
-        int pid = vfork();
-        if (pid == 0)
-        {
-          char arg_d[10];
-          sprintf(arg_d, "-DNP=%d", NP);
-          execlp("g++", "g++", "-O2", arg_d, "-fpic", "-shared",
-                 "-I.", "-Isrc", "-Isrc/core", "-Isrc/utils", "-Isrc/subsys",
-                 src_path.c_str(), "-o", obj.c_str(), NULL);
-          perror("exec");
-        }
-        else
-          waitpid(pid, 0, 0);
-      }
-      obj_path = obj;
-    }
-    
-    void *handle = dlopen(obj_path.c_str(), RTLD_LAZY | RTLD_LOCAL);
-    if (!handle)
+    if (nr >= 0 && cp.contains("choose"))
     {
-      panic("%s", dlerror());
+      choose_many[nr] = cp["choose"].get<int>();
     }
-
-    for (int nr = 0; nr < 450; nr++)
-    {
-      if (syscalls[nr] == NULL)
-        continue;
-      char funcname[64];
-      sprintf(funcname, "choose_%s", syscalls[nr]);
-      choose_func func = (choose_func)dlsym(handle, funcname);
-      choose_syswhat[nr] = func;
-    }
-    LOG_INFO("Done");
   }
-
-  /* StateStore configuration */
-  cJSON *statestore = cJSON_GetObjectItem(cfg, "StateStore");
-  if (statestore)
-  {
-    StateStore::Config ss_config;
-    
-    cJSON *hot_mb = cJSON_GetObjectItem(statestore, "hot_cache_mb");
-    if (hot_mb) {
-      ss_config.hot_cache_size = static_cast<size_t>(cJSON_GetNumberValue(hot_mb)) * 1024 * 1024;
-    }
-    
-    cJSON *warm_mb = cJSON_GetObjectItem(statestore, "warm_cache_mb");
-    if (warm_mb) {
-      ss_config.warm_cache_size = static_cast<size_t>(cJSON_GetNumberValue(warm_mb)) * 1024 * 1024;
-    }
-    
-    cJSON *prefetch_window = cJSON_GetObjectItem(statestore, "prefetch_window");
-    if (prefetch_window) {
-      ss_config.prefetch_window = static_cast<size_t>(cJSON_GetNumberValue(prefetch_window));
-    }
-    
-    cJSON *prefetch_threads = cJSON_GetObjectItem(statestore, "prefetch_threads");
-    if (prefetch_threads) {
-      ss_config.prefetch_threads = static_cast<size_t>(cJSON_GetNumberValue(prefetch_threads));
-    }
-    
-    cJSON *compression_level = cJSON_GetObjectItem(statestore, "compression_level");
-    if (compression_level) {
-      ss_config.compression_level = static_cast<int>(cJSON_GetNumberValue(compression_level));
-    }
-    
-    /* Initialize StateStore with custom config */
-    StateStore::instance().init(ss_config);
-    LOG_INFO("StateStore configured: hot=%zuMB, warm=%zuMB, prefetch=%zu",
-             ss_config.hot_cache_size / (1024*1024),
-             ss_config.warm_cache_size / (1024*1024),
-             ss_config.prefetch_window);
-  }
-  
-  // cJSON_Delete(cfg);
 }
 
-int auto_mode = 0;
+/* Parse and load choose function plugin */
+static void parse_choose_function(const json &cfg, const fs::path &cfg_dir)
+{
+  if (!cfg.contains("ChooseFunc"))
+    return;
+
+  std::string src = cfg["ChooseFunc"].get<std::string>();
+  std::string src_path = resolve_path(src, cfg_dir);
+  std::string obj_path = compile_plugin_if_needed(src_path, "choose");
+
+  void *handle = dlopen(obj_path.c_str(), RTLD_LAZY | RTLD_LOCAL);
+  if (!handle)
+  {
+    panic("%s", dlerror());
+  }
+
+  for (int nr = 0; nr < 450; nr++)
+  {
+    if (syscalls[nr] == nullptr)
+      continue;
+
+    char funcname[64];
+    snprintf(funcname, sizeof(funcname), "choose_%s", syscalls[nr]);
+    auto *func = reinterpret_cast<choose_func>(dlsym(handle, funcname));
+    choose_syswhat[nr] = func;
+  }
+
+  LOG_INFO("Choose function plugin loaded");
+}
+
+/* Parse StateStore configuration */
+static void parse_statestore_config(const json &cfg)
+{
+  if (!cfg.contains("StateStore"))
+    return;
+
+  auto ss = cfg["StateStore"];
+  StateStore::Config ss_config;
+
+  if (ss.contains("hot_cache_mb"))
+  {
+    ss_config.hot_cache_size = ss["hot_cache_mb"].get<size_t>() * 1024 * 1024;
+  }
+  if (ss.contains("warm_cache_mb"))
+  {
+    ss_config.warm_cache_size = ss["warm_cache_mb"].get<size_t>() * 1024 * 1024;
+  }
+  if (ss.contains("prefetch_window"))
+  {
+    ss_config.prefetch_window = ss["prefetch_window"].get<size_t>();
+  }
+  if (ss.contains("prefetch_threads"))
+  {
+    ss_config.prefetch_threads = ss["prefetch_threads"].get<size_t>();
+  }
+  if (ss.contains("compression_level"))
+  {
+    ss_config.compression_level = ss["compression_level"].get<int>();
+  }
+  if (ss.contains("enable_malloc_trim"))
+  {
+    ss_config.enable_malloc_trim = ss["enable_malloc_trim"].get<bool>();
+  }
+  if (ss.contains("malloc_trim_threshold_mb"))
+  {
+    ss_config.malloc_trim_threshold =
+        ss["malloc_trim_threshold_mb"].get<size_t>() * 1024 * 1024;
+  }
+  if (ss.contains("packed_storage_path"))
+  {
+    ss_config.packed_storage_path =
+        ss["packed_storage_path"].get<std::string>();
+  }
+
+  StateStore::instance().init(ss_config);
+  LOG_INFO(
+      "StateStore configured: hot=%zuMB, warm=%zuMB, prefetch=%zu, trim=%s",
+      ss_config.hot_cache_size / (1024 * 1024),
+      ss_config.warm_cache_size / (1024 * 1024), ss_config.prefetch_window,
+      ss_config.enable_malloc_trim ? "on" : "off");
+}
+
+void read_config(const char *cfg_file)
+{
+  assert(cfg_file);
+
+  // Get config file directory
+  fs::path cfg_dir = fs::path(cfg_file).parent_path();
+
+  // Load and parse JSON
+  json cfg = load_json_file(cfg_file);
+
+  // Parse basic configuration
+  loglevel = cfg.value("Loglevel", 0);
+
+  // Parse all sections
+  parse_tracees(cfg, cfg_dir);
+  parse_addrs(cfg);
+  parse_fsmap(cfg, cfg_dir);
+  parse_assertions(cfg);
+  parse_user_check(cfg, cfg_dir);
+  parse_choose_points(cfg);
+  parse_choose_function(cfg, cfg_dir);
+  parse_statestore_config(cfg);
+}
 
 void parse_args(int argc, char *argv[])
 {
   const struct option table[] = {
-      {"auto", no_argument, NULL, 'a'},
-      {"log", required_argument, NULL, 'l'},
-      {"help", no_argument, NULL, 'h'},
-      {"cfg", required_argument, NULL, 'c'},
-      {0, 0, NULL, 0},
+      {"auto", no_argument, nullptr, 'a'},
+      {"no-ui", no_argument, nullptr, 'n'},
+      {"batch", required_argument, nullptr, 'b'},
+      {"log", required_argument, nullptr, 'l'},
+      {"help", no_argument, nullptr, 'h'},
+      {"cfg", required_argument, nullptr, 'c'},
+      {0, 0, nullptr, 0},
   };
+
   int o;
-  while ((o = getopt_long(argc, argv, "-ahl:c:", table, NULL)) != -1)
+  while ((o = getopt_long(argc, argv, "-ahnl:c:b:", table, nullptr)) != -1)
   {
     switch (o)
     {
       case 'a':
         auto_mode = 1;
+        break;
+      case 'n':
+        use_ui = 0;
+        break;
+      case 'b':
+        batch_file = optarg;
         break;
       case 'l':
         log_file = optarg;
@@ -399,15 +419,31 @@ void parse_args(int argc, char *argv[])
       default:
         printf("Usage: %s [OPTION...]\n\n", argv[0]);
         printf("\t-a,--auto               run with auto mode\n");
+        printf("\t-n,--no-ui              run without TUI (CLI mode)\n");
+        printf("\t-b,--batch=FILE         run commands from script file\n");
         printf("\t-l,--log=FILE           output log to FILE\n");
-        printf("\t-c,--cfg=FILE   specify configuration FILE\n");
+        printf("\t-c,--cfg=FILE           specify configuration FILE\n");
         printf("\n");
         exit(0);
     }
   }
 }
 
-int is_auto_mode()
+int is_auto_mode() { return auto_mode; }
+
+void cleanup_config()
 {
-  return auto_mode;
+  for (int i = 0; i < NP; i++)
+  {
+    for (int j = 0; j < ptmc_state.tracee[i].argc; j++)
+    {
+      if (ptmc_state.tracee[i].argv[j])
+      {
+        free(ptmc_state.tracee[i].argv[j]);
+        ptmc_state.tracee[i].argv[j] = nullptr;
+      }
+    }
+    ptmc_state.tracee[i].argc = 0;
+    ptmc_state.tracee[i].executable = nullptr;
+  }
 }

@@ -36,107 +36,6 @@ FILE *create_anonymous_tmp(const char *id, const char *mode)
 }
 
 hash_type crc32(FILE *fp);
-hash_type compress_tmp_file(FILE *fin, const char *out_path, int level)
-{
-  fseek(fin, 0, SEEK_SET);
-  FILE *fout = fopen(out_path, "w+b");
-  if (!fin || !fout)
-  {
-    perror("fopen");
-    return 1;
-  }
-
-  void *in_buf = malloc(CHUNK_SIZE);
-  void *out_buf = malloc(ZSTD_compressBound(CHUNK_SIZE));
-  if (!in_buf || !out_buf)
-  {
-    fprintf(stderr, "Memory allocation failed\n");
-    free(in_buf);
-    free(out_buf);
-    return 1;
-  }
-
-  size_t read_size;
-  while ((read_size = fread(in_buf, 1, CHUNK_SIZE, fin)) > 0)
-  {
-#ifndef NOCOMPRESS
-    size_t out_size = ZSTD_compress(out_buf, ZSTD_compressBound(read_size),
-                                    in_buf, read_size, level);
-    if (ZSTD_isError(out_size))
-    {
-      fprintf(stderr, "Compression error: %s\n", ZSTD_getErrorName(out_size));
-      return 1;
-    }
-    fwrite(&out_size, sizeof(size_t), 1, fout);
-    fwrite(out_buf, 1, out_size, fout);
-#else
-    fwrite(in_buf, 1, read_size, fout);
-#endif
-  }
-
-  fseek(fout, 0, SEEK_SET);
-  fseek(fin, 0, SEEK_SET);
-  int ret = crc32(fin);
-
-  fclose(fout);
-  free(in_buf);
-  free(out_buf);
-  return ret;
-}
-
-FILE *decompress_file_tmp(const char *in_path)
-{
-  FILE *fin = fopen(in_path, "rb");
-  FILE *fout = create_anonymous_tmp("decompressed", "r+b");
-  if (!fin || !fout)
-  {
-    perror("fopen");
-    return NULL;
-  }
-
-  void *in_buf = malloc(ZSTD_compressBound(CHUNK_SIZE));
-  void *out_buf = malloc(CHUNK_SIZE);
-  if (!in_buf || !out_buf)
-  {
-    fprintf(stderr, "Memory allocation failed\n");
-    free(in_buf);
-    free(out_buf);
-    fclose(fin);
-    fclose(fout);
-    return NULL;
-  }
-
-#ifndef NOCOMPRESS
-  size_t chunk_size;
-  while (fread(&chunk_size, sizeof(size_t), 1, fin) == 1)
-  {
-    if (fread(in_buf, 1, chunk_size, fin) != chunk_size)
-    {
-      fprintf(stderr, "Unexpected EOF\n");
-      return NULL;
-    }
-    size_t out_size = ZSTD_decompress(out_buf, CHUNK_SIZE, in_buf, chunk_size);
-    if (ZSTD_isError(out_size))
-    {
-      fprintf(stderr, "Decompression error: %s\n", ZSTD_getErrorName(out_size));
-      return NULL;
-    }
-    fwrite(out_buf, 1, out_size, fout);
-  }
-#else
-  size_t read_size;
-  while ((read_size = fread(in_buf, 1, CHUNK_SIZE, fin)) > 0)
-  {
-    fwrite(in_buf, 1, read_size, fout);
-  }
-#endif
-
-  fclose(fin);
-  free(in_buf);
-  free(out_buf);
-  fseek(fout, 0, SEEK_SET);
-  return fout;
-}
 
 int filecmp(const char *file1, const char *file2)
 {
@@ -407,7 +306,7 @@ std::unique_ptr<FILE, file_closer> open_cfile(const std::string &path,
 }
 
 std::string format_hash_filename(const std::string &dir, const std::string &ext,
-                                 uint32_t hash)
+                                 hash_type hash)
 {
   return dir + fmt::sprintf("/" HASH_FORMAT, hash) + ext;
 }
@@ -417,16 +316,6 @@ std::unique_ptr<FILE, file_closer> open_map_file(hash_type hash,
 {
   std::string filename = format_hash_filename("mappings", ".maps", hash);
   return open_cfile(filename, mode);
-}
-
-std::unique_ptr<FILE, file_closer> open_mem_file(hash_type hash,
-                                                 const char *mode)
-{
-  std::string filename = format_hash_filename("memory", ".mem.zstd", hash);
-  FILE *raw_fp = decompress_file_tmp(filename.c_str());
-  if (!raw_fp)
-    return nullptr;
-  return std::unique_ptr<FILE, file_closer>(raw_fp);
 }
 
 std::unique_ptr<FILE, file_closer> open_state_file(hash_type hash,

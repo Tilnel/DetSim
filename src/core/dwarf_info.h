@@ -12,30 +12,33 @@
 #define __DWARF_H
 
 #include "types.h"
+#include <mutex>
 #include <string>
-#include <vector>
 #include <unordered_map>
+#include <vector>
 
 /* ======================================================================
  * Type Information
  * ====================================================================== */
 
-struct type_info {
+struct type_info
+{
   std::string name;
   size_t size = 0;
   bool is_pointer = false;
   bool is_struct = false;
   bool is_array = false;
-  
+
   /* For structs */
-  struct member {
+  struct member
+  {
     std::string name;
     size_t offset = 0;
     size_t size = 0;
     std::string type_name;
   };
   std::vector<member> members;
-  
+
   /* For arrays */
   size_t array_elements = 0;
   std::string element_type;
@@ -45,11 +48,12 @@ struct type_info {
  * Variable Information
  * ====================================================================== */
 
-struct var_info {
+struct var_info
+{
   std::string name;
   std::string type_name;
-  uintptr_t address = 0;      /* For global variables */
-  int stack_offset = 0;       /* For local variables (from $rbp) */
+  uintptr_t address = 0; /* For global variables */
+  int stack_offset = 0;  /* For local variables (from $rbp) */
   bool is_global = false;
   bool is_local = false;
 };
@@ -58,7 +62,8 @@ struct var_info {
  * Stack Frame Information
  * ====================================================================== */
 
-struct stack_frame {
+struct stack_frame
+{
   int frame_id;
   std::string function_name;
   uintptr_t pc;
@@ -80,6 +85,9 @@ void dwarf_cleanup(void);
 /* Legacy compatibility wrapper - uses tracee[0].executable */
 void init_dwarf(void);
 
+/* Load shared library symbols for a specific PID (for dynamic linking) */
+void dwarf_load_shared_library_symbols(int pid);
+
 /* ======================================================================
  * Variable Lookup
  * ====================================================================== */
@@ -90,8 +98,7 @@ uintptr_t dwarf_get_global_addr(const char *varname);
 /* Get global variable type */
 std::string dwarf_get_global_type(const char *varname);
 
-/* Get type information by name */
-type_info dwarf_get_type_info(const char *type_name);
+const type_info &dwarf_get_type_info(const char *type_name);
 
 /* ======================================================================
  * Stack Analysis
@@ -119,10 +126,11 @@ void dwarf_print_local_vars(int pid);
 uintptr_t dwarf_get_frame_base(int frame_id);
 
 /* Look up local variable in current frame */
-bool dwarf_lookup_local(const char *varname, uintptr_t *out_addr, std::string *out_type);
+bool dwarf_lookup_local(const char *varname, uintptr_t *out_addr,
+                        std::string *out_type);
 
 /* Resolve PC to function name and source location */
-bool dwarf_resolve_pc(uintptr_t pc, std::string &func_name, 
+bool dwarf_resolve_pc(uintptr_t pc, std::string &func_name,
                       std::string &file_name, int &line_num);
 
 /* ======================================================================
@@ -133,13 +141,13 @@ bool dwarf_resolve_pc(uintptr_t pc, std::string &func_name,
 uintptr_t dwarf_eval_expr(int pid, const char *expr);
 
 /* Read variable value by name (simple types only) */
-template<typename T>
+template <typename T>
 bool dwarf_read_var(int pid, const char *varname, T *out);
 
 /* Read member from struct by path like "struct_ptr->member.submember" */
-bool dwarf_read_member(int pid, const char *base_var, 
-                       const std::vector<std::string> &members,
-                       void *out_buf, size_t out_size);
+bool dwarf_read_member(int pid, const char *base_var,
+                       const std::vector<std::string> &members, void *out_buf,
+                       size_t out_size);
 
 /* ======================================================================
  * Type Operations
@@ -152,7 +160,7 @@ size_t dwarf_type_size(const char *type_name);
 ptrdiff_t dwarf_member_offset(const char *struct_type, const char *member);
 
 /* Get member size and type name */
-bool dwarf_member_info(const char *struct_type, const char *member, 
+bool dwarf_member_info(const char *struct_type, const char *member,
                        ptrdiff_t *offset, size_t *size, std::string *type_name);
 
 /* Get element type after one level of array/pointer indexing
@@ -169,5 +177,30 @@ void dwarf_dump_type(const char *type_name);
 
 /* Direct DWARF die lookup */
 void *dwarf_lookup_die(uintptr_t pc);
+
+/* Per-frame local variable cache */
+class DwarfLocalCache
+{
+  public:
+  static DwarfLocalCache &instance();
+
+  struct VarInfo
+  {
+    uintptr_t address;
+    std::string type_name;
+  };
+
+  void cache_local(int frame_id, const std::string &varname,
+                   const VarInfo &info);
+  bool lookup_local(int frame_id, const std::string &varname, VarInfo &out);
+  void clear();
+  void clear_frame(int frame_id);
+
+  private:
+  DwarfLocalCache() = default;
+  std::unordered_map<std::string, VarInfo> cache_;
+  mutable std::mutex mutex_;
+  int current_frame_id_ = -1;
+};
 
 #endif /* __DWARF_H */

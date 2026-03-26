@@ -9,11 +9,11 @@ SHELL  = /bin/bash
 CFLAGS += -std=gnu2x -fno-stack-protector -gdwarf-4 \
     -Iinclude -Werror -Werror=return-type -Werror=uninitialized -Wcast-align \
 	  -Wno-pointer-sign -fno-omit-frame-pointer -fno-common -fsigned-char \
-	  -static -Wunused-variable \
+	   -Wunused-variable \
 	  -I$(LLQUEUE_DIR) -Iinclude -g -fno-omit-frame-pointer -O0 \
 		-fno-inline -fno-inline-functions -fno-inline-small-functions \
 		-fasynchronous-unwind-tables -fno-optimize-sibling-calls \
-		-funwind-tables -Wl,--eh-frame-hdr,--no-gc-sections
+		-funwind-tables -Wl,--eh-frame-hdr,--no-gc-sections -D_FORTIFY_SOURCE=0
 
 UNAME := $(shell uname)
 
@@ -103,4 +103,4 @@ clean:
 	if [ -f tests_main ]; then rm tests_main; fi;
 
 main: static main.c
-	gcc $(CFLAGS) main.c src/*.o -o raft
+	gcc $(CFLAGS) main.c src/*.o -static -o raft

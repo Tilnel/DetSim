@@ -76,11 +76,12 @@ struct ptrace_syscall_info
  * ======================================================================== */
 
 #ifndef NP
-#define NP 1
+  #define NP 0
 #endif
+static_assert(NP > 0);
 
-#define HASH_LEN 8
-#define HASH_FORMAT "%08x"
+#define HASH_LEN 16
+#define HASH_FORMAT "%016lx"
 
 #define KiB *1024
 #define MiB KiB * 1024
@@ -90,20 +91,24 @@ struct ptrace_syscall_info
  * ======================================================================== */
 
 typedef uint8_t bytes;
-typedef uint32_t hash_type;
+typedef uint64_t hash_type;
 
 /* ========================================================================
  * Memory Mapping Item
  * ======================================================================== */
 
 /* Represents a single entry from /proc/pid/maps */
-typedef struct
+typedef struct maps_item
 {
   uint64_t start, end;
   char flags[5];
   uint32_t offset;
   int a, b, inode;
   char name[512];
+  maps_item() : start(0), end(0), offset(0), a(0), b(0), inode(0)
+  {
+    name[0] = '\0';
+  }
 } maps_item;
 
 /* ========================================================================

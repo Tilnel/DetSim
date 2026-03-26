@@ -1,6 +1,6 @@
 {
-  "Loglevel": 0,
-  "Nodes": 1,
-  "Tracee": [["./malloc", "0"]],
-  "Addr": ["192.168.0.1"]
+  "Loglevel": 2,
+  "Nodes": 3,
+  "Tracee": [["./malloc", "0"], ["./malloc", "0"], ["./malloc", "0"]],
+  "Addr": ["192.168.0.1","192.168.0.2","192.168.0.3"]
 }

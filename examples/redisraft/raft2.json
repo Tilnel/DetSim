@@ -1,0 +1,11 @@
+{
+  "Loglevel": 1,
+  "Nodes": 2,
+  "Tracee": [
+    ["./raft/raft", "0"],
+    ["./raft/raft", "1"]
+  ],
+  "Addr": ["192.168.0.1", "192.168.0.2"],
+  "SharedFiles": [],
+  "UserCheck": "./plugins/check.so"
+}

@@ -1,19 +1,17 @@
 #ifndef __GUEST_H
 #define __GUEST_H
-#include "types.h"
 #include "debug.h"
-#include "emu.h"
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/ptrace.h>
 #include <sys/user.h>
 #include <unistd.h>
-#include <vector>
 
 extern const char *syscalls[450];
-extern const uintptr_t available_memory;
+extern const uintptr_t scratch_page;
 extern int running_process;
 
 void tracee_set_rax(int pid, uint64_t val);
@@ -31,6 +29,8 @@ int tracee_write_word(int pid, void *addr, long data);
 void tracee_write_mem(int pid, void *addr, const void *data, int len);
 void tracee_read_mem(int pid, const void *addr, void *data, int len);
 void remove_vdso(int pid);
+int patch_at_random(pid_t pid);
+void patch_cpu_features_elf(pid_t pid);
 
 void show_regs(struct user_regs_struct *regs);
 void tracee_switch_syscall(int pid, int SYS_which, uint64_t rdi, uint64_t rsi,
@@ -58,8 +58,9 @@ Ptrace_right(enum __ptrace_request op, pid_t pid, void *addr, void *data)
 
 #define ptrace_right(a, b, c, d) Ptrace_right((enum __ptrace_request)a, (pid_t)b, (void *)(c), (void *)(d))
 void tracee_do_munmap(int pid, uint64_t start, uint64_t end);
-void *tracee_do_mmap(int pid, uint64_t start, uint64_t end);
-void *tracee_do_mmap_back(int pid, uint64_t start, uint64_t end);
+void *tracee_do_mmap(int pid, uint64_t start, uint64_t end, int prot = PROT_READ | PROT_WRITE | PROT_EXEC);
+void *tracee_do_mmap_in_place(int pid, uint64_t start, uint64_t end, int prot = PROT_READ | PROT_WRITE | PROT_EXEC);
+void *tracee_do_mmap_back(int pid, uint64_t start, uint64_t end, int prot = PROT_READ | PROT_WRITE | PROT_EXEC);
 int tracee_do_open(int pid, const char *filename, uint64_t flags);
 
 void tracee_backtrace(int pid);
@@ -67,6 +68,7 @@ void tracee_show_regs(int pid);
 uintptr_t get_var_addr(const char *varname);
 std::string get_var_type(const char *varname);
 void init_dwarf();
+void cleanup_dwarf();
 
 void *memcpy_guest2host(void *dest, const void *src, size_t n);
 void *memcpy_host2guest(void *dest, const void *src, size_t n);

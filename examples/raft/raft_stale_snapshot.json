@@ -1,0 +1,17 @@
+{
+  "Loglevel": 2,
+  "Nodes": 3,
+  "Tracee": [
+    ["./raft/raft", "0"],
+    ["./raft/raft", "1"],
+    ["./raft/raft", "2"]
+  ],
+  "Addr": ["192.168.0.1", "192.168.0.2", "192.168.0.3"],
+  "UserCheck": "./plugins/check.so",
+  "ChooseFunc": "./plugins/choose.so",
+  "CheckInterval": 1,
+  "ChoosePoint": [
+    {"syscall": "gettimeofday", "choose": 2}
+  ],
+  "Description": "Test for stale snapshot term bug. Leader creates snapshot, term increases, then node reloads stale snapshot causing term regression."
+}

@@ -3,7 +3,7 @@
 
 CXXFLAGS = -gdwarf-4 -g -fPIC -shared \
            -I. -I../../../src -I../../../src/core -I../../../src/utils -I../../../src/subsys \
-           -I../raft/include
+           -I../raft/include -DNP=3 -D_FORTIFY_SOURCE=0
 
 .PHONY: all clean
 

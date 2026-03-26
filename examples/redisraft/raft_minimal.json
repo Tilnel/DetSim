@@ -1,0 +1,12 @@
+{
+  "Loglevel": 2,
+  "Nodes": 3,
+  "Tracee": [
+    ["./raft/raft", "0"],
+    ["./raft/raft", "1"],
+    ["./raft/raft", "2"]
+  ],
+  "Addr": ["192.168.0.1", "192.168.0.2", "192.168.0.3"],
+  "WorkingDir": "/",
+  "SharedFiles": []
+}

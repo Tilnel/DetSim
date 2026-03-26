@@ -21,6 +21,10 @@ extern const char* g_input_string;
     ExprNode* node_val;
 }
 
+/* Destructor rules to prevent memory leaks on parse errors */
+%destructor { delete $$; } <node_val>
+%destructor { free($$); } <str_val>
+
 %token <int_val> NUMBER CHAR_LITERAL
 %token <str_val> IDENTIFIER TRACEE_N
 

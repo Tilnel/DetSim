@@ -1,0 +1,13 @@
+{
+  "Loglevel": 2,
+  "Nodes": 2,
+  "Tracee": [
+    ["./redis/src/redis-server", "/redis.conf"], 
+    ["./client"]
+  ],
+  "Addr": ["192.168.0.1", "192.168.0.2"],
+  "WorkingDir": "/",
+  "FSMap": [ 
+    { "Host": "./fs_root", "Target": "/" }
+  ]
+}

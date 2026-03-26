@@ -2,8 +2,8 @@
 # Builds raft server and tracer plugins
 
 NP ?= 3
-CFLAGS = -gdwarf-4 -g
-CXXFLAGS = -gdwarf-4 -g -I . -I ../../src -I ../../src/core -I ../../src/utils -I ../../src/subsys
+CFLAGS = -gdwarf-4 -g -D_FORTIFY_SOURCE=0 -static
+CXXFLAGS = -gdwarf-4 -g -I . -I ../../src -I ../../src/core -I ../../src/utils -I ../../src/subsys -D_FORTIFY_SOURCE=0 -static
 
 .PHONY: all clean raft raft_dynamic plugins
 

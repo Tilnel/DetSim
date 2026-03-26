@@ -10,7 +10,6 @@
 !*.md
 !*.rst
 !*.sh
-!*.txt
 !*.py
 !LICENSE
 
@@ -30,6 +29,12 @@
 !src/subsys/*
 !src/utils/
 !src/utils/*
+!src/ui/
+!src/ui/*
+
+# Perf benchmarks
+!perf/
+!perf/*
 
 # Third party
 !third_party/

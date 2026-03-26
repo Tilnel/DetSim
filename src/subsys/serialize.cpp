@@ -1,11 +1,4 @@
 #include "cereal/archives/binary.hpp"
-#include "cereal/types/deque.hpp"
-#include "cereal/types/list.hpp"
-#include "cereal/types/map.hpp"
-#include "cereal/types/memory.hpp"
-#include "cereal/types/string.hpp"
-#include "cereal/types/unordered_map.hpp"
-#include "cereal/types/vector.hpp"
 #include "fd_manager.h"
 #include "fsstate.h"
 #include "sockstate.h"
@@ -20,13 +13,13 @@ void syscall_info::serialize(Archive &ar)
 template <class Archive>
 void tracee_state::serialize(Archive &ar)
 {
-  ar(si, pid, brk, tv.tv_sec, tv.tv_usec, fs_state, sock_state);
+  ar(si, brk, tv.tv_sec, tv.tv_usec, fs_state, sock_state, raft_state, fd_manager_state);
 }
 
 template <class Archive>
 void sys_state::serialize(Archive &ar)
 {
-  ar(ts_hash, exited);
+  ar(ts_hash, status, error_bound);
 }
 
 template void syscall_info::serialize<cereal::BinaryInputArchive>(

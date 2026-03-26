@@ -5,11 +5,10 @@
 #ifndef __MONITOR_H
 #define __MONITOR_H
 
-#include "common.h"
-#include "types.h"
+#include "fd_manager.h"
 #include "sockstate.h"
 #include "state.h"
-#include "fd_manager.h"
+#include "types.h"
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -25,42 +24,55 @@ enum
   PTMC_QUIT
 };
 
-typedef struct
+struct PTMC_STATE
 {
-  int state;
-  int cursor;
-  int n_choose;
-  int choose;
-  sys_state source_state;
-  sys_state dest_state;
-  hash_type sysstate_hash; /* state in operating system */
-  hash_type toload;
+  enum
+  {
+    MODE_DFS,
+    MODE_BFS,
+    MODE_RAND
+  } mode = MODE_BFS;
+  int state = PTMC_PRELOAD;
+  int cursor = -1;
+  int n_choose = 0;
+  int choose = -1;
+  int batch_choice_preset =
+      -1; /* Preset choice value from batch file (-1 = not set) */
+  sys_state running_state = sys_state();
+  hash_type toload = 0;
 
-  int exited[NP];
-  
+  int status[NP] = {};
+
   SockState sock_states[NP];
-  std::shared_ptr<FdManager> fd_managers[NP];  /* Per-process fd allocation */
+  std::shared_ptr<FdManager> fd_managers[NP]; /* Per-process fd allocation */
   FileSystemState fs_states[NP];
 
-  int pids[NP];
+  int pids[NP] = {};
 
-  struct
+  struct tracee_info
   {
-    char *executable;
-    int argc;
-    char *argv[5];
+    char *executable = nullptr;
+    int argc = 0;
+    char *argv[5] = {};
   } tracee[NP];
 
-  struct timeval time[NP];
+  struct timeval time[NP] = {};
   std::string addrs[NP];
-  std::unordered_set<std::string> shared_files;
-  std::unordered_set<std::string> proc_files[NP];
 
   std::unordered_set<std::string> assertions;
   std::vector<int (*)()> user_checks;
-} PTMC_STATE;
+
+  /* Raft consensus checking state - stored per-process */
+  raft_check_state raft_states[NP];
+
+  int error_bound = 5;
+
+  // Constructor to ensure proper initialization
+  PTMC_STATE() = default;
+};
 
 int is_auto_mode();
+void cleanup_readline();
 
 extern PTMC_STATE ptmc_state;
 
