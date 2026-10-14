@@ -1,5 +1,23 @@
 # Maintenance baseline
 
+## Soft-dirty experiment plan (2026-10-15)
+
+This is an opt-in experiment, not a supported incremental snapshot backend.
+Keep full snapshot format, identity, restore and search unchanged. With the mode
+unset, retain the ordinary capture path without tracking allocations or syscalls.
+Use per-live-process raw memory baselines, pagemap bit55 and clear_refs=4; map
+layout changes and missing baselines force full reads. Restore writes remain
+inside the tracking epoch. Verification mode compares reconstructed bytes against
+full reads before normalization and rejects omissions. No asynchronous-write
+coverage claim follows from the finite fixtures.
+
+Acceptance: real ptrace fixtures cover user/kernel/tracer writes, readonly writes,
+discard/replacement and partial pages; existing capture byte oracles pass. Fixed
+Raft seed/depth/checkpoint/visit counts must agree in full/verify/delta modes.
+Measure sequential alternating full/delta runs, all-thread/main/tracee CPU, total
+DFS wall time and tracking costs/bytes; report slowdown as readily as improvement.
+Do not promote the mode to default or redesign persistence based on this experiment.
+
 Status: maintenance scope and the functional repair pass below are implemented and reviewed.
 The initial maintenance scope was reproducible development and truthful guidance,
 without changing runtime semantics. The later functional pass explicitly extends it.

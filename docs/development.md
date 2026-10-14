@@ -22,6 +22,7 @@ make check-futex check-futex-snapshot # NP=1 wait/wake/requeue and branch restor
 make check-xstate check-exec check-state-io check-mappings # NP=1 state/atom gates
 make check-identity check-port # NP=2 identity and deterministic network state
 make check-capture       # NP=2 full/hinted snapshot byte-equivalence oracle
+make check-soft-dirty    # opt-in experiment: real kernel dirty tracking + byte oracle
 make check-accept        # NP=2 cross-process accept address/length regressions
 make check-redis         # NP=2 fixed-schedule SET/GET with existing Redis debug binary
 make benchmark-redisraft # NP=3 bounded Raft-library replication and DFS benchmark
@@ -137,6 +138,8 @@ limits are documented in [redisraft-benchmark.md](redisraft-benchmark.md).
 The benchmark's `--perf PATH --perf-sudo` options record DFS-only CPU call stacks;
 `tests/redisraft_profile_summary.py` groups exported stacks into disjoint phases.
 CPU sampling proportions and full-command wall time answer different questions.
+The soft-dirty experiment is disabled by default. See the measured costs and
+explicit support limits in [the Raft benchmark](redisraft-benchmark.md).
 
 Before finishing a change, run `git diff --check`, the relevant tests, and a fresh
 build if production/build files changed. Use compiler warnings/static analysis on

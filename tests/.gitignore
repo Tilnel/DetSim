@@ -47,6 +47,9 @@
 
 !redisraft_benchmark.py
 !redisraft_profile_summary.py
+!soft_dirty_integration.cpp
+!soft_dirty.mk
+!soft_dirty_benchmark.py
 !redisraft.mk
 
 !capture.mk

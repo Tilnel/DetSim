@@ -38,6 +38,13 @@ relationship to the native-binary model-checking goal.
 
 ## Next development slice
 
+Soft-dirty experiment (2026-10-15): opt-in verify reconstructed all11,127 Raft
+captures without observed omitted pages; native fixtures also reject a deliberately
+lost dirty epoch. This does not close C08 or certify asynchronous/pinned writes:
+the baseline-read/clear_refs window, epoch exclusivity and PID/exec lifetime need
+a supported contract. The full backend remains default; end-to-end timings show
+no gain in the measured workload. See [measurement and limits](redisraft-benchmark.md).
+
 Redis smoke evidence (2026-10-14): [redis-smoke.md](redis-smoke.md).
 Redis findings and resolution:
 

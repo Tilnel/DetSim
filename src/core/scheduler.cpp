@@ -14,6 +14,7 @@
 #include "state/state_transition.h"
 #include "state/sysstate_store.h"
 #include "utils.h"
+#include "state/soft_dirty_experiment.h"
 
 /* NCursesUI integration */
 #include "ui/log_wrapper.h"
@@ -1218,6 +1219,8 @@ int do_dfs_iterative(hash_type initial_ss_hash, int initial_depth)
 
 int exec_dfs(int depth)
 {
+  if (auto* experiment = detsim::experiment::configured_capture())
+    experiment->reset_stats();
   srand(time(NULL));
   ptmc_state.mode = PTMC_STATE::MODE_DFS;
   StateStore::instance().reset_stats();
@@ -1255,6 +1258,9 @@ int exec_dfs(int depth)
   detsim::ui::ui_printf("  Save+Restore overhead: %.1f%%\n",
                         100.0 * (total_save_us + total_restore_us) /
                             (time_used * 1000000));
+
+  if (auto* experiment = detsim::experiment::configured_capture())
+    experiment->report();
 
   return 0;
 }

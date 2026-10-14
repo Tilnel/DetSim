@@ -4,6 +4,7 @@
 
 #include "state.h"
 #include "xstate.h"
+#include "soft_dirty_experiment.h"
 #include <stdexcept>
 #include <climits>
 #include "cereal/archives/binary.hpp"
@@ -935,6 +936,21 @@ hash_type tracee_state::save_full_state_to_state_store(int pid, hash_type compar
   size_t region_data_offset =
       header_size + regions_size + tstate_size + maps_size;
 
+  auto* soft_dirty = detsim::experiment::configured_capture();
+  if (soft_dirty) {
+    std::vector<detsim::experiment::Region> raw_regions;
+    raw_regions.reserve(regions.size());
+    for (size_t i = 0; i < regions.size(); ++i) {
+      region_infos[i] = regions[i];
+      region_infos[i].offset = region_data_offset + regions[i].offset;
+      raw_regions.push_back({uintptr_t(regions_to_capture[i].start),
+                             regions_to_capture[i].size,
+                             all_data + region_infos[i].offset});
+    }
+    // The helper keeps unnormalized bytes and deliberately tracks restore writes.
+    soft_dirty->capture(pid, raw_regions, maps_text);
+  }
+
   constexpr int MAX_IOV_BATCH = 256;
   for (size_t batch_start = 0; batch_start < regions.size();
        batch_start += MAX_IOV_BATCH)
@@ -960,7 +976,8 @@ hash_type tracee_state::save_full_state_to_state_store(int pid, hash_type compar
       remote_iov[i].iov_len = src.size;
     }
 
-    checked_memory_io(false, pid, local_iov, remote_iov, batch_count);
+    if (!soft_dirty)
+      checked_memory_io(false, pid, local_iov, remote_iov, batch_count);
 
     for (size_t i = 0; i < batch_count; i++)
     {

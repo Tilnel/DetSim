@@ -246,3 +246,90 @@ python3 tests/redisraft_profile_summary.py RUN/result.json RUN/stacks.txt
 `hot/run-97j2m9t2`、小缓存 `cold/run-qt4fq_5d`。新驱动另记录DFS单调时钟窗口；
 两份汇总是 `hot-summary.json`、`cold-summary.json`，syscall差分是
 `syscall-count-delta.json`。本轮没有修改产品捕获、恢复或搜索语义。
+
+## Soft-dirty 捕获实验（2026-10-15）
+
+**在当前完整快照架构和该Raft负载上，没有测到全链路收益，因此默认关闭。**
+跨进程读取量减少约90%，但捕获的小幅改善被恢复和追踪开销抵消。此结论不等于
+soft-dirty在所有负载上无用，也不支持将它直接作为通用正确性保证。
+
+实验保留版本5格式、完整缓冲区、hash/去重、寄存器捕获、原有恢复和搜索。
+`DETSIM_SOFT_DIRTY_EXPERIMENT=verify` 重建原始内存后再独立全读、逐页比较，
+发现漏页立即失败；`delta` 省去独立全读。未设置变量时走原完整读取路径，不构造
+追踪器、不扫描pagemap、不写clear_refs。模式在首次调用固定，不支持运行时切换。
+
+每个live PID保留原始内存基线；同布局时读pagemap bit55，将脏页及nonpresent页
+合并为区间读取，其他字节从基线复制。布局变化全读回退。读取完成后写
+`/proc/PID/clear_refs=4`；恢复写入继续计入下一次捕获，不能随便在恢复后清除标记。
+所有基线及oracle均在rseq归一化之前处理。
+
+### 正确性实验
+
+- 独立ptrace fixture：用户写入、内核read copyout、外部process_vm_writev、只读页
+  PTRACE_POKEDATA、MADV_DONTNEED、同地址unmap/remap、恢复式写入、跨页部分范围、
+  多个不连续输出buffer、超过256页的分批扫描，以及布局变化全读回退。
+- 故意由外部清除epoch：完整oracle确实拒绝漏掉的变化页，不是永远报成功。
+- 现有NP2 capture gate：默认、verify、delta分别运行普通/极小缓存两种配置，
+  覆盖分支恢复、非活动节点外部修改、socket/time变化。verify包含独立完整读取。
+- Raft深度12的v1/v2 verify均完成11,127次捕获，`missed_pages=0`，访问数
+  3,433、新增状态1,776、新子快照403，协议检查结果一致。
+
+这仅验证已执行的路径，不能证明所有变化来源都被追踪。尤其baseline读取和
+clear_refs之间仍有窗口：异步writer在该窗口写入，会被清位却未进入基线。
+固定且停止的线程不排除AIO/io_uring、pinned页、设备及外部backing修改。
+还要求独占该PID的clear_refs epoch、固定进程生命周期；PID复用、exec、THP/swap
+及真实异步writer的通用覆盖未验证。实验不改变项目现有支持边界。
+
+### 全链路结果
+
+同一GCC14 NP3二进制，固定seed=1、300步预热、DFS12、相同两个插件。
+每档full/delta各3次，串行交替，下一轮反转顺序。以下为第二版中位数：
+
+| 指标 | 32/64 MiB full→delta | 256/512 MiB full→delta |
+| --- | ---: | ---: |
+| DFS墙钟，含历史 | 14.032→14.037 s | 9.890→9.881 s |
+| tracer全部线程CPU | 15.540→15.560 s | 11.830→12.000 s |
+| tracer主线程CPU | 12.450→12.480 s | 8.640→8.850 s |
+| 三个tracee合计CPU | 0.350→0.380 s | 0.340→0.370 s |
+| 捕获/保存区间 | 7.511→7.259 s | 5.769→5.624 s |
+| 恢复区间 | 2.546→2.761 s | 2.175→2.496 s |
+| tracer峰值RSS | 317→336 MiB | 1254→1259 MiB |
+
+全部样本计数及检查点一致。毫秒级墙钟差异不构成收益，且monitor尾部仍有一秒
+量化；CPU与区间计时也没有支持稳定的整体加速。小缓存冷读为518–520，淘汰时序
+有变化；大缓存均无冷读。
+
+第二版每次DFS本可全读13.810GB，实际读约1.351GB（减少90.2%）；扫描约337万
+页，约33万页需要读取。扫描加基线→输出复制约1.33–1.43s，clear_refs约0.25s。
+`bytes_read`不含verify额外oracle；正式性能样本均关闭oracle。第二版只把脏区间
+复制回基线，该方向复制量也约1.351GB；仍保留另一方向的整份基线复制。
+
+第一版在每次捕获后整份复制回基线，大缓存墙钟9.890→10.881s、小缓存
+13.025→15.034s，明显更差。删掉该复制后才回到整体接近持平，故不能把读取字节
+减少直接当成加速。两版不同测量时段的绝对时长不直接混比。
+
+捕获阶段仍清零、复制、拼装及比较/hash完整快照；dirty追踪只减少了其中的远程
+读取。恢复仍完整读取并在区域有差异时整区写回。清位撤掉页表可写位，给随后的
+写入增加处理成本，与恢复区间变慢相符；尚未单独隔离每种写入成本，不能全部
+归因于某一种缺页。继续开发需要同时考虑页级恢复和避免完整缓冲区搬运的表示，
+还要先解决上述追踪窗口与支持契约。当前不建议仅凭此实验推广增量捕获。
+
+### 复现与产物
+
+```sh
+make NP=3 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4 tracer \
+  build/release/np3/tests/redisraft_choose.so \
+  build/release/np3/tests/redisraft_check.so \
+  build/release/np3/tests/redisraft_seed.so
+make check-soft-dirty CC=/usr/bin/gcc CXX=/usr/bin/g++
+DETSIM_SOFT_DIRTY_EXPERIMENT=verify make NP=2 check-capture \
+  CC=/usr/bin/gcc CXX=/usr/bin/g++
+python3 tests/soft_dirty_benchmark.py --repeats 3 --depth 12
+```
+
+Raft verify可在前述benchmark命令前加`DETSIM_SOFT_DIRTY_EXPERIMENT=verify`。
+`soft_dirty_benchmark.py`按模式清理环境、检查工作量计数并保存逐次日志、原始结果
+和中位数，不改变默认后端。运行前确保root tracer是NP3。
+本次产物保留在`build/soft-dirty/results-v1.json`、`results-v2.json`、
+`summary-v2.json`及对应run目录。新增runner另以深度8、每档每模式1次验证入口。
+产品构建、`make check`、NP1原生scenario/state-io/mappings及上述capture gates通过。

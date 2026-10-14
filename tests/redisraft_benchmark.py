@@ -169,6 +169,8 @@ try:
                 result['perf_window_monotonic_s'] = [begin, end]
             result['dfs_history_s']=result['dfs_s']-result.get('dfs_until_report_s',result['dfs_s'])
             (work/'dfs-report.txt').write_text(reply)
+            experiment=re.search(r'SOFT_DIRTY (\{[^\n]+\})', reply)
+            if experiment: result['soft_dirty']=json.loads(experiment[1])
             result['dfs_report_tail']=reply[reply.rfind('Time elapsed:'):]
             m=re.search(r'Complete explore all (\d+) sys_states \(new: (\d+)\)',reply)
             if not m: raise RuntimeError('DFS did not report normal bounded completion: '+reply[-2000:])
