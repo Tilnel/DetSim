@@ -23,6 +23,7 @@ make check-xstate check-exec check-state-io check-mappings # NP=1 state/atom gat
 make check-identity check-port # NP=2 identity and deterministic network state
 make check-accept        # NP=2 cross-process accept address/length regressions
 make check-redis         # NP=2 fixed-schedule SET/GET with existing Redis debug binary
+make benchmark-redisraft # NP=3 bounded Raft-library replication and DFS benchmark
 make NP=1 -j4
 make NP=3 debug -j4
 ```
@@ -129,6 +130,9 @@ with assertions enabled, and saves each run under `build/redis-check/run-*`.
 Default bounds are 60 seconds, 1000 steps per stage and 2 GiB address space.
 Success requires both exact client RESP checks and normal virtual exit, not merely
 server readiness. See [Redis evidence and model limits](redis-smoke.md).
+
+For the three-node Raft-library workload, reproducible timings and measurement
+limits are documented in [redisraft-benchmark.md](redisraft-benchmark.md).
 
 Before finishing a change, run `git diff --check`, the relevant tests, and a fresh
 build if production/build files changed. Use compiler warnings/static analysis on

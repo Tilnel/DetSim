@@ -44,3 +44,6 @@
 !store_packed*
 !store_metadata*
 !storage_benchmark.py
+
+!redisraft_benchmark.py
+!redisraft.mk

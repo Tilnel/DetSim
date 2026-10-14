@@ -5,6 +5,10 @@
         wc clean clear benchmark tools pgo-generate pgo-use pgo-clean \
         check-integration check-scenarios check-redis
 
+ifneq ($(filter benchmark-redisraft,$(MAKECMDGOALS)),)
+NP ?= 3
+endif
+
 ifneq ($(filter check-accept check-redis check-port check-identity,$(MAKECMDGOALS)),)
 NP ?= 2
 endif
@@ -113,7 +117,7 @@ check-build-contracts:
 check: test check-build-contracts
 
 # Optional fragments are absent in the disposable build-contract fixtures.
--include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk tests/futex_snapshot.mk tests/futex.mk tests/storage.mk tests/store_cache.mk tests/store_packed.mk
+-include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk tests/futex_snapshot.mk tests/futex.mk tests/storage.mk tests/store_cache.mk tests/store_packed.mk tests/redisraft.mk
 check-integration: check-dwarf check-elf
 
 # This gate executes native programs via ptrace; keep it separate from make check.
@@ -141,6 +145,7 @@ help:
 	@echo 'make check-mappings         Private mapping contents and protections regression'
 	@echo 'make check-identity         NP=2 ordered metadata identity regression'
 	@echo 'make check-port             NP=2 deterministic virtual TCP ports regression'
+	@echo 'make benchmark-redisraft    NP=3 bounded Raft replication and DFS benchmark'
 	@echo 'make check-redis            NP=2 Redis SET/GET (requires existing Redis binary and ptrace)'
 	@echo 'make NP=N benchmark|tools   Build optional utilities'
 	@echo 'make NP=N pgo-generate     Instrument; run workload; then make NP=N pgo-use'
