@@ -218,15 +218,42 @@ int SockState::do_connect(int fd, const struct sockaddr *addr,
   struct sockaddr_in peer_addr;
   memcpy_guest2host(&peer_addr, addr, sizeof(struct sockaddr_in));
 
-  // Set local address: bind to 0.0.0.0 with ephemeral port
-  if (!sock->bound)
+  // A connected socket uses the node's concrete source address, not ANY.
+  // Stage both address and port so allocation failures leave the socket intact.
+  sockaddr_in local_addr = sock->bound ? sock->local_addr : sockaddr_in{};
+  local_addr.sin_family = AF_INET;
+  if (local_addr.sin_addr.s_addr == INADDR_ANY)
   {
-    sock->bound = true;
-    sock->local_addr.sin_family = AF_INET;
-    sock->local_addr.sin_addr.s_addr = INADDR_ANY; // 0.0.0.0
-    sock->local_addr.sin_port =
-        htons(10000 + (rand() % 50000)); // Random ephemeral port
+    if (inet_pton(AF_INET, ptmc_state.addrs[ptmc_state.cursor].c_str(),
+                  &local_addr.sin_addr) != 1 ||
+        local_addr.sin_addr.s_addr == INADDR_ANY)
+      return -EADDRNOTAVAIL;
   }
+
+  // Allocate from this node's saved socket state, never the search's host RNG.
+  // Keep the existing modeled range, not the host's configurable Linux range.
+  if (!sock->bound || local_addr.sin_port == 0)
+  {
+    constexpr int first_port = 10000;
+    constexpr int port_count = 50000;
+    bool used[port_count]{};
+    for (const auto &[other_fd, other] : sockets_)
+    {
+      if (!other.bound)
+        continue;
+      int port = ntohs(other.local_addr.sin_port);
+      if (port >= first_port && port < first_port + port_count)
+        used[port - first_port] = true;
+    }
+    int index = 0;
+    while (index < port_count && used[index])
+      ++index;
+    if (index == port_count)
+      return -EADDRNOTAVAIL;
+    local_addr.sin_port = htons(first_port + index);
+  }
+  sock->bound = true;
+  sock->local_addr = local_addr;
 
   sock->connected = true;
   sock->peer_addr = peer_addr;

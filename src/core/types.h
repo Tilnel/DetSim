@@ -102,10 +102,10 @@ typedef struct maps_item
 {
   uint64_t start, end;
   char flags[5];
-  uint32_t offset;
-  int a, b, inode;
+  uint64_t offset, inode;
+  unsigned int a, b;
   char name[512];
-  maps_item() : start(0), end(0), offset(0), a(0), b(0), inode(0)
+  maps_item() : start(0), end(0), offset(0), inode(0), a(0), b(0)
   {
     name[0] = '\0';
   }

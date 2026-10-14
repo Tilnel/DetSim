@@ -601,6 +601,21 @@ static void stop_status_monitor()
   detsim::ui::NCursesUI *ui = get_ncurses_ui();
 }
 
+// Search failures must join the monitor before main catches the exception.
+// Existing explicit stops retain their reporting order on normal/early exits.
+class StatusMonitorScope
+{
+public:
+  StatusMonitorScope() { start_status_monitor(); }
+  ~StatusMonitorScope()
+  {
+    if (g_monitor_thread.joinable())
+      stop_status_monitor();
+  }
+  StatusMonitorScope(const StatusMonitorScope &) = delete;
+  StatusMonitorScope &operator=(const StatusMonitorScope &) = delete;
+};
+
 bool state_to_be_discarded(int index, syscall_info *infos)
 {
   if (ptmc_state.error_bound <= 0)
@@ -679,7 +694,7 @@ int exec_bfs()
   ptmc_state.choose = 0;
 
   /* Start status monitor in auto mode */
-  start_status_monitor();
+  StatusMonitorScope status_monitor;
 
   /* until no state in queue */
   int loop_count = 0;
@@ -1211,7 +1226,7 @@ int exec_dfs(int depth)
   g_states_new = 1;
   states_searched_this_run = 1;
   states_new_this_run = 1;
-  start_status_monitor();
+  StatusMonitorScope status_monitor;
 
   StateStore::instance().queue_clear();
   start_time = gettime();
@@ -1265,7 +1280,7 @@ int exec_rand(int depth)
   g_states_searched = states_searched_this_run;
   g_states_new = states_new_this_run;
 
-  start_status_monitor();
+  StatusMonitorScope status_monitor;
 
   while (true)
   {

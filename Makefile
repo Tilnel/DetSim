@@ -5,12 +5,12 @@
         wc clean clear benchmark tools pgo-generate pgo-use pgo-clean \
         check-integration check-scenarios check-redis
 
-ifneq ($(filter check-accept check-redis,$(MAKECMDGOALS)),)
+ifneq ($(filter check-accept check-redis check-port check-identity,$(MAKECMDGOALS)),)
 NP ?= 2
 endif
 
 # Integration fixtures use one node unless explicitly overridden.
-ifneq ($(filter check-integration check-dwarf check-elf check-scenarios,$(MAKECMDGOALS)),)
+ifneq ($(filter check-integration check-dwarf check-elf check-scenarios check-xstate check-exec check-state-io check-mappings,$(MAKECMDGOALS)),)
 NP ?= 1
 endif
 
@@ -40,7 +40,7 @@ SRCS = src/main.cpp\
        src/core/scheduler.cpp src/core/guest.cpp src/core/monitor.cpp src/core/config.cpp src/core/syscall_fmt.cpp src/core/resolve.cpp \
        src/core/scheduler/exploration.cpp \
        src/core/dwarf.cpp \
-       src/core/state/state.cpp src/core/state/state_store.cpp src/core/state/state_store_packed.cpp src/core/state/sysstate_store.cpp src/core/state/state_transition.cpp src/core/state/serialize.cpp \
+       src/core/state/state.cpp src/core/state/xstate.cpp src/core/state/state_store.cpp src/core/state/state_store_packed.cpp src/core/state/sysstate_store.cpp src/core/state/state_transition.cpp src/core/state/serialize.cpp \
        src/core/engine/thread_manager.cpp src/core/engine/signal_handler.cpp src/core/engine/exec_engine.cpp \
        src/core/syscall/dispatcher.cpp src/core/syscall/handlers.cpp \
        src/subsys/net/sockstate.cpp src/subsys/net/emu.cpp \
@@ -113,7 +113,7 @@ check-build-contracts:
 check: test check-build-contracts
 
 # Optional fragments are absent in the disposable build-contract fixtures.
--include tests/dwarf.mk tests/elf.mk tests/accept.mk
+-include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk
 check-integration: check-dwarf check-elf
 
 # This gate executes native programs via ptrace; keep it separate from make check.
@@ -131,6 +131,12 @@ help:
 	@echo 'make check-integration      Production DWARF/ELF fixtures (default NP=1; no ptrace)'
 	@echo 'make check-scenarios        Build NP=1 tracer and run isolated ptrace scenarios'
 	@echo 'make check-accept           NP=2 remote-memory accept regression'
+	@echo 'make check-xstate           FP/SIMD capture, restore and archive regression'
+	@echo 'make check-exec             Syscall input and automatic-step boundary regression'
+	@echo 'make check-state-io         Snapshot format and exact I/O failure regression'
+	@echo 'make check-mappings         Private mapping contents and protections regression'
+	@echo 'make check-identity         NP=2 ordered metadata identity regression'
+	@echo 'make check-port             NP=2 deterministic virtual TCP ports regression'
 	@echo 'make check-redis            NP=2 Redis SET/GET (requires existing Redis binary and ptrace)'
 	@echo 'make NP=N benchmark|tools   Build optional utilities'
 	@echo 'make NP=N pgo-generate     Instrument; run workload; then make NP=N pgo-use'

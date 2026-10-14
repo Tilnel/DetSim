@@ -41,7 +41,7 @@ class TracerScenarios(unittest.TestCase):
         )
 
     def run_tracer(self, commands, *, name="probe", batch=False, sibling=False,
-                   terminate=False, assertions=()):
+                   terminate=False, assertions=(), verify_failure_cleanup=False):
         work = self.root / (name + ("-batch" if batch else "-interactive"))
         work.mkdir()
         binary = work / name
@@ -136,7 +136,19 @@ finally:
                     commands(prompt)
                     proc.communicate(b"q\n", timeout=20)
                 else:
+                    children = []
+                    if verify_failure_cleanup:
+                        deadline = time.monotonic() + 20
+                        while not (work / "output").read_bytes().endswith(b"(ptmc) "):
+                            if proc.poll() is not None or time.monotonic() > deadline:
+                                self.fail("Tracer failed before scenario commands")
+                            time.sleep(0.001)
+                        children = Path(f"/proc/{proc.pid}/task/{proc.pid}/children").read_text().split()
+                        self.assertTrue(children, "No tracees to verify cleanup")
                     proc.communicate(None if batch else commands.encode(), timeout=20)
+                    if verify_failure_cleanup:
+                        self.assertFalse(any(Path("/proc", child).exists() for child in children),
+                                         "Tracee survived checker failure")
             except subprocess.TimeoutExpired:
                 self.fail("Tracer timed out: " + (work / "output").read_text(errors="replace")[-4000:])
             finally:
@@ -217,6 +229,51 @@ finally:
                 self.assertIn("counter = 2", send("p counter"))
                 actual = re.findall(r"=> ([0-9a-f]{16})", send("info"))[-1]
                 self.assertEqual(actual, expected, "Replaying the same edge changed state identity")
+
+        code, output = self.run_tracer(scenario)
+        self.assertEqual(code, 0, output)
+
+    def test_automatic_capture_failure_exits_cleanly(self):
+        source = self.root / "unsupported.c"
+        source.write_text(
+            '#include <sys/mman.h>\n'
+            'int main(void) { return mmap(0, 4096, PROT_READ | PROT_WRITE,\n'
+            '  MAP_SHARED | MAP_ANONYMOUS, -1, 0) == MAP_FAILED; }\n'
+        )
+        subprocess.run(
+            shlex.split(os.environ.get("CC", "/usr/bin/gcc"))
+            + ["-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie",
+               str(source), "-o", str(self.root / "probe")], check=True,
+        )
+        for command in ("bfs", "dfs 3", "rand 3"):
+            with self.subTest(command=command):
+                code, output = self.run_tracer(
+                    "sw 0\n" + command + "\nq\n", name=command.split()[0],
+                    verify_failure_cleanup=True,
+                )
+                self.assertIn("Unsupported snapshot mapping", output)
+                self.assertIn("DetSim state/execution error:", output)
+                self.assertNotIn("terminate called", output)
+                self.assertNotIn("Complete explore all", output)
+                self.assertEqual(code, 1, output)
+
+    def test_simd_registers_restore_with_memory(self):
+        subprocess.run([
+            "/usr/bin/gcc", "-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie",
+            str(ROOT / "tests/simd_probe.c"), "-o", str(self.root / "probe"),
+        ], check=True)
+
+        def scenario(send):
+            send("sw 0")
+            send("si")
+            saved = re.findall(r"=> ([0-9a-f]{16})", send("info"))[-1]
+            send("si")
+            self.assertIn("observed = 11", send("p observed"))
+            for _ in range(3):
+                self.assertIn("Loaded state", send("load " + saved))
+                self.assertIn("observed = 0", send("p observed"))
+                send("si")
+                self.assertIn("observed = 11", send("p observed"))
 
         code, output = self.run_tracer(scenario)
         self.assertEqual(code, 0, output)

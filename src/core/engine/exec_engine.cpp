@@ -74,13 +74,14 @@ int ExecutionEngine::do_single_syscall(pid_t pid, syscall_info& info)
         return CKPT_STOP;
     }
 
-    // Dispatch syscall enter
-    syscall_dispatch::enter(pid, psi.entry.nr, info);
-
     info.nr = psi.entry.nr;
     for (int i = 0; i < 6; i++) {
         info.args[i] = psi.entry.args[i];
     }
+
+    // Entry handlers (notably clone/futex) must see this syscall, not the
+    // previous syscall or an uninitialized argument buffer.
+    syscall_dispatch::enter(pid, info.nr, info);
 
     // Mark exit_group
     if (info.nr == SYS_exit_group) {
@@ -202,7 +203,11 @@ ExecResult ExecutionEngine::execute_step(const sys_state& state, syscall_info& i
         }
     }
 
-    // Auto mode: try each thread in round-robin (original logic)
+    // Reference atom policy: one completed syscall per step, as in manual
+    // mode. CKPT_NO is a handler hint, not permission to swallow scheduling
+    // points indefinitely (e.g. receive retries or getpid busy loops).
+    // This does not expose shared-memory interleavings inside user code.
+    // Try each thread until a runnable one is found.
     int num_threads = tm->thread_count();
     if (num_threads == 0) {
         num_threads = 1;
@@ -230,8 +235,7 @@ ExecResult ExecutionEngine::execute_step(const sys_state& state, syscall_info& i
 
         switch (result) {
             case CKPT_NO:
-                attempt--;
-                continue;
+                return ExecResult(ExecStatus::SUCCESS, CKPT_YES, "Syscall completed");
             case CKPT_DISCARD:
                 return ExecResult(ExecStatus::DISCARD, CKPT_DISCARD, "Thread blocked");
             case CKPT_EXIT:

@@ -3,6 +3,9 @@
  */
 
 #include "state.h"
+#include "xstate.h"
+#include <stdexcept>
+#include <climits>
 #include "cereal/archives/binary.hpp"
 #include "config.h"
 #include "debug.h"
@@ -34,6 +37,70 @@
 #include <sys/uio.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+
+// Check before interpreting an archive: v3 thread records lack XSTATE.
+static void validate_state_header(const std::vector<uint8_t>& data)
+{
+  if (data.size() < sizeof(StateDataHeader))
+    throw std::runtime_error("Truncated state snapshot header");
+  StateDataHeader header;
+  memcpy(&header, data.data(), sizeof(header));
+  if (header.magic != 0x4453544D || header.version != 4)
+    throw std::runtime_error("Incompatible state snapshot: requires format version 4 (XSTATE)");
+  auto in_bounds = [&](uint64_t offset, uint64_t size) {
+    return offset <= data.size() && size <= data.size() - offset;
+  };
+  if (header.num_regions > (data.size() - sizeof(header)) / sizeof(RegionInfo) ||
+      !header.tstate_size || !in_bounds(header.tstate_offset, header.tstate_size) ||
+      !in_bounds(header.maps_offset, header.maps_size) ||
+      !in_bounds(header.regs_offset, sizeof(user_regs_struct)))
+    throw std::runtime_error("Invalid state snapshot section bounds");
+  const uint64_t table_end = sizeof(header) + uint64_t(header.num_regions) * sizeof(RegionInfo);
+  if (header.tstate_offset != table_end ||
+      header.maps_offset != header.tstate_offset + header.tstate_size ||
+      header.regs_offset < header.maps_offset + header.maps_size ||
+      header.regs_offset + sizeof(user_regs_struct) != data.size())
+    throw std::runtime_error("Invalid state snapshot section ordering");
+  uint64_t next_data = header.maps_offset + header.maps_size;
+  uint64_t previous_end = 0;
+  for (uint32_t i = 0; i < header.num_regions; ++i) {
+    RegionInfo region;
+    memcpy(&region, data.data() + sizeof(header) + i * sizeof(region), sizeof(region));
+    const uint32_t prot = (region.flags[0] == 'r' ? PROT_READ : 0) |
+                          (region.flags[1] == 'w' ? PROT_WRITE : 0) |
+                          (region.flags[2] == 'x' ? PROT_EXEC : 0);
+    if (region.flags[0] != 'r' || (region.flags[1] != 'w' && region.flags[1] != '-') ||
+        (region.flags[2] != 'x' && region.flags[2] != '-') || region.flags[3] != 'p' ||
+        region.flags[4] != 0 || region.prot != prot)
+      throw std::runtime_error("Invalid snapshot memory region protection");
+    if (region.end <= region.start || region.start < previous_end ||
+        region.offset != next_data || region.offset > header.regs_offset ||
+        region.end - region.start > header.regs_offset - region.offset)
+      throw std::runtime_error("Invalid state snapshot memory region");
+    previous_end = region.end;
+    next_data += region.end - region.start;
+  }
+  if (next_data != header.regs_offset)
+    throw std::runtime_error("Invalid state snapshot memory extent");
+}
+
+static void checked_memory_io(bool write, pid_t pid, const iovec* local,
+                              const iovec* remote, size_t count)
+{
+  size_t expected = 0;
+  for (size_t i = 0; i < count; ++i) {
+    if (local[i].iov_len != remote[i].iov_len ||
+        local[i].iov_len > size_t(SSIZE_MAX) - expected)
+      throw std::runtime_error("Invalid snapshot memory transfer size");
+    expected += local[i].iov_len;
+  }
+  if (!expected) return;
+  const ssize_t n = write ? process_vm_writev(pid, local, count, remote, count, 0)
+                          : process_vm_readv(pid, local, count, remote, count, 0);
+  if (n < 0 || size_t(n) != expected)
+    throw std::runtime_error(std::string(write ? "Snapshot memory write" : "Snapshot memory read") +
+                             " incomplete: " + std::to_string(n) + "/" + std::to_string(expected));
+}
 
 /* ======================================================================
  * Section 1: Global State Variables
@@ -118,7 +185,6 @@ sys_state::sys_state(const struct syscall_info info[][MAX_THREADS_PER_PROCESS])
 {
   auto old_state = ptmc_state.running_state;
   auto active_idx = ptmc_state.cursor;
-  hash_type ss_hash_tmp = 0;
   error_bound = ptmc_state.error_bound;
   extern int auto_mode;  // For detecting manual mode
 
@@ -129,9 +195,7 @@ sys_state::sys_state(const struct syscall_info info[][MAX_THREADS_PER_PROCESS])
       child[j] = tracee_state(j, info[j]);
       status[j] = ptmc_state.status[j];
       ts_hash[j] = child[j].save(ptmc_state.pids[j]);
-      ss_hash_tmp ^= ts_hash[j];
     }
-    ss_hash = ss_hash_tmp;
     goto ret;
   }
 
@@ -165,11 +229,12 @@ sys_state::sys_state(const struct syscall_info info[][MAX_THREADS_PER_PROCESS])
       }
     }
 
-    ss_hash_tmp ^= ts_hash[j];
   }
 
 ret:
-  ss_hash = ss_hash_tmp;
+  for (hash_type hash : ts_hash)
+    if (!hash) throw std::runtime_error("Failed to capture tracee state");
+  ss_hash = identity_hash();
   LOG_DEBUG("Create sstate (incremental) " HASH_FORMAT, ss_hash);
   save_metadata();
 }
@@ -178,42 +243,44 @@ ret:
  * Section 4: State Persistence (save/load to disk)
  * ====================================================================== */
 
+hash_type sys_state::identity_hash() const
+{
+  std::ostringstream encoded;
+  {
+    cereal::BinaryOutputArchive archive(encoded);
+    const uint32_t domain = 0x44535334; // DSS4: ordered system metadata
+    const uint32_t nodes = NP;
+    archive(domain, nodes, *this);
+  }
+  const std::string bytes = encoded.str();
+  const hash_type result = XXHash64::hash(bytes.data(), bytes.size());
+  if (result == 0)
+    throw std::runtime_error("Reserved zero system-state identity");
+  return result;
+}
+
 int sys_state::save_metadata() const
 {
-  LOG_DEBUG("to store sstate %016lx", ss_hash);
-
-  // Use SysStateStore for packed storage
-  SysStateStore &store = SysStateStore::instance();
-
-  if (!store.exists(ss_hash))
+  if (ss_hash != identity_hash())
+    throw std::runtime_error("System-state metadata does not match its identity");
+  std::ostringstream encoded;
   {
-    LOG_DEBUG("sys_state stores %016lx", ss_hash);
-
-    // Serialize to memory buffer
-    std::ostringstream oss;
-    try
-    {
-      cereal::BinaryOutputArchive outputArchive(oss);
-      outputArchive(*this);
-    }
-    catch (...)
-    {
-      LOG_CRIT("Failed to serialize sys_state %016lx", ss_hash);
-      return 0;
-    }
-
-    std::string data_str = oss.str();
-    std::vector<uint8_t> data(data_str.begin(), data_str.end());
-
-    if (!store.save(ss_hash, data))
-    {
-      LOG_CRIT("Failed to save metadata to SysStateStore");
-      return 0;
-    }
-
-    return 1;
+    cereal::BinaryOutputArchive archive(encoded);
+    archive(*this);
   }
-  return 0;
+  const std::string bytes = encoded.str();
+  const std::vector<uint8_t> data(bytes.begin(), bytes.end());
+  auto &store = SysStateStore::instance();
+  if (store.exists(ss_hash))
+  {
+    std::vector<uint8_t> previous;
+    if (!store.load(ss_hash, previous) || previous != data)
+      throw std::runtime_error("System-state identity collision or corrupt metadata");
+    return 0;
+  }
+  if (!store.save(ss_hash, data))
+    throw std::runtime_error("Failed to persist system-state metadata");
+  return 1;
 }
 
 /* ======================================================================
@@ -236,11 +303,11 @@ tracee_state::tracee_state(hash_type hash)
 
   if (!data_shared_ptr)
   {
-    LOG_CRIT("Cannot load tracee_state for hash %016lx", hash);
-    return;
+    throw std::runtime_error("Cannot load tracee_state snapshot");
   }
 
   const std::vector<uint8_t> &data = *data_shared_ptr;
+  validate_state_header(data);
 
   // Parse header
   if (data.size() < sizeof(StateDataHeader))
@@ -270,7 +337,7 @@ tracee_state::tracee_state(hash_type hash)
       }
       catch (...)
       {
-        LOG_ERROR("Failed to deserialize tracee_state for hash %016lx", hash);
+        throw std::runtime_error("Failed to deserialize tracee_state snapshot");
       }
     }
   }
@@ -282,52 +349,62 @@ tracee_state::tracee_state(hash_type hash)
 }
 
 /* Load sys_state from state_store by hash */
-sys_state::sys_state(hash_type hash)
+sys_state::sys_state(hash_type hash) : sys_state()
 {
-  ss_hash = hash;
-
-  // Initialize ts_hash to 0 to avoid garbage values if loading fails
-  for (int i = 0; i < NP; i++)
-  {
-    ts_hash[i] = 0;
-  }
-
-  // Try SysStateStore first (new format)
-  SysStateStore &store = SysStateStore::instance();
+  if (!hash)
+    throw std::runtime_error("Cannot load zero system-state identity");
   std::vector<uint8_t> data;
-
-  LOG_DEBUG("sys_state: loading hash %016lx from SysStateStore", hash);
-
-  if (store.load(hash, data))
+  if (!SysStateStore::instance().load(hash, data))
+    throw std::runtime_error("Cannot load system-state metadata");
+  std::istringstream encoded(std::string(data.begin(), data.end()));
   {
-    LOG_DEBUG("sys_state: loaded hash %016lx, data size=%zu", hash,
-              data.size());
-    // Loaded from packed storage
-    try
-    {
-      std::istringstream iss(std::string((char *)data.data(), data.size()));
-      cereal::BinaryInputArchive inputArchive(iss);
-      inputArchive(*this);
-    }
-    catch (...)
-    {
-      LOG_CRIT("Failed to deserialize sys_state %016lx from packed store",
-               hash);
-    }
+    cereal::BinaryInputArchive archive(encoded);
+    archive(*this);
   }
-  else
+  if (encoded.peek() != std::char_traits<char>::eof() || identity_hash() != hash)
+    throw std::runtime_error("Incompatible or corrupt system-state metadata identity");
+  ss_hash = hash;
+  for (int i = 0; i < NP; ++i)
   {
-    LOG_CRIT("Failed to load sys_state %016lx from SysStateStore", hash);
-  }
-
-  // Load child states from integrated data (only for valid hashes)
-  for (int i = 0; i < NP; i++)
-  {
-    if (DISALIVE(status[i]) && ts_hash[i] != 0)
-    {
+    if (!ts_hash[i])
+      throw std::runtime_error("Missing tracee identity in system-state metadata");
+    if (DISALIVE(status[i]))
       child[i] = tracee_state(ts_hash[i]);
-    }
   }
+}
+
+static bool excluded_mapping(const maps_item& item)
+{
+  if (item.start < scratch_page + PAGE_SIZE && scratch_page < item.end) {
+    if (item.start != scratch_page || item.end != scratch_page + PAGE_SIZE)
+      throw std::runtime_error("Unsupported mapping overlaps reserved scratch page");
+    return true;
+  }
+  return !strncmp(item.name, "[vvar", 5) || !strcmp(item.name, "[vdso]") ||
+         !strcmp(item.name, "[vsyscall]");
+}
+
+static int mapping_protection(const char* flags)
+{
+  return (flags[0] == 'r' ? PROT_READ : 0) |
+         (flags[1] == 'w' ? PROT_WRITE : 0) |
+         (flags[2] == 'x' ? PROT_EXEC : 0);
+}
+
+static void restore_protection(pid_t pid, uint64_t start, uint64_t end, int prot)
+{
+  if (tracee_do_syscall(pid, SYS_mprotect, start, end - start, prot, 0, 0, 0) != 0)
+    throw std::runtime_error("Cannot restore snapshot memory protection");
+}
+
+static bool same_backing(const maps_item& saved, const maps_item& live, uint64_t address)
+{
+  if (saved.flags[3] != live.flags[3] || saved.inode != live.inode ||
+      saved.a != live.a || saved.b != live.b)
+    return false;
+  // Anonymous splits need no file-offset adjustment. File mappings do.
+  return !saved.inode || uint64_t(saved.offset) + address - saved.start ==
+                          uint64_t(live.offset) + address - live.start;
 }
 
 void tracee_state::restore_memory_mappings(
@@ -340,11 +417,11 @@ void tracee_state::restore_memory_mappings(
         StateStore::instance().load_shared(ts_hash);
     if (data_shared_ptr == nullptr)
     {
-      LOG_CRIT("Cannot load state for hash %016lx", ts_hash);
-      return;
+      throw std::runtime_error("Cannot load snapshot mappings");
     }
 
     const std::vector<uint8_t> &data = *data_shared_ptr;
+    validate_state_header(data);
 
     if (data.size() >= sizeof(StateDataHeader))
     {
@@ -362,13 +439,16 @@ void tracee_state::restore_memory_mappings(
           while (std::getline(iss, line))
           {
             maps_item item = {};
-            uint32_t offset, a, b, inode;
-            if (sscanf(line.c_str(), "%lx-%lx %4s %x %d:%d %d %511s",
-                       &item.start, &item.end, item.flags, &offset, &a, &b,
-                       &inode, item.name) >= 7)
+            if (sscanf(line.c_str(), "%lx-%lx %4s %lx %x:%x %lu %511s",
+                       &item.start, &item.end, item.flags, &item.offset, &item.a, &item.b,
+                       &item.inode, item.name) >= 7)
             {
+              if (item.end <= item.start)
+                throw std::runtime_error("Invalid saved memory mapping extent");
               maps_saved.push_back(item);
             }
+            else
+              throw std::runtime_error("Invalid saved memory mapping text");
           }
         }
       }
@@ -376,50 +456,60 @@ void tracee_state::restore_memory_mappings(
   }
 
   if (maps_saved.empty())
-  {
-    /* Fallback: load from separate .maps file */
-    LOG_WARN("StateStore includes no mappings for tshash = %016lx", ts_hash);
-    std::string maps_path =
-        fileutils::format_hash_filename("mappings", ".maps", ts_hash);
-    auto maps_fp = fileutils::open_cfile(maps_path, "r");
-    if (maps_fp)
-    {
-      get_maps_item(maps_saved, maps_fp.get());
-    }
-  }
+    throw std::runtime_error("Snapshot contains no memory mappings");
 
   /* Get current mappings */
   std::string maps_path = fmt::format("/proc/{}/maps", pid);
   auto maps_fp = fileutils::open_cfile(maps_path, "r");
   std::vector<maps_item> maps_old;
-  if (maps_fp)
-  {
-    get_maps_item(maps_old, maps_fp.get());
-  }
+  if (!maps_fp)
+    throw std::runtime_error("Cannot read current memory mappings for restore");
+  get_maps_item(maps_old, maps_fp.get());
+  if (ferror(maps_fp.get()) || maps_old.empty())
+    throw std::runtime_error("Incomplete current memory mappings for restore");
 
   LOG_DEBUG("new maps has %d and old maps has %d items", maps_saved.size(),
             maps_old.size());
 
-  /* Unmap regions that exist in current but not in saved */
-  for (auto &item_old : maps_old)
-  {
-    LOG_TRACE("old item: [%lx-%lx] %s", item_old.start, item_old.end,
-              item_old.name);
-    if (!mapping_exists(item_old, maps_saved))
-    {
-      tracee_do_munmap(pid, item_old.start, item_old.end);
+  // Restore ranges rather than matching VMA endpoints: mprotect may split or
+  // merge VMAs while leaving the same underlying private mapping intact.
+  for (const auto& saved : maps_saved) {
+    if (excluded_mapping(saved) || !strcmp(saved.name, "[heap]")) continue;
+    if (saved.flags[3] != 'p')
+      throw std::runtime_error("Shared mappings are outside snapshot restore support");
+    uint64_t cursor = saved.start;
+    for (const auto& live : maps_old) {
+      if (live.end <= cursor || live.start >= saved.end) continue;
+      if (live.start > cursor) break;
+      if (!same_backing(saved, live, cursor)) break;
+      cursor = std::min(saved.end, live.end);
+      if (cursor == saved.end) break;
+    }
+    if (cursor != saved.end) {
+      if (saved.inode || saved.name[0])
+        throw std::runtime_error("Cannot recreate missing or replaced file-backed/named snapshot mapping");
+      void* result = tracee_do_mmap(pid, saved.start, saved.end, mapping_protection(saved.flags));
+      if (reinterpret_cast<uint64_t>(result) != saved.start)
+        throw std::runtime_error("Cannot recreate anonymous snapshot mapping");
     }
   }
 
-  /* Map regions that exist in saved but not in current */
-  for (auto &item_new : maps_saved)
-  {
-    LOG_TRACE("new item: [%lx-%lx] %s", item_new.start, item_new.end,
-              item_new.name);
-    if (!mapping_exists(item_new, maps_old))
-    {
-      tracee_do_mmap(pid, item_new.start, item_new.end);
+  // Remove only portions absent from the saved map, preserving split/merged
+  // neighbors and the tracer's injection page. Heap extent is restored by brk.
+  for (const auto& live : maps_old) {
+    if (excluded_mapping(live) || !strcmp(live.name, "[heap]")) continue;
+    uint64_t cursor = live.start;
+    for (const auto& saved : maps_saved) {
+      if (saved.end <= cursor || saved.start >= live.end) continue;
+      if (saved.start > cursor &&
+          tracee_do_syscall(pid, SYS_munmap, cursor, saved.start - cursor, 0, 0, 0, 0) != 0)
+        throw std::runtime_error("Cannot remove extra snapshot mapping range");
+      cursor = std::min(live.end, saved.end);
+      if (cursor == live.end) break;
     }
+    if (cursor < live.end &&
+        tracee_do_syscall(pid, SYS_munmap, cursor, live.end - cursor, 0, 0, 0, 0) != 0)
+      throw std::runtime_error("Cannot remove extra snapshot mapping range");
   }
 
   /* Return saved mappings for further processing */
@@ -439,11 +529,11 @@ void tracee_state::recover_mem_reg_snapshot(std::vector<maps_item> &maps,
 
   if (!data_shared_ptr)
   {
-    LOG_CRIT("Cannot load state for hash %016lx", ts_hash);
-    return;
+    throw std::runtime_error("Cannot load snapshot memory");
   }
 
   const std::vector<uint8_t> &data = *data_shared_ptr;
+  validate_state_header(data);
   // Parse header
   if (data.size() < sizeof(StateDataHeader))
   {
@@ -461,8 +551,12 @@ void tracee_state::recover_mem_reg_snapshot(std::vector<maps_item> &maps,
   RegionInfo *regions = (RegionInfo *)(data.data() + sizeof(StateDataHeader));
 
   /* Read current rseq structure to preserve it */
-  void *rseq = malloc(rseq_len[pid]);
-  tracee_read_mem(pid, rseq_struct[pid], rseq, rseq_len[pid]);
+  if (rseq_len[pid] < 0)
+    throw std::runtime_error("Invalid rseq size");
+  std::vector<uint8_t> rseq(rseq_len[pid]);
+  iovec rseq_local{rseq.data(), rseq.size()};
+  iovec rseq_remote{rseq_struct[pid], rseq.size()};
+  checked_memory_io(false, pid, &rseq_local, &rseq_remote, 1);
 
   // ========================================================================
   // Optimization 1: Aggregated IO - Batch multiple regions in single syscall
@@ -476,6 +570,12 @@ void tracee_state::recover_mem_reg_snapshot(std::vector<maps_item> &maps,
   struct iovec local_iov[MAX_IOV_BATCH];
   struct iovec remote_iov[MAX_IOV_BATCH];
   int iov_count = 0;
+  std::vector<maps_item> current_maps;
+  auto current_maps_file = fileutils::open_cfile(fmt::format("/proc/{}/maps", pid), "r");
+  if (!current_maps_file) throw std::runtime_error("Cannot inspect restore memory permissions");
+  get_maps_item(current_maps, current_maps_file.get());
+  std::vector<uint32_t> protected_regions;
+  std::vector<uint8_t> comparison;
 
   for (uint32_t i = 0; i < header->num_regions; i++)
   {
@@ -491,7 +591,7 @@ void tracee_state::recover_mem_reg_snapshot(std::vector<maps_item> &maps,
     bool valid = false;
     for (auto &item : maps)
     {
-      if (item.start <= start && end <= item.end && item.flags[1] == 'w')
+      if (item.start <= start && end <= item.end && item.flags[3] == 'p')
       {
         valid = true;
         break;
@@ -499,9 +599,7 @@ void tracee_state::recover_mem_reg_snapshot(std::vector<maps_item> &maps,
     }
     if (!valid)
     {
-      LOG_WARN("Region %lx-%lx not found in current maps, skipping", start,
-               end);
-      continue;
+      throw std::runtime_error("Snapshot private region missing during restore");
     }
 
     // Check data bounds
@@ -509,6 +607,41 @@ void tracee_state::recover_mem_reg_snapshot(std::vector<maps_item> &maps,
     {
       LOG_WARN("Region %lx-%lx data out of bounds", start, end);
       continue;
+    }
+
+    uint64_t readable_end = start;
+    bool original_permissions = true;
+    for (const auto& live : current_maps) {
+      if (live.end <= readable_end || live.start >= end) continue;
+      if (live.start > readable_end || live.flags[0] != 'r') break;
+      original_permissions &= mapping_protection(live.flags) == int(regions[i].prot);
+      readable_end = std::min(end, live.end);
+      if (readable_end == end) break;
+    }
+    if (readable_end == end) {
+      comparison.resize(size);
+      iovec local{comparison.data(), size_t(size)}, remote{reinterpret_cast<void*>(start), size_t(size)};
+      checked_memory_io(false, pid, &local, &remote, 1);
+      if (!memcmp(comparison.data(), data.data() + offset, size)) {
+        if (!original_permissions) restore_protection(pid, start, end, regions[i].prot);
+        continue;
+      }
+    }
+
+    uint64_t cursor = start;
+    bool already_writable = (regions[i].prot & PROT_WRITE) != 0;
+    for (const auto& live : current_maps) {
+      if (live.end <= cursor || live.start >= end) continue;
+      if (live.start > cursor || mapping_protection(live.flags) != int(regions[i].prot)) {
+        already_writable = false;
+        break;
+      }
+      cursor = std::min(end, live.end);
+      if (cursor == end) break;
+    }
+    if (!already_writable || cursor != end) {
+      restore_protection(pid, start, end, regions[i].prot | PROT_WRITE);
+      protected_regions.push_back(i);
     }
 
     // Fill iovec for this region
@@ -524,18 +657,7 @@ void tracee_state::recover_mem_reg_snapshot(std::vector<maps_item> &maps,
     // Flush batch when full
     if (iov_count >= MAX_IOV_BATCH)
     {
-      ssize_t n = syscall(SYS_process_vm_writev, pid, local_iov, iov_count,
-                          remote_iov, iov_count, 0);
-      if (n < 0)
-      {
-        LOG_ERROR("Batch process_vm_writev failed: %s", strerror(errno));
-        // Fallback: try individual writes
-        for (int j = 0; j < iov_count; j++)
-        {
-          tracee_write_mem(pid, remote_iov[j].iov_base, local_iov[j].iov_base,
-                           local_iov[j].iov_len);
-        }
-      }
+      checked_memory_io(true, pid, local_iov, remote_iov, iov_count);
       iov_count = 0;
     }
   }
@@ -543,30 +665,24 @@ void tracee_state::recover_mem_reg_snapshot(std::vector<maps_item> &maps,
   // Flush remaining regions
   if (iov_count > 0)
   {
-    ssize_t n = syscall(SYS_process_vm_writev, pid, local_iov, iov_count,
-                        remote_iov, iov_count, 0);
-    if (n < 0)
-    {
-      LOG_ERROR("Final batch process_vm_writev failed: %s", strerror(errno));
-      // Fallback: try individual writes
-      for (int j = 0; j < iov_count; j++)
-      {
-        tracee_write_mem(pid, remote_iov[j].iov_base, local_iov[j].iov_base,
-                         local_iov[j].iov_len);
-      }
-    }
+    checked_memory_io(true, pid, local_iov, remote_iov, iov_count);
   }
 
   /* Restore the preserved rseq structure */
-  tracee_write_mem(pid, rseq_struct[pid], rseq, rseq_len[pid]);
-  free(rseq);
+  checked_memory_io(true, pid, &rseq_local, &rseq_remote, 1);
+
+  // Restore every saved permission, including pages that were writable in S
+  // but read-only in the branch being discarded.
+  for (uint32_t i : protected_regions)
+    restore_protection(pid, regions[i].start, regions[i].end, regions[i].prot);
 
   // Read registers from data
   if (header->regs_offset + sizeof(struct user_regs_struct) <= data.size())
   {
     struct user_regs_struct regs;
     memcpy(&regs, data.data() + header->regs_offset, sizeof(regs));
-    ptrace(PTRACE_SETREGS, pid, NULL, &regs);
+    if (ptrace(PTRACE_SETREGS, pid, NULL, &regs) == -1)
+      throw std::runtime_error("Cannot restore main thread registers");
     LOG_TRACE("Restored registers for hash %016lx", ts_hash);
   }
   else
@@ -717,14 +833,14 @@ void tracee_state::restore_thread_registers(pid_t main_pid) const
     if (physical_tid > 0) {
       // Restore registers for this thread
       if (ptrace(PTRACE_SETREGS, physical_tid, NULL, (void*)&target_ts.regs) == 0) {
+        restore_xstate(physical_tid, target_ts.xstate);
         LOG_TRACE("Restored registers for virtual thread %d (physical %d)",
                   target_ts.tid, physical_tid);
       } else {
-        LOG_ERROR("Failed to restore registers for virtual thread %d (physical %d): %s",
-                  target_ts.tid, physical_tid, strerror(errno));
+        throw std::runtime_error("Cannot restore thread registers");
       }
     } else {
-      LOG_WARN("Could not find physical thread for virtual thread %d", target_ts.tid);
+      throw std::runtime_error("Cannot find physical thread for register restore");
     }
   }
 }
@@ -732,13 +848,11 @@ void tracee_state::restore_thread_registers(pid_t main_pid) const
 void tracee_state::recover_running_state(int index, hash_type ts_hash) const
 {
   pid_t main_pid = ptmc_state.pids[index];
+  /* Restore the kernel heap extent before reconciling VMAs. */
+  if (tracee_do_syscall(main_pid, SYS_brk, brk, 0, 0, 0, 0, 0) != brk)
+    throw std::runtime_error("Cannot restore snapshot brk");
   std::vector<maps_item> maps;
   restore_memory_mappings(ts_hash, main_pid, maps);
-
-  /* Restore brk (heap) - must be done before restoring memory content */
-  tracee_do_syscall(main_pid, SYS_brk, brk, 0, 0, 0, 0, 0);
-  LOG_DEBUG("restored brk = 0x%x", brk);
-
   recover_mem_reg_snapshot(maps, ts_hash, main_pid);
 
   /* ======================================================================
@@ -854,111 +968,52 @@ hash_type tracee_state::save_full_state_to_state_store(int pid)
   auto maps_fp = fileutils::open_cfile(maps_path, "r");
   if (!maps_fp)
   {
-    LOG_CRIT("Failed to open /proc/{}/maps", pid);
-    exit(1);
+    throw std::runtime_error("Cannot open tracee memory mappings for capture");
   }
 
-  // ========================================================================
-  // First pass: collect all writable regions
-  // ========================================================================
-  struct RegionToCapture
-  {
-    uint64_t start;
-    uint64_t end;
-    size_t size;
-    char flags[5];
-    char name[64];
-    int prot;
-  };
+  std::vector<maps_item> parsed_maps;
+  get_maps_item(parsed_maps, maps_fp.get());
+  if (ferror(maps_fp.get()) || parsed_maps.empty())
+    throw std::runtime_error("Failed to read tracee memory mappings");
+
+  // Kernel VMA partitions can change after mprotect without changing memory
+  // semantics. Store one canonical partition for adjacent equivalent ranges.
+  std::vector<maps_item> maps;
+  for (const auto& item : parsed_maps) {
+    bool merge = false;
+    if (!maps.empty()) {
+      const auto& previous = maps.back();
+      merge = previous.end == item.start && !excluded_mapping(previous) &&
+              !excluded_mapping(item) && !strcmp(previous.flags, item.flags) &&
+              !strcmp(previous.name, item.name) && same_backing(previous, item, item.start);
+    }
+    if (merge) maps.back().end = item.end;
+    else maps.push_back(item);
+  }
+
+  struct RegionToCapture { uint64_t start, end; size_t size; };
   std::vector<RegionToCapture> regions_to_capture;
-
-  char line[1024];
-  while (fgets(line, sizeof(line), maps_fp.get()))
-  {
-    uint64_t start, end;
-    char flags[5];
-    uint32_t offset;
-    int a, b, inode;
-    char name[64] = {};
-    sscanf(line, "%lx-%lx %4s %x %d:%d %d %63s", &start, &end, flags, &offset,
-           &a, &b, &inode, name);
-
-    /* Only save writable regions */
-    if (flags[1] != 'w')
-      continue;
-    if (start == scratch_page)
-      continue;
-
-    RegionToCapture region;
-    region.start = start;
-    region.end = end;
-    region.size = end - start;
-    memcpy(region.flags, flags, 5);
-    strncpy(region.name, name, 63);
-    region.prot = 0;
-    if (flags[0] == 'r')
-      region.prot |= PROT_READ;
-    if (flags[1] == 'w')
-      region.prot |= PROT_WRITE;
-    if (flags[2] == 'x')
-      region.prot |= PROT_EXEC;
-    regions_to_capture.push_back(region);
-  }
-
-  // ========================================================================
   std::vector<RegionInfo> regions;
-  regions.reserve(regions_to_capture.size());
-
   size_t regions_data_size = 0;
-  for (auto &src : regions_to_capture)
-  {
-    RegionInfo info;
-    info.start = src.start;
-    info.end = src.end;
-    info.prot = src.prot;
-    memcpy(info.flags, src.flags, 5);
+  std::string maps_text;
+  for (const auto& item : maps) {
+    maps_text += fmt::format("{:x}-{:x} {} {:x} {:x}:{:x} {} {}\n", item.start,
+                            item.end, item.flags, item.offset, item.a, item.b,
+                            item.inode, item.name);
+    if (excluded_mapping(item)) continue;
+    if (item.flags[3] != 'p' || item.flags[0] != 'r')
+      throw std::runtime_error(fmt::format("Unsupported snapshot mapping {:x}-{:x} {} {}: requires private readable memory",
+                                         item.start, item.end, item.flags, item.name));
+    RegionInfo info{};
+    info.start = item.start; info.end = item.end;
+    info.prot = mapping_protection(item.flags);
+    memcpy(info.flags, item.flags, 5);
     info.offset = regions_data_size;
     regions.push_back(info);
-    regions_data_size += src.size;
-
-    LOG_TRACE("dump %lx-%lx (prot=%x), %s", src.start, src.end, src.prot,
-              src.name);
+    regions_to_capture.push_back({item.start, item.end, size_t(item.end - item.start)});
+    regions_data_size += item.end - item.start;
   }
-
-  // Read mappings data from /proc/PID/maps
-  // Note: procfs files don't support fseek/ftell, must read until EOF
-  std::vector<uint8_t> maps_data;
-  {
-    std::string maps_path = fmt::format("/proc/{}/maps", pid);
-    LOG_TRACE("Reading maps from %s", maps_path.c_str());
-    FILE *maps_fp = fopen(maps_path.c_str(), "r");
-    if (maps_fp)
-    {
-      char buffer[4096];
-      size_t total_read = 0;
-      while (!feof(maps_fp))
-      {
-        size_t n = fread(buffer, 1, sizeof(buffer), maps_fp);
-        if (n > 0)
-        {
-          maps_data.insert(maps_data.end(), buffer, buffer + n);
-          total_read += n;
-        }
-        if (ferror(maps_fp) && !feof(maps_fp))
-        {
-          LOG_ERROR("Error reading maps file");
-          break;
-        }
-      }
-      fclose(maps_fp);
-      LOG_TRACE("Maps data read: %zu bytes, data size: %zu", total_read,
-                maps_data.size());
-    }
-    else
-    {
-      LOG_ERROR("Failed to open %s", maps_path.c_str());
-    }
-  }
+  std::vector<uint8_t> maps_data(maps_text.begin(), maps_text.end());
 
   // ========================================================================
   // Multi-threading support: save all thread registers
@@ -966,6 +1021,8 @@ hash_type tracee_state::save_full_state_to_state_store(int pid)
   // ========================================================================
   threads.clear();
   auto thread_list = get_thread_list(pid);
+  if (thread_list.empty())
+    throw std::runtime_error("Cannot capture an empty thread register set");
 
   int virtual_tid = 1;
   for (pid_t physical_tid : thread_list) {
@@ -974,6 +1031,7 @@ hash_type tracee_state::save_full_state_to_state_store(int pid)
       thread_state ts;
       ts.tid = virtual_tid;  // Use virtual TID (index + 1)
       ts.regs = thread_regs;
+      ts.xstate = capture_xstate(physical_tid);
 
       // Store physical TID for stable mapping
       ts.physical_tid = physical_tid;
@@ -995,7 +1053,7 @@ hash_type tracee_state::save_full_state_to_state_store(int pid)
       LOG_TRACE("Saved thread physical=%d virtual=%d (main=%d) registers",
                 physical_tid, ts.tid, ts.is_main);
     } else {
-      LOG_WARN("Failed to get registers for thread %d", physical_tid);
+      throw std::runtime_error("Cannot capture registers for thread " + std::to_string(physical_tid));
     }
     virtual_tid++;
   }
@@ -1021,7 +1079,8 @@ hash_type tracee_state::save_full_state_to_state_store(int pid)
 
   // Get main thread registers (for backward compatibility)
   struct user_regs_struct regs;
-  ptrace(PTRACE_GETREGS, pid, NULL, &regs);
+  if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) == -1)
+    throw std::runtime_error("Cannot capture main thread registers");
 
   // Serialize tracee_state AFTER threads have been populated
   std::vector<uint8_t> tstate_data;
@@ -1043,11 +1102,12 @@ hash_type tracee_state::save_full_state_to_state_store(int pid)
 
   size_t total_size = header_size + regions_size + tstate_size + maps_size +
                       regions_data_size + sizeof(regs);
-  uint8_t *all_data = new uint8_t[total_size];
+  std::vector<uint8_t> buffer(total_size);
+  uint8_t *all_data = buffer.data();
 
   StateDataHeader *header = (StateDataHeader *)all_data;
   header->magic = 0x4453544D;
-  header->version = 3;
+  header->version = 4;
   header->num_regions = regions.size();
   header->tstate_offset = header_size + regions_size;
   header->tstate_size = tstate_size;
@@ -1086,28 +1146,7 @@ hash_type tracee_state::save_full_state_to_state_store(int pid)
       remote_iov[i].iov_len = src.size;
     }
 
-    ssize_t n = syscall(SYS_process_vm_readv, pid, local_iov, batch_count,
-                        remote_iov, batch_count, 0);
-    if (n < 0)
-    {
-      LOG_ERROR("Batch process_vm_readv failed: %s", strerror(errno));
-      for (size_t i = 0; i < batch_count; i++)
-      {
-        size_t idx = batch_start + i;
-        auto &src = regions_to_capture[idx];
-        uint8_t *dest = all_data + region_infos[idx].offset;
-        struct iovec local = {dest, src.size};
-        struct iovec remote = {(void *)src.start, src.size};
-        ssize_t nr =
-            syscall(SYS_process_vm_readv, pid, &local, 1, &remote, 1, 0);
-        if ((size_t)nr != src.size)
-        {
-          LOG_ERROR("Fallback read failed for %p-%p", (void *)src.start,
-                    (void *)(src.start + src.size));
-          memset(dest, 0, src.size);
-        }
-      }
-    }
+    checked_memory_io(false, pid, local_iov, remote_iov, batch_count);
 
     for (size_t i = 0; i < batch_count; i++)
     {
@@ -1118,6 +1157,8 @@ hash_type tracee_state::save_full_state_to_state_store(int pid)
       {
         uintptr_t rseq_offset = (uintptr_t)rseq_struct[pid] - src.start;
         uint8_t *dest = all_data + region_infos[idx].offset;
+        if (rseq_len[pid] < 0 || size_t(rseq_len[pid]) > src.size - rseq_offset)
+          throw std::runtime_error("rseq extends beyond captured memory region");
         memset(dest + rseq_offset, 0x55, rseq_len[pid]);
       }
     }
@@ -1136,7 +1177,6 @@ hash_type tracee_state::save_full_state_to_state_store(int pid)
 
   hash_type ts_hash = StateStore::instance().save(all_data, total_size);
 
-  delete[] all_data;
 
   LOG_DEBUG("StateStore saved hash %016lx, size=%zu, regions=%zu, tstate=%zu, "
             "maps=%zu",
@@ -1289,70 +1329,31 @@ int tracee_state::find_thread_index(pid_t tid) const
  * ====================================================================== */
 
 /* Read memory from snapshot by hash using StateStore */
-void *read_mem(int pid, hash_type ts_hash, uint64_t addr, long size)
+void *read_mem(int /*pid*/, hash_type ts_hash, uint64_t addr, long size)
 {
-  bytes *ret = (bytes *)malloc(size + 1);
-  ret[size] = 0;
-
-  // Load state data from StateStore
-  auto data_shared_ptr = StateStore::instance().load_shared(ts_hash);
-
-  if (!data_shared_ptr)
-  {
-    LOG_CRIT("Cannot load state for hash %016lx in read_mem", ts_hash);
-    // Fallback: try reading from live process
-    tracee_read_mem(pid, (void *)addr, ret, size);
-    return ret;
-  }
-
-  const std::vector<uint8_t> &data = *data_shared_ptr;
-
-  // Parse header
-  if (data.size() < sizeof(StateDataHeader))
-  {
-    LOG_CRIT("Invalid state data for hash %016lx", ts_hash);
-    tracee_read_mem(pid, (void *)addr, ret, size);
-    return ret;
-  }
-
-  StateDataHeader *header = (StateDataHeader *)data.data();
-  if (header->magic != 0x4453544D)
-  {
-    LOG_CRIT("Invalid state data format for hash %016lx", ts_hash);
-    tracee_read_mem(pid, (void *)addr, ret, size);
-    return ret;
-  }
-
-  RegionInfo *regions = (RegionInfo *)(data.data() + sizeof(StateDataHeader));
-
-  // Find region containing addr
-  for (uint32_t i = 0; i < header->num_regions; i++)
-  {
-    if (regions[i].start <= addr && addr < regions[i].end)
-    {
-      uint64_t offset_in_region = addr - regions[i].start;
-      uint64_t data_offset = regions[i].offset + offset_in_region;
-      size_t bytes_available = regions[i].end - addr;
-      size_t bytes_to_copy = std::min((size_t)size, bytes_available);
-
-      if (data_offset + bytes_to_copy <= data.size())
-      {
-        memcpy(ret, data.data() + data_offset, bytes_to_copy);
-        LOG_TRACE("read addr %p from state data (region %u)", (void *)addr, i);
-      }
-      else
-      {
-        LOG_ERROR("Data offset out of bounds for addr %p", (void *)addr);
-      }
-      return ret;
+  if (size < 0 || uint64_t(size) > UINT64_MAX - addr)
+    throw std::runtime_error("Invalid snapshot memory read range");
+  auto saved = StateStore::instance().load_shared(ts_hash);
+  if (!saved)
+    throw std::runtime_error("Cannot read unavailable snapshot");
+  validate_state_header(*saved);
+  const auto* header = reinterpret_cast<const StateDataHeader*>(saved->data());
+  const auto* regions = reinterpret_cast<const RegionInfo*>(saved->data() + sizeof(StateDataHeader));
+  auto result = std::unique_ptr<bytes, decltype(&free)>(static_cast<bytes*>(malloc(size_t(size) + 1)), &free);
+  if (!result) throw std::bad_alloc();
+  size_t copied = 0;
+  for (uint32_t i = 0; i < header->num_regions && copied < size_t(size); ++i) {
+    const uint64_t current = addr + copied;
+    if (regions[i].start <= current && current < regions[i].end) {
+      const size_t length = std::min(uint64_t(size - copied), regions[i].end - current);
+      memcpy(result.get() + copied, saved->data() + regions[i].offset + current - regions[i].start, length);
+      copied += length;
     }
   }
-
-  // Region not found in saved state, try live process
-  LOG_TRACE("addr %p not in saved state, reading from live process",
-            (void *)addr);
-  tracee_read_mem(pid, (void *)addr, ret, size);
-  return ret;
+  if (copied != size_t(size))
+    throw std::runtime_error("Requested memory range is absent from snapshot");
+  result.get()[size] = 0;
+  return result.release();
 }
 
 /* ======================================================================
@@ -1361,17 +1362,21 @@ void *read_mem(int pid, hash_type ts_hash, uint64_t addr, long size)
 
 void get_maps_item(std::vector<maps_item> &items, FILE *maps)
 {
-  maps_item item;
   char line[1024];
   while (fgets(line, sizeof(line), maps) != NULL)
   {
+    maps_item item{};
     /* Use width-limited format specifiers to prevent buffer overflow */
-    if (sscanf(line, "%lx-%lx %4s %x %d:%d %d %511s", &item.start, &item.end,
+    if (sscanf(line, "%lx-%lx %4s %lx %x:%x %lu %511s", &item.start, &item.end,
                item.flags, &item.offset, &item.a, &item.b, &item.inode,
                item.name) >= 7)
     {
+      if (item.end <= item.start)
+        throw std::runtime_error("Invalid memory mapping extent");
       items.emplace_back(item);
     }
+    else
+      throw std::runtime_error("Invalid memory mapping text");
   }
 }
 

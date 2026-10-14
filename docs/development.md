@@ -14,6 +14,8 @@ make help
 make check
 make check-integration   # production DWARF/ELF fixtures; default NP=1
 make check-scenarios     # build NP=1 tracer and run isolated native ptrace scenarios
+make check-xstate check-exec check-state-io check-mappings # NP=1 state/atom gates
+make check-identity check-port # NP=2 identity and deterministic network state
 make check-accept        # NP=2 cross-process accept address/length regressions
 make check-redis         # NP=2 fixed-schedule SET/GET with existing Redis debug binary
 make NP=1 -j4
@@ -91,9 +93,9 @@ Consolidation requires equivalence tests; see the backlog.
   Do not restore those to the default gate merely by suppressing compile errors.
 - `make check-integration` links the production parser against real DWARF 4/5
   multi-CU fixtures and tests ELF Go-section classification. It does not use ptrace.
-- `make check-scenarios NP=1` runs nine real tracer scenarios: interactive/batch
-  commands, filename-independent startup, finite execution, restore/replay identity,
-  finite BFS and a reachable violation, normal/SIGTERM child cleanup. Each run
+- `make check-scenarios NP=1` runs real tracer scenarios: interactive/batch
+  commands, filename-independent startup, finite execution, restore/replay identity and SIMD state,
+  finite BFS and a reachable violation, normal/SIGTERM child cleanup and automatic-search exception cleanup. Each run
   owns a temporary directory, session and timeout. Host ASLR is not changed.
   Ptrace must be permitted by the execution environment; permission failures fail
   the gate rather than silently skip it. These are NP=1 single-thread checks.
@@ -107,6 +109,10 @@ The scenario fixture intentionally ignores write return values: VFS currently
 rejects standard-stream writes (C15). Loader CPU-feature normalization also logs
 an unresolved symbol (C17). Passing counter/replay tests does not close either gap,
 nor does it prove multithread, cross-process-run or eviction correctness.
+
+Snapshot format is now version 4; old snapshots are rejected without migration.
+Private readable mappings are captured; shared/unreadable mappings, overlaps with
+the reserved scratch page and missing file-backed restore mappings fail explicitly.
 
 Run the NP=1 and NP=2 gates in separate make invocations. The Redis gate requires
 the existing `examples/redis/redis/src/redis-server`; it downloads nothing and

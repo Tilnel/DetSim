@@ -191,3 +191,50 @@ instrumented DWARF parser also passed the original Redis input with
 Compiler builds,
 regressions, DWARF ASan/UBSan runs, new-test formatting, Python syntax and diff
 checks provide the verification evidence above.
+
+## State/atom contract repair pass
+
+Plan: first turn the demonstrated XMM failure into a regression and capture user
+XSTATE per thread, bumping/rejecting incompatible snapshot versions. Fix current
+syscall inputs before entry dispatch. Use one completed syscall per automatic
+transition as the conservative reference boundary, rather than silently consuming
+CKPT_NO loops. Require complete snapshot I/O and reject missing/invalid state.
+
+Next replace XOR system identity with an ordered, versioned hash of exactly the
+serialized semantic metadata (node hashes, status and error budget), protected by
+permutation/status/budget tests. Remove host RNG from TCP port allocation using
+serialized socket state. Keep mapping/thread/time semantics outside those fixes
+explicit until their own regressions exist. Add nonzero top-level error handling
+so restoration failure cannot be mistaken for a valid successor; preserve old
+snapshot files and reject them rather than mutate/migrate them in place.
+
+Mapping follow-up was required because strict saved-memory reads exposed missing
+read-only literals. Capture now includes all private readable regions; restore
+preserves permissions and backing, and rejects unsupported mappings. Canonical
+adjacent VMAs prevent restore-induced split/merge hash drift. Unchanged memory
+regions skip copy/protection changes. A reserved scratch VMA that expands into
+application memory is rejected, never silently omitted.
+
+Verification: component/build-contract and DWARF/ELF gates; XSTATE, exact I/O,
+mapping, syscall-boundary, ordered-identity and TCP-port regressions; native
+restore/replay scenarios and Redis SET/GET. Independent review required explicit
+monitor shutdown during search exceptions as well as scratch-overlap rejection.
+Remaining semantic gaps are tracked in correctness-backlog.md; this pass does not
+establish multithread exploration completeness or virtualize time/signals.
+
+Final commands (all successful, GCC 14 via explicit compiler paths):
+
+```sh
+make NP=1 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4 check check-integration check-xstate check-exec check-state-io check-mappings
+make NP=1 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4 tracer check-mappings check-state-io
+make NP=1 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4 check-scenarios
+make NP=2 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4 tracer check-identity check-port check-accept check-redis
+python3 -m py_compile tests/tracer_scenarios.py tests/redis_scenario.py
+git diff --check
+```
+
+The final native suite has 11 scenarios, including repeated SIMD restoration and
+BFS/DFS/random-search failure cleanup. Accept has 12 cases; the final Redis client
+and tracer both exit 0 after exact SET/GET replies (7.65 seconds on this host).
+Touched state code passed warning checks; the scheduler retains its existing unused
+variable/parameter warnings. No whole-project static-analysis-clean claim is made.

@@ -25,7 +25,7 @@ class FutexState;
 struct __attribute__((packed)) StateDataHeader
 {
   uint32_t magic;         // 'DSTM' = 0x4453544D
-  uint32_t version;       // 3 (updated for integrated mappings)
+  uint32_t version;       // 4 (per-thread XSTATE; older snapshots are incompatible)
   uint32_t num_regions;   // number of memory regions
   uint64_t tstate_offset; // offset to serialized tracee_state
   uint64_t tstate_size;   // size of serialized tracee_state
@@ -80,7 +80,8 @@ struct thread_state
 {
   pid_t tid;                      // Virtual TID (stable thread index + 1)
   pid_t physical_tid;             // Physical TID (actual kernel thread ID)
-  struct user_regs_struct regs;   // Register context
+  struct user_regs_struct regs{}; // General-purpose register context
+  std::vector<uint8_t> xstate;     // Complete Linux NT_X86_XSTATE register set
   uint64_t clone_flags;           // Clone flags used to create this thread
   uint64_t stack_addr;            // Stack address (for clone)
   pid_t ptid;                     // Parent thread TID
@@ -98,7 +99,7 @@ struct thread_state
        regs.r11, regs.r10, regs.r9, regs.r8, regs.rax, regs.rcx, regs.rdx,
        regs.rsi, regs.rdi, regs.orig_rax, regs.rip, regs.cs, regs.eflags,
        regs.rsp, regs.ss, regs.fs_base, regs.gs_base, regs.ds, regs.es,
-       regs.fs, regs.gs, clone_flags, stack_addr, ptid, is_main);
+       regs.fs, regs.gs, clone_flags, stack_addr, ptid, is_main, xstate);
   }
 };
 
@@ -310,7 +311,7 @@ public:
  */
 typedef struct sys_state
 {
-  hash_type ss_hash;        // Global state hash (XOR of all ts_hash)
+  hash_type ss_hash;        // Ordered global semantic metadata identity
   hash_type ts_hash[NP];    // Per-process state hashes
   tracee_state child[NP];   // Per-process detailed state
   int status[NP];           // Per-process status (running/exited/etc)
@@ -343,6 +344,7 @@ typedef struct sys_state
    * --------------------------------------------------------- */
 
   int save_metadata() const;
+  hash_type identity_hash() const;
 
   /* ---------------------------------------------------------
    * Recovery

@@ -5,6 +5,7 @@
 #include "segv_handler.hpp"
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <signal.h>
 #include <execinfo.h>
 
@@ -31,9 +32,8 @@ extern "C" detsim::ui::NCursesUI *get_ncurses_ui() { return g_ui; }
 extern int use_ui;
 extern char *batch_file;
 
-int main(int argc, char *argv[])
+static int run_tracer(int argc, char *argv[])
 {
-  ThreadAltStack main_altstack;
 
   /* 先解析参数（设置 loglevel, use_ui, batch_file） */
   parse_args(argc, argv);
@@ -125,4 +125,21 @@ int main(int argc, char *argv[])
   detsim::utils::FileLock::release();
 
   return 0;
+}
+
+int main(int argc, char *argv[])
+{
+  ThreadAltStack main_altstack;
+  try
+  {
+    return run_tracer(argc, argv);
+  }
+  catch (const std::exception &error)
+  {
+    // Returning from main still runs the registered owned-tracee cleanup.
+    // A failed capture/restore is a checker failure, not a valid model state.
+    fprintf(stderr, "DetSim state/execution error: %s\n", error.what());
+    detsim::utils::FileLock::release();
+    return 1;
+  }
 }
