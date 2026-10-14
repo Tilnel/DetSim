@@ -9,7 +9,7 @@ ifneq ($(filter benchmark-redisraft,$(MAKECMDGOALS)),)
 NP ?= 3
 endif
 
-ifneq ($(filter check-accept check-redis check-port check-identity check-capture,$(MAKECMDGOALS)),)
+ifneq ($(filter check-accept check-redis check-port check-identity check-capture check-io-boundary,$(MAKECMDGOALS)),)
 NP ?= 2
 endif
 
@@ -48,7 +48,7 @@ SRCS = src/main.cpp\
        src/core/engine/thread_manager.cpp src/core/engine/signal_handler.cpp src/core/engine/exec_engine.cpp \
        src/core/syscall/dispatcher.cpp src/core/syscall/handlers.cpp \
        src/subsys/net/sockstate.cpp src/subsys/net/emu.cpp \
-       src/subsys/fs/fsstate.cpp src/subsys/fs/fd_manager.cpp \
+       src/subsys/fs/fsstate.cpp src/subsys/fs/fd_manager.cpp src/subsys/io.cpp \
        src/subsys/sync/futexstate.cpp \
        src/utils/utils.cpp src/utils/expr.cpp src/utils/expr_ast.cpp \
        src/utils/expr_lexer.cpp src/utils/expr_parser.cpp \
@@ -117,7 +117,7 @@ check-build-contracts:
 check: test check-build-contracts
 
 # Optional fragments are absent in the disposable build-contract fixtures.
--include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk tests/futex_snapshot.mk tests/futex.mk tests/storage.mk tests/store_cache.mk tests/store_packed.mk tests/redisraft.mk tests/capture.mk tests/soft_dirty.mk tests/page_snapshot.mk
+-include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk tests/futex_snapshot.mk tests/futex.mk tests/storage.mk tests/store_cache.mk tests/store_packed.mk tests/redisraft.mk tests/capture.mk tests/soft_dirty.mk tests/page_snapshot.mk tests/io_boundary.mk
 check-integration: check-dwarf check-elf
 
 # This gate executes native programs via ptrace; keep it separate from make check.
@@ -146,6 +146,7 @@ help:
 	@echo 'make check-capture         NP=2 full-versus-optimized snapshot equivalence'
 	@echo 'make check-soft-dirty      Experimental kernel soft-dirty byte oracle'
 	@echo 'make check-page-snapshot   v5/v6 page storage, reads, corruption and reopen'
+	@echo 'make check-io-boundary     NP=2 virtual FD/socket/pipe/epoll and archive gates'
 	@echo 'make check-identity         NP=2 ordered metadata identity regression'
 	@echo 'make check-port             NP=2 deterministic virtual TCP ports regression'
 	@echo 'make benchmark-redisraft    NP=3 bounded Raft replication and DFS benchmark'

@@ -20,7 +20,8 @@ int emu_gettimeofday(struct timeval *tv, struct timezone *tz)
   {
     // LOG_INFO("gettimeofday: returning simulated time %ld.%06ld", tracee_tv.tv_sec,
     //          tracee_tv.tv_usec);
-    memcpy_host2guest(tv, &tracee_tv, sizeof(struct timeval));
+    if (tv && !guest_write_exact(ptmc_state.pids[index], tv, &tracee_tv, sizeof(tracee_tv)))
+      return -EFAULT;
     return 0;
   }
 

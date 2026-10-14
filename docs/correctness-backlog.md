@@ -22,7 +22,7 @@ relationship to the native-binary model-checking goal.
 | C12 | Fixed | `handle_exit_group` wrote a raw wait status without the DetSim exited flag; successful exit became “running” and the next step crashed. | Finite program reaches counter 1/2/3, exits virtually, and further stepping reports exit status 0. |
 | C13 | Fixed | BFS reset an optional on violation, continued executing and printed a false completion message. | Reachable `counter < 3` violation interrupts BFS without printing completion; ordinary finite BFS explores the expected five states. |
 | C14 | Fixed | Batch command parser pointed at the NUL inserted by strtok and discarded all arguments. | Real batch handles whitespace, `sw 0`, `p counter` and `q`. |
-| C15 | P1 | Standard streams are absent from VFS open_files; intercepted `write(1, ...)` returns `-EBADF`. The counter fixture ignores that return value. | Define deterministic stdin/stdout/stderr semantics and test writes, errors, close and restore; do not silently pass through external I/O. |
+| C15 | Fixed (captured streams) | STDIO descriptors share the virtual FD registry; stdin is deterministic EOF and stdout/stderr content is archived VFS state. | `check-io-boundary` covers access modes, writes, close, archive and branch isolation; terminal input/output and interactive stdin remain unsupported. |
 | C16 | Fixed (scoped) | WAKE unblocks removed waiters, successful WAIT saves a suspended successor with return 0; requeue uses arg4 count/arg6 comparison, returns total affected and handles same address safely. | `check-futex` covers real ptrace WAIT/WAKE/bitset/requeue/errors; unsupported timed/realtime/PI operations explicitly fail. Exhaustive wake-order outcomes remain outside coverage. |
 | C17 | P1 | CPU-feature patch logs “Symbol not found” on ordinary dynamic workloads because the requested loader symbol is not resolved. | Define and test which nondeterministic CPU/runtime state must be normalized; avoid assuming this patch worked from a successful scenario. |
 | C20 | Fixed (host user XSTATE) | Capture/archive/restore NT_X86_XSTATE for each thread; snapshot version 5 rejects old formats. | `check-xstate` covers XMM/AVX/x87/MXCSR; native SIMD scenario repeatedly restores observed=0 and replays observed=11. Cross-host layouts and supervisor state are outside coverage. |
@@ -38,8 +38,8 @@ relationship to the native-binary model-checking goal.
 
 ## Next development slice
 
-Page snapshot branch (2026-10-15): opt-in v6 manifests and page objects use the
-existing barrier; v5 stays default. Exact decoded v5/v6 ptrace oracles, cold/tiny
+Page snapshot branch (2026-10-15): opt-in page manifests (now v8) and page objects use the
+existing barrier; flat snapshots (now v7) stay default. Exact decoded flat/page ptrace oracles, cold/tiny
 reads, fresh-process inspection, missing/corrupt pages and warmed-cache poisoning
 have regressions. Both formats compare live bytes and restore only differing pages.
 This strengthens C08 evidence without closing general canonicalization, complete
@@ -62,8 +62,8 @@ Redis findings and resolution:
   and 64 MiB RSS under a 1-GiB cap (previously >45 seconds / 6.2 GiB sampled RSS).
 - **C19 / fixed for the supported path:** Checked guest sockaddr/length copies,
   length writeback, truncation, fd/peer matching and stale queue handling pass 12
-  cross-process cases; original Redis SET/GET now completes. Snapshot representation
-  is unchanged. Ambiguous multiple same-fd peers explicitly return EOPNOTSUPP.
+  cross-process cases; original Redis SET/GET now completes. Pending connections now use captured endpoint keys; same numeric client FDs
+  across nodes no longer alias. Snapshot formats are7/8.
   EFAULT retains the virtual pending connection; partial copyout is not rolled back.
   These error-path modeling limits and accept4 flag fidelity need further coverage.
 
@@ -72,7 +72,7 @@ restoration, ordered system identity and a completed-syscall reference boundary.
 Next define and enforce the supported binary/environment/property profile, close
 remaining host inputs (C23), and complete thread lifecycle restoration C02 and explicit
 actor enumeration C03/C25. C01/C16 now have scoped branch-state/syscall regressions. Consolidate schedulers only with successor-set
-and property-observation comparisons. Standard streams (C15), eviction and wider
+and property-observation comparisons. Eviction and wider
 mapping coverage (C08) remain necessary for broader workloads.
 
 Current scenario evidence is NP=1, native non-PIE, single-thread, with inherited
@@ -80,3 +80,21 @@ ASLR unchanged. It verifies repeated restore within one live process, not cross-
 canonical hashes, multi-node symmetry, complete syscall fidelity or general search
 soundness. The early single-thread commit (`c21c496`) remains a design reference,
 not a proven oracle.
+
+## Joint virtual I/O boundary slice (2026-10-15)
+
+A shared typed descriptor registry now owns allocation and flags. Files, pipes,
+sockets and epoll dispatch through one read/write/close boundary. Guest copies
+are exact; failed copyout retains offsets/queued payloads (guest memory may have
+a partial prefix written). Archives include pipe endpoints/queues, pre-accept
+TCP payloads, socket options and epoll opaque userdata. Old format5/6 is rejected.
+Unsupported descriptor/path syscalls stop before host kernel effects; this is a
+supported profile, not complete Linux emulation.
+
+Still open: blocking read/accept/epoll wakeups/timeouts; dup/shared open-file
+descriptions; cross-node shared filesystem ownership; symlinks; advanced epoll
+ET/ONESHOT/nesting and temporary signal masks; TCP timers/Nagle/keepalive effects.
+Private VFS mmap copies initial bytes and restores permissions, but does not track
+subsequent file writes into clean mapped pages. fsync validates a virtual regular
+file without modeling filesystem crashes/durability. These require new transition
+and snapshot contracts, rather than success-only syscall stubs.

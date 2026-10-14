@@ -2,12 +2,14 @@
 #include "cereal/archives/binary.hpp"
 #include "cereal/cereal.hpp"
 #include "cereal/types/map.hpp"
+#include "cereal/types/deque.hpp"
 #include "cereal/types/string.hpp"
 #include "cereal/types/utility.hpp"
 #include "cereal/types/vector.hpp"
 #include "debug.h"
 #include "monitor.h"
-#include "sockstate.h"
+#include "guest.h"
+#include "io.h"
 #include <algorithm>
 #include <cstring>
 #include <ctime>
@@ -15,9 +17,9 @@
 #include <fcntl.h>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <libgen.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/types.h>
 #include <time.h>
 
@@ -43,36 +45,45 @@ void VFSNode::serialize(Archive &ar)
 template <class Archive>
 void OpenFileDescription::serialize(Archive &ar)
 {
-  ar(CEREAL_NVP(path), CEREAL_NVP(offset), CEREAL_NVP(flags));
+  ar(CEREAL_NVP(path), CEREAL_NVP(offset));
 }
 
 template <class Archive>
 void FileSystemState::serialize(Archive &ar)
 {
   /* Note: fd_manager_ is shared and not serialized per instance */
-  ar(filesystem, open_files, cwd, mappings);
+  ar(filesystem, open_files, cwd, mappings, pipes_, pipe_fds_);
 }
 
 /* --- FileSystemState Method Implementations --- */
 
-int FileSystemState::get_new_fd()
+FileSystemState::FileSystemState() : cwd(""), fd_manager_()
 {
-  if (!fd_manager_)
+  // Embedded NUL keys cannot be named by a guest pathname.
+  for (int fd = 0; fd < 3; ++fd)
   {
-    LOG_ERROR("FdManager not set!");
-    return -1;
+    std::string path(1, '\0');
+    path += "stdio" + std::to_string(fd);
+    VFSNode node{};
+    node.metadata.st_mode = S_IFCHR | 0600;
+    filesystem.emplace(path, std::move(node));
+    open_files.emplace(fd, OpenFileDescription{path, 0});
   }
-  return fd_manager_->allocate_fd(FdType::FILE);
 }
 
-int FileSystemState::allocate_fd(FdType type)
+FileSystemState::FileSystemState(FdManagerPtr fd_mgr) : FileSystemState()
+{
+  set_fd_manager(std::move(fd_mgr));
+}
+
+int FileSystemState::allocate_fd(FdType type, int status_flags, int descriptor_flags)
 {
   if (!fd_manager_)
   {
     LOG_ERROR("FdManager not set!");
     return -1;
   }
-  return fd_manager_->allocate_fd(type);
+  return fd_manager_->allocate_fd(type, status_flags, descriptor_flags);
 }
 
 void FileSystemState::release_fd(int fd)
@@ -213,38 +224,10 @@ const std::string &FileSystemState::get_cwd() const { return cwd; }
 
 std::string FileSystemState::resolve_path(int dirfd, const std::string &path)
 {
-  if (path.empty())
-    return cwd.empty() ? std::string("/") : cwd;
-  if (path[0] == '/')
-  {
-    return path;
-  }
-  // relative path
   std::string base;
-  if (dirfd == AT_FDCWD)
-  {
-    base = cwd.empty() ? "/" : cwd;
-  }
-  else
-  {
-    auto it = open_files.find(dirfd);
-    if (it != open_files.end())
-    {
-      std::string p = it->second.path;
-      // if it's a file, use its directory
-      size_t pos = p.find_last_of('/');
-      if (pos == std::string::npos)
-        base = "/";
-      else if (pos == 0)
-        base = "/";
-      else
-        base = p.substr(0, pos);
-    }
-    else
-    {
-      base = cwd.empty() ? "/" : cwd;
-    }
-  }
+  if (!path.empty() && path[0] == '/') base = "";
+  else if (dirfd == AT_FDCWD) base = cwd.empty() ? "/" : cwd;
+  else base = open_files.at(dirfd).path;
   // normalize
   std::string combined = join_paths(base, path);
   // collapse /. and /.. (simple implementation)
@@ -288,15 +271,43 @@ std::string FileSystemState::resolve_path(int dirfd, const std::string &path)
   return out;
 }
 
+int FileSystemState::resolve_path_checked(int dirfd, const std::string& path, std::string& result)
+{
+  if (path.empty()) return -ENOENT;
+  if (path[0]!='/' && dirfd!=AT_FDCWD) {
+    if (!fd_manager_ || !fd_manager_->is_allocated(dirfd)) return -EBADF;
+    const auto open=open_files.find(dirfd);
+    if (open==open_files.end()) return -ENOTDIR;
+    const auto node=filesystem.find(open->second.path);
+    if (node==filesystem.end()) throw std::runtime_error("Directory descriptor has no payload");
+    if (!S_ISDIR(node->second.metadata.st_mode)) return -ENOTDIR;
+  }
+  result=resolve_path(dirfd,path);
+  return 0;
+}
+
 int FileSystemState::do_open(const std::string &path, int flags, mode_t mode)
 {
-  // Simplified path handling for now. Assumes absolute paths.
+  if (path.empty())
+    return -ENOENT;
+  if (path.find('\0') != std::string::npos)
+    return -EINVAL;
+  if ((flags & O_ACCMODE) == O_ACCMODE)
+    return -EINVAL;
+  if ((flags & (O_ASYNC | O_DIRECT | O_NOATIME | O_PATH)) ||
+      (flags & O_TMPFILE) == O_TMPFILE)
+    throw std::runtime_error("Unsupported virtual open flags");
+  if (!fd_manager_)
+    return -EMFILE;
   auto it = filesystem.find(path);
   bool exists = (it != filesystem.end());
 
   if (exists)
   {
-    // File exists. Check permissions, etc. (to be implemented)
+    if ((flags & O_DIRECTORY) && !S_ISDIR(it->second.metadata.st_mode))
+      return -ENOTDIR;
+    if (S_ISDIR(it->second.metadata.st_mode) && (flags & O_ACCMODE) != O_RDONLY)
+      return -EISDIR;
     if ((flags & O_CREAT) && (flags & O_EXCL))
     {
       return -EEXIST;
@@ -304,11 +315,13 @@ int FileSystemState::do_open(const std::string &path, int flags, mode_t mode)
   }
   else
   {
+    if (flags & O_DIRECTORY)
+      return -ENOENT;
     // File does not exist.
     if (flags & O_CREAT)
     {
       // Create a new file node
-      VFSNode newNode;
+      VFSNode newNode{};
 #ifdef FSSTATE_DETAILED_METADATA
       memset(&newNode.metadata, 0, sizeof(struct stat));
       newNode.metadata.st_nlink = 1;
@@ -317,7 +330,7 @@ int FileSystemState::do_open(const std::string &path, int flags, mode_t mode)
       newNode.metadata.st_atime = newNode.metadata.st_mtime =
           newNode.metadata.st_ctime = time(NULL);
 #endif
-      newNode.metadata.st_mode = mode;
+      newNode.metadata.st_mode = S_IFREG | (mode & 07777);
       newNode.metadata.st_size = 0;
       filesystem[path] = newNode;
     }
@@ -329,11 +342,19 @@ int FileSystemState::do_open(const std::string &path, int flags, mode_t mode)
 
   // If we got here, the file is accessible or was created.
   // Now, create an open file description for it.
-  int fd = get_new_fd();
+  int fd = allocate_fd(FdType::FILE,
+                       flags & ~(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC),
+                       (flags & O_CLOEXEC) ? FD_CLOEXEC : 0);
+  if (fd < 0)
+    return -EMFILE;
+  if ((flags & O_TRUNC) && (flags & O_ACCMODE) != O_RDONLY)
+  {
+    filesystem.at(path).content.clear();
+    filesystem.at(path).metadata.st_size = 0;
+  }
   OpenFileDescription ofd;
   ofd.path = path;
-  ofd.flags = flags;
-  ofd.offset = 0; // TODO: handle O_APPEND
+  ofd.offset = 0;
 
   open_files[fd] = ofd;
 
@@ -348,21 +369,27 @@ ssize_t FileSystemState::do_read(int fd, void *buf, size_t count)
     return -EBADF;
   }
 
+  if (!fd_manager_ || !fd_manager_->is_allocated(fd))
+    return -EBADF;
+
   OpenFileDescription &ofd = it->second;
   VFSNode &node = filesystem.at(ofd.path);
 
-  if ((ofd.flags & O_ACCMODE) == O_WRONLY)
+  if (S_ISDIR(node.metadata.st_mode))
+    return -EISDIR;
+  if ((fd_manager_->get_status_flags(fd) & O_ACCMODE) == O_WRONLY)
   {
     return -EBADF;
   }
 
-  ssize_t readable_bytes = node.content.size() - ofd.offset;
-  if (readable_bytes <= 0)
+  if (static_cast<uint64_t>(ofd.offset) >= node.content.size())
   {
     return 0; // EOF
   }
 
-  ssize_t bytes_to_read = std::min((ssize_t)count, readable_bytes);
+  size_t bytes_to_read = std::min(count, node.content.size() - static_cast<size_t>(ofd.offset));
+  if (bytes_to_read == 0)
+    return 0;
   memcpy(buf, node.content.data() + ofd.offset, bytes_to_read);
   ofd.offset += bytes_to_read;
 
@@ -377,28 +404,37 @@ ssize_t FileSystemState::do_write(int fd, const void *buf, size_t count)
     return -EBADF;
   }
 
+  if (!fd_manager_ || !fd_manager_->is_allocated(fd))
+    return -EBADF;
+
   OpenFileDescription &ofd = it->second;
   VFSNode &node = filesystem.at(ofd.path);
 
-  if ((ofd.flags & O_ACCMODE) == O_RDONLY)
+  if ((fd_manager_->get_status_flags(fd) & O_ACCMODE) == O_RDONLY)
   {
     return -EBADF;
   }
 
-  // Handle append mode
-  if (ofd.flags & O_APPEND)
+  if (count == 0)
+    return 0;
+  off_t write_offset = ofd.offset;
+  // Output streams retain branch-owned bytes; they are always append-only.
+  if ((fd_manager_->get_status_flags(fd) & O_APPEND) ||
+      fd_manager_->get_fd_type(fd) == FdType::STDIO)
   {
-    ofd.offset = node.content.size();
+    write_offset = node.content.size();
   }
 
-  size_t new_size = ofd.offset + count;
+  if (count > static_cast<size_t>(std::numeric_limits<off_t>::max() - write_offset))
+    return -EFBIG;
+  size_t new_size = static_cast<size_t>(write_offset) + count;
   if (new_size > node.content.size())
   {
     node.content.resize(new_size);
   }
 
-  memcpy(node.content.data() + ofd.offset, buf, count);
-  ofd.offset += count;
+  memcpy(node.content.data() + write_offset, buf, count);
+  ofd.offset = write_offset + count;
   node.metadata.st_size = node.content.size();
 #ifdef FSSTATE_DETAILED_METADATA
   node.metadata.st_mtime = time(NULL);
@@ -409,10 +445,12 @@ ssize_t FileSystemState::do_write(int fd, const void *buf, size_t count)
 
 int FileSystemState::do_close(int fd)
 {
-  if (open_files.erase(fd) == 0)
+  if (!fd_manager_ || !fd_manager_->is_allocated(fd) ||
+      open_files.erase(fd) == 0)
   {
     return -EBADF;
   }
+  release_fd(fd);
   return 0;
 }
 
@@ -424,24 +462,25 @@ off_t FileSystemState::do_lseek(int fd, off_t offset, int whence)
     return -EBADF;
   }
 
+  if (!fd_manager_ || !fd_manager_->is_allocated(fd))
+    return -EBADF;
+
   OpenFileDescription &ofd = it->second;
   VFSNode &node = filesystem.at(ofd.path);
+  if (fd_manager_->get_fd_type(fd) == FdType::STDIO)
+    return -ESPIPE;
   off_t new_offset;
 
+  off_t base = 0;
   switch (whence)
   {
-    case SEEK_SET:
-      new_offset = offset;
-      break;
-    case SEEK_CUR:
-      new_offset = ofd.offset + offset;
-      break;
-    case SEEK_END:
-      new_offset = node.content.size() + offset;
-      break;
-    default:
-      return -EINVAL;
+    case SEEK_SET: break;
+    case SEEK_CUR: base = ofd.offset; break;
+    case SEEK_END: base = node.content.size(); break;
+    default: return -EINVAL;
   }
+  if (__builtin_add_overflow(base, offset, &new_offset))
+    return -EOVERFLOW;
 
   if (new_offset < 0)
   {
@@ -479,11 +518,14 @@ int FileSystemState::do_fstat(int fd, struct stat *statbuf)
     return -EBADF;
   }
 
+  if (!fd_manager_ || !fd_manager_->is_allocated(fd))
+    return -EBADF;
   return do_stat(it->second.path, statbuf);
 }
 
 int FileSystemState::do_chdir(const std::string &path)
 {
+  if (path.empty()) return -ENOENT;
   std::string resolved = resolve_path(AT_FDCWD, path);
 
   auto it = filesystem.find(resolved);
@@ -508,97 +550,37 @@ int FileSystemState::do_chdir(const std::string &path)
 
 #include "monitor.h"
 
-// Helper to read a null-terminated string from guest memory.
-// Returns empty string if guest_addr is 0 or string exceeds max length.
-static std::string read_guest_string(uintptr_t guest_addr)
+// Path arguments are copied exactly; an invalid guest address cannot become
+// an empty or partially read pathname.
+static long read_guest_string(const char *guest_addr, std::string &result)
 {
-  if (guest_addr == 0)
-    return "";
-
-  std::string str;
-  str.reserve(256);
-  char ch;
-  size_t max_len = 4096; // Reasonable limit for path strings
-  do
+  if (!guest_addr)
+    return -EFAULT;
+  result.clear();
+  for (size_t i = 0; i < 4096; ++i)
   {
-    if (str.length() >= max_len)
-      break;
-    memcpy_guest2host(&ch, (void *)(guest_addr + str.length()), 1);
-    if (ch != '\0')
-    {
-      str += ch;
-    }
-  } while (ch != '\0');
-  return str;
+    char ch;
+    if (!guest_read_exact(ptmc_state.pids[ptmc_state.cursor],
+                          guest_addr + i, &ch, 1))
+      return -EFAULT;
+    if (ch == '\0')
+      return 0;
+    result += ch;
+  }
+  return -ENAMETOOLONG;
 }
 
 long emu_vfs_openat(int dirfd, const char *path_ptr, int flags, mode_t mode)
 {
-  if (!path_ptr)
-    return -EFAULT;
-  std::string path = read_guest_string((uintptr_t)path_ptr);
-  std::string resolved =
-      ptmc_state.fs_states[ptmc_state.cursor].resolve_path(dirfd, path);
-  return ptmc_state.fs_states[ptmc_state.cursor].do_open(resolved, flags, mode);
-}
-
-long emu_vfs_read(int fd, void *buf, size_t count)
-{
-  // Check if fd is a socket
-  SockState &sock_state = ptmc_state.sock_states[ptmc_state.cursor];
-  if (sock_state.is_valid_socket(fd))
-  {
-    ssize_t ret = sock_state.do_recv(fd, buf, count, 0);
-    return ret;
-  }
-
-  std::vector<char> host_buf(count);
-  long bytes_read = ptmc_state.fs_states[ptmc_state.cursor].do_read(
-      fd, host_buf.data(), count);
-
-  if (bytes_read > 0)
-  {
-    memcpy_host2guest(buf, host_buf.data(), bytes_read);
-  }
-  return bytes_read;
-}
-
-long emu_vfs_write(int fd, const void *buf, size_t count)
-{
-  // Check if fd is a socket
-  SockState &sock_state = ptmc_state.sock_states[ptmc_state.cursor];
-  if (sock_state.is_valid_socket(fd))
-  {
-    ssize_t ret = sock_state.do_send(fd, buf, count, 0);
-    return ret;
-  }
-
-  std::vector<char> host_buf(count);
-  memcpy_guest2host(host_buf.data(), buf, count);
-
-  return ptmc_state.fs_states[ptmc_state.cursor].do_write(fd, host_buf.data(),
-                                                          count);
-}
-
-long emu_vfs_close(int fd)
-{
-  auto &fs = ptmc_state.fs_states[ptmc_state.cursor];
-
-  // Check if it's a socket
-  SockState &sock_state = ptmc_state.sock_states[ptmc_state.cursor];
-  if (sock_state.get_socket(fd) != nullptr)
-  {
-    return sock_state.do_close(fd);
-  }
-
-  // Check if it's a pipe
-  if (fs.is_pipe(fd))
-  {
-    return fs.do_pipe_close(fd);
-  }
-
-  // Regular file
-  return fs.do_close(fd);
+  std::string path;
+  long copied = read_guest_string(path_ptr, path);
+  if (copied < 0)
+    return copied;
+  auto& fs=ptmc_state.fs_states[ptmc_state.cursor];
+  std::string resolved;
+  const int error=fs.resolve_path_checked(dirfd,path,resolved);
+  if (error) return error;
+  return fs.do_open(resolved,flags,mode);
 }
 
 long emu_vfs_lseek(int fd, off_t offset, int whence)
@@ -606,158 +588,18 @@ long emu_vfs_lseek(int fd, off_t offset, int whence)
   return ptmc_state.fs_states[ptmc_state.cursor].do_lseek(fd, offset, whence);
 }
 
-long emu_vfs_stat(const char *path_ptr, struct stat *statbuf)
+long emu_vfs_stat(const char* path,struct stat* destination)
 {
-  if (!path_ptr)
-    return -EFAULT;
-  std::string path = read_guest_string((uintptr_t)path_ptr);
-
-  struct stat host_statbuf;
-  long result =
-      ptmc_state.fs_states[ptmc_state.cursor].do_stat(path, &host_statbuf);
-
-  if (result == 0)
-  {
-    memcpy_host2guest(statbuf, &host_statbuf, sizeof(struct stat));
-  }
-  return result;
-}
-
-long emu_vfs_fstat(int fd, struct stat *statbuf)
-{
-  struct stat host_statbuf;
-  long result =
-      ptmc_state.fs_states[ptmc_state.cursor].do_fstat(fd, &host_statbuf);
-
-  if (result == 0)
-  {
-    memcpy_host2guest(statbuf, &host_statbuf, sizeof(struct stat));
-  }
-  return result;
+  return emu_vfs_statat(AT_FDCWD,path,destination,0);
 }
 
 long emu_chdir(const char *path_ptr)
 {
-  if (!path_ptr)
-    return -EFAULT;
-  std::string path = read_guest_string((uintptr_t)path_ptr);
+  std::string path;
+  long copied = read_guest_string(path_ptr, path);
+  if (copied < 0)
+    return copied;
   return ptmc_state.fs_states[ptmc_state.cursor].do_chdir(path);
-}
-
-void *FileSystemState::do_mmap(void *addr, size_t length, int prot, int flags,
-                               int fd, off_t offset)
-{
-  (void)flags;
-  (void)addr;
-
-  auto it = open_files.find(fd);
-  if (it == open_files.end())
-  {
-    return MAP_FAILED;
-  }
-
-  std::string &path = it->second.path;
-  auto node_it = filesystem.find(path);
-  if (node_it == filesystem.end())
-  {
-    return MAP_FAILED;
-  }
-
-  VFSNode &node = node_it->second;
-
-  // Check offset bounds
-  if ((size_t)offset > node.content.size())
-  {
-    return MAP_FAILED;
-  }
-
-  // Allocate memory via host mmap
-  size_t map_len = length;
-  if (offset + (off_t)length > (off_t)node.content.size())
-  {
-    map_len = node.content.size() - offset;
-  }
-
-  void *mem = mmap(nullptr, length, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (mem == MAP_FAILED)
-  {
-    return MAP_FAILED;
-  }
-
-  // Copy file content to the allocated memory
-  if (map_len > 0)
-  {
-    memcpy(mem, node.content.data() + offset, map_len);
-  }
-
-  // Zero the rest if length > file size
-  if (length > map_len)
-  {
-    memset((char *)mem + map_len, 0, length - map_len);
-  }
-
-  // Track this mmap region
-  MmapRegion region;
-  region.fd = fd;
-  region.offset = offset;
-  region.length = length;
-  region.prot = prot;
-  mmap_regions[(uintptr_t)mem] = region;
-
-  // Apply protection
-  int host_prot = 0;
-  if (prot & PROT_READ)
-    host_prot |= PROT_READ;
-  if (prot & PROT_WRITE)
-    host_prot |= PROT_WRITE;
-  if (prot & PROT_EXEC)
-    host_prot |= PROT_EXEC;
-  mprotect(mem, length, host_prot);
-
-  return mem;
-}
-
-int FileSystemState::do_munmap(void *addr, size_t length)
-{
-  uintptr_t key = (uintptr_t)addr;
-  auto it = mmap_regions.find(key);
-  if (it != mmap_regions.end())
-  {
-    mmap_regions.erase(it);
-  }
-  return munmap(addr, length);
-}
-
-long emu_mmap(void *addr, size_t length, int prot, int flags, int fd,
-              off_t offset)
-{
-  // Check if fd is a VFS file
-  auto &fs = ptmc_state.fs_states[ptmc_state.cursor];
-  if (fd >= 0 && fs.open_files.find(fd) != fs.open_files.end())
-  {
-    void *result = fs.do_mmap(addr, length, prot, flags, fd, offset);
-    return (long)result;
-  }
-
-  // Not a VFS file, let the host handle it (this will likely fail or be NOP)
-  // We still need to return something valid for anonymous mappings
-  if (fd == -1)
-  {
-    // Anonymous mapping - let host handle it
-    void *result = mmap(addr, length, prot, flags, fd, offset);
-    return (long)result;
-  }
-
-  // For non-VFS files with fd >= 0, we can't really support this
-  // Return MAP_FAILED
-  return (long)MAP_FAILED;
-}
-
-long emu_munmap(void *addr, size_t length)
-{
-  auto &fs = ptmc_state.fs_states[ptmc_state.cursor];
-  return fs.do_munmap(addr, length);
 }
 
 template void
@@ -777,18 +619,20 @@ template void FileSystemState::serialize<cereal::BinaryOutputArchive>(
 
 int FileSystemState::do_pipe(int pipefd[2], int flags)
 {
-  (void)flags;
-
-  // Allocate pipe ID
-  static int next_pipe_id = 1;
-  int pipe_id = next_pipe_id++;
+  if (flags & ~(O_NONBLOCK | O_CLOEXEC))
+    return -EINVAL;
+  int pipe_id = 1;
+  while (pipes_.contains(pipe_id))
+    ++pipe_id;
 
   // Create the pipe
   pipes_[pipe_id] = Pipe();
 
   // Allocate two fds: read end and write end
-  int read_fd = allocate_fd(FdType::PIPE);
-  int write_fd = allocate_fd(FdType::PIPE);
+  int read_fd = allocate_fd(FdType::PIPE, O_RDONLY | (flags & O_NONBLOCK),
+                            (flags & O_CLOEXEC) ? FD_CLOEXEC : 0);
+  int write_fd = allocate_fd(FdType::PIPE, O_WRONLY | (flags & O_NONBLOCK),
+                             (flags & O_CLOEXEC) ? FD_CLOEXEC : 0);
 
   if (read_fd < 0 || write_fd < 0)
   {
@@ -819,7 +663,8 @@ bool FileSystemState::is_pipe(int fd) const
 ssize_t FileSystemState::do_pipe_read(int fd, void *buf, size_t count)
 {
   auto it = pipe_fds_.find(fd);
-  if (it == pipe_fds_.end())
+  if (!fd_manager_ || fd_manager_->get_fd_type(fd) != FdType::PIPE ||
+      it == pipe_fds_.end())
   {
     return -EBADF;
   }
@@ -837,6 +682,8 @@ ssize_t FileSystemState::do_pipe_read(int fd, void *buf, size_t count)
   }
 
   Pipe &pipe = pipe_it->second;
+  if (count == 0)
+    return 0;
   if (pipe.buffer.empty())
   {
     if (pipe.write_closed)
@@ -848,7 +695,8 @@ ssize_t FileSystemState::do_pipe_read(int fd, void *buf, size_t count)
 
   size_t to_read = std::min(count, pipe.buffer.size());
   std::vector<char> data(pipe.buffer.begin(), pipe.buffer.begin() + to_read);
-  memcpy_host2guest(buf, data.data(), to_read);
+  if (!guest_write_exact(ptmc_state.pids[ptmc_state.cursor], buf, data.data(), to_read))
+    return -EFAULT;
   pipe.buffer.erase(pipe.buffer.begin(), pipe.buffer.begin() + to_read);
 
   LOG_TRACE("pipe_read(fd=%d, count=%zu) = %zu", fd, count, to_read);
@@ -858,7 +706,8 @@ ssize_t FileSystemState::do_pipe_read(int fd, void *buf, size_t count)
 ssize_t FileSystemState::do_pipe_write(int fd, const void *buf, size_t count)
 {
   auto it = pipe_fds_.find(fd);
-  if (it == pipe_fds_.end())
+  if (!fd_manager_ || fd_manager_->get_fd_type(fd) != FdType::PIPE ||
+      it == pipe_fds_.end())
   {
     return -EBADF;
   }
@@ -877,14 +726,19 @@ ssize_t FileSystemState::do_pipe_write(int fd, const void *buf, size_t count)
   }
 
   Pipe &pipe = pipe_it->second;
+  if (count == 0)
+    return 0;
   if (pipe.read_closed)
   {
     return -EPIPE; // Reader closed
   }
 
   // Read data from guest
+  if (count > static_cast<size_t>(std::numeric_limits<ssize_t>::max()))
+    return -EINVAL;
   std::vector<char> data(count);
-  memcpy_guest2host(data.data(), buf, count);
+  if (!guest_read_exact(ptmc_state.pids[ptmc_state.cursor], buf, data.data(), count))
+    return -EFAULT;
 
   // Append to pipe buffer
   pipe.buffer.insert(pipe.buffer.end(), data.begin(), data.end());
@@ -896,7 +750,8 @@ ssize_t FileSystemState::do_pipe_write(int fd, const void *buf, size_t count)
 int FileSystemState::do_pipe_close(int fd)
 {
   auto it = pipe_fds_.find(fd);
-  if (it == pipe_fds_.end())
+  if (!fd_manager_ || fd_manager_->get_fd_type(fd) != FdType::PIPE ||
+      it == pipe_fds_.end())
   {
     return -EBADF;
   }
@@ -941,3 +796,39 @@ long emu_pipe(int pipefd[2], int flags)
 }
 
 long emu_pipe2(int pipefd[2], int flags) { return emu_pipe(pipefd, flags); }
+template <class Archive>
+void FileSystemState::Pipe::serialize(Archive &ar)
+{
+  ar(buffer, read_closed, write_closed);
+}
+
+template void FileSystemState::Pipe::serialize<cereal::BinaryInputArchive>(cereal::BinaryInputArchive &);
+template void FileSystemState::Pipe::serialize<cereal::BinaryOutputArchive>(cereal::BinaryOutputArchive &);
+
+long emu_vfs_statat(int dirfd,const char* path_ptr,struct stat* destination,int flags)
+{
+  if (flags & ~(AT_EMPTY_PATH|AT_SYMLINK_NOFOLLOW|AT_NO_AUTOMOUNT)) return -EINVAL;
+  std::string path;
+  const long copied=read_guest_string(path_ptr,path);
+  if (copied) return copied;
+  auto& fs=ptmc_state.fs_states[ptmc_state.cursor];
+  if (path.empty() && (flags&AT_EMPTY_PATH)) {
+    if (dirfd!=AT_FDCWD) return emu_fstat(dirfd,destination);
+    path=fs.get_cwd().empty()?"/":fs.get_cwd();
+  }
+  std::string resolved;
+  const int error=fs.resolve_path_checked(dirfd,path,resolved);
+  if (error) return error;
+  struct stat value{};
+  const int result=fs.do_stat(resolved,&value);
+  if (result) return result;
+  return guest_write_exact(ptmc_state.pids[ptmc_state.cursor],destination,&value,sizeof(value))?0:-EFAULT;
+}
+long emu_getcwd(char* destination,size_t size)
+{
+  if (!size) return -EINVAL;
+  const auto& stored=ptmc_state.fs_states[ptmc_state.cursor].get_cwd();
+  const std::string path=stored.empty()?"/":stored;
+  if (size<path.size()+1) return -ERANGE;
+  return guest_write_exact(ptmc_state.pids[ptmc_state.cursor],destination,path.c_str(),path.size()+1)?long(path.size()+1):-EFAULT;
+}

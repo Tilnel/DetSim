@@ -32,7 +32,7 @@ std::vector<uint8_t> encode_page_manifest(const std::vector<RegionInfo>& regions
       metadata.size() > UINT32_MAX || maps.size() > UINT32_MAX)
     throw std::length_error("Page manifest table exceeds format limits");
   PageManifestHeader h{};
-  h.common.magic = 0x4453544D; h.common.version = 6;
+  h.common.magic = 0x4453544D; h.common.version = PAGE_SNAPSHOT_VERSION;
   h.common.num_regions = regions.size();
   h.common.tstate_offset = sizeof(h) + regions.size() * sizeof(RegionInfo);
   h.common.tstate_size = metadata.size();
@@ -59,9 +59,9 @@ SnapshotView::SnapshotView(std::shared_ptr<const std::vector<uint8_t>> data, uin
     : data_(std::move(data)), generation_(generation) {
   require(data_->size() >= sizeof(header_), "Truncated state snapshot header");
   memcpy(&header_, data_->data(), sizeof(header_));
-  require(header_.magic == 0x4453544D && (header_.version == 5 || header_.version == 6),
+  require(header_.magic == 0x4453544D && (header_.version == FLAT_SNAPSHOT_VERSION || header_.version == PAGE_SNAPSHOT_VERSION),
           "Incompatible state snapshot version");
-  const bool paged = header_.version == 6;
+  const bool paged = header_.version == PAGE_SNAPSHOT_VERSION;
   const size_t header_size = paged ? sizeof(PageManifestHeader) : sizeof(StateDataHeader);
   auto bounds = [&](uint64_t offset, uint64_t length) {
     return offset <= data_->size() && length <= data_->size() - offset;
@@ -172,7 +172,7 @@ SnapshotView::OwnedSpan SnapshotView::page(size_t region_index, size_t index) co
   check_generation();
   const auto& r = regions_.at(region_index);
   require(index < page_count(region_index), "Snapshot page index out of range");
-  if (header_.version == 5) {
+  if (header_.version == FLAT_SNAPSHOT_VERSION) {
     const uint64_t address = index == 0 ? r.start : (r.start / page_size + index) * page_size;
     return {address, uint32_t(chunk_length(address, r.end)),
             data_->data() + r.offset + address - r.start, data_};

@@ -16,10 +16,20 @@ static void require(bool value, const char *message) {
 static sockaddr_in peer;
 static void reset() {
     for (int node = 0; node < NP; ++node) {
-        ptmc_state.sock_states[node] = SockState(std::make_shared<FdManager>());
+        ptmc_state.fd_managers[node] = std::make_shared<FdManager>();
+        ptmc_state.sock_states[node] = SockState(ptmc_state.fd_managers[node]);
         ptmc_state.pids[node] = getpid();
         ptmc_state.addrs[node] = node == 0 ? "127.0.0.1" : "127.0.0.2";
     }
+    // Reserve node 0 fd 3 so equivalent clients start with the same fd on
+    // both nodes; node 1 owns the real listener at fd 3.
+    require(ptmc_state.sock_states[0].do_socket(AF_INET, SOCK_STREAM, 0) == 3, "reserve matching fd");
+    ptmc_state.cursor = 1;
+    auto &server = ptmc_state.sock_states[1];
+    int listener = server.do_socket(AF_INET, SOCK_STREAM, 0);
+    require(server.do_bind(listener, reinterpret_cast<sockaddr*>(&peer), sizeof(peer)) == 0,
+            "real listener bind");
+    require(server.do_listen(listener, 128) == 0, "real listener listen");
     ptmc_state.cursor = 0;
 }
 static int new_socket(int node) {
@@ -37,16 +47,28 @@ static int connect_socket(int node, int fd) {
 static void replay() {
     reset();
     int fd = new_socket(0);
-    SockState saved = ptmc_state.sock_states[0];
+    SockState saved[NP];
+    FdManager managers[NP];
+    for (int node = 0; node < NP; ++node) {
+        saved[node] = ptmc_state.sock_states[node];
+        managers[node] = *ptmc_state.fd_managers[node];
+    }
+    auto restore = [&] {
+        for (int node = 0; node < NP; ++node) {
+            ptmc_state.fd_managers[node] = std::make_shared<FdManager>(managers[node]);
+            ptmc_state.sock_states[node] = saved[node];
+            ptmc_state.sock_states[node].set_fd_manager(ptmc_state.fd_managers[node]);
+        }
+    };
     srand(1);
     int first = connect_socket(0, fd);
     for (unsigned seed : {2u, 123u, 444u}) {
-        ptmc_state.sock_states[0] = saved;
+        restore();
         srand(seed);
         for (int i = 0; i < 31; ++i) (void)rand();
         require(connect_socket(0, fd) == first, "restored socket chose a different port after search RNG changes");
     }
-    ptmc_state.sock_states[0] = saved;
+    restore();
     srand(777);
     int expected = rand();
     srand(777);
@@ -64,10 +86,18 @@ static void distinct_and_reuse() {
         require(port >= 10000 && port < 60000, "port outside modeled ephemeral range");
         auto ip = ptmc_state.sock_states[node].get_socket(fd)->local_addr.sin_addr.s_addr;
         require(used.insert({ip, port}).second, "live sockets share a virtual endpoint");
-        if (i == 1) require(port == first_port, "independent nodes should reuse ports");
+        if (i == 1) {
+            require(fd == first_fd, "independent clients must have matching process-local fds");
+            require(port == first_port, "independent nodes should reuse ports");
+        }
         if (!i) { first_fd = fd; first_port = port; }
     }
-    ptmc_state.sock_states[0].do_close(first_fd);
+    ptmc_state.cursor = 1;
+    int accepted = ptmc_state.sock_states[1].do_accept(3, nullptr, nullptr);
+    require(accepted >= 0, "accept first connection before endpoint reuse");
+    require(ptmc_state.sock_states[1].do_close(accepted) == 0, "close accepted peer");
+    ptmc_state.cursor = 0;
+    require(ptmc_state.sock_states[0].do_close(first_fd) == 0, "close first client");
     require(connect_socket(0, new_socket(0)) == first_port, "released port was not deterministically reusable");
 }
 static void exhaustion() {
@@ -123,7 +153,7 @@ int main() {
     peer = {};
     peer.sin_family = AF_INET;
     peer.sin_port = htons(6379);
-    peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    peer.sin_addr.s_addr = htonl(0x7f000002);
     try {
         replay(); puts("port replay and independent search RNG: PASS");
         distinct_and_reuse(); puts("distinct live endpoints and reuse: PASS");

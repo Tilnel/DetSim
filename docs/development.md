@@ -23,7 +23,8 @@ make check-xstate check-exec check-state-io check-mappings # NP=1 state/atom gat
 make check-identity check-port # NP=2 identity and deterministic network state
 make check-capture       # NP=2 full/hinted snapshot byte-equivalence oracle
 make check-soft-dirty    # opt-in experiment: real kernel dirty tracking + byte oracle
-make check-page-snapshot # v5/v6 readers, missing/corrupt pages, reopen and poison gates
+make check-page-snapshot # v7/v8 readers, missing/corrupt pages, reopen and poison gates
+make check-io-boundary   # NP=2 mixed descriptors, guest-copy faults and native dispatch
 make check-accept        # NP=2 cross-process accept address/length regressions
 make check-redis         # NP=2 fixed-schedule SET/GET with existing Redis debug binary
 make benchmark-redisraft # NP=3 bounded Raft-library replication and DFS benchmark
@@ -114,13 +115,13 @@ Consolidation requires equivalence tests; see the backlog.
   runs that replay case under installed `strace` to count `madvise` calls.
   Elapsed times include CLI/strace overhead and are not throughput benchmarks.
 
-The scenario fixture intentionally ignores write return values: VFS currently
-rejects standard-stream writes (C15). Loader CPU-feature normalization also logs
-an unresolved symbol (C17). Passing counter/replay tests does not close either gap,
+Standard streams use captured virtual files: stdin is EOF, stdout/stderr writes
+enter snapshot state. Loader CPU-feature normalization still logs an unresolved
+symbol (C17). Passing counter/replay tests does not close that gap,
 nor does it prove multithread, cross-process-run or eviction correctness.
 
-Default snapshot format is version 5; older formats are rejected without migration.
-This branch additionally reads opt-in version 6 page manifests, selected with
+Default snapshot format is version 7; older formats are rejected without migration.
+This branch additionally reads opt-in version 8 page manifests, selected with
 `DETSIM_SNAPSHOT_BACKEND=pages`; `verify-pages` adds a full memory oracle.
 See [page snapshots and whole-exploration measurements](page-snapshots.md).
 Private readable mappings are captured; shared/unreadable mappings, overlaps with

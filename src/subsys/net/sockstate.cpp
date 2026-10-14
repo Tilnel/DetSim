@@ -10,13 +10,15 @@
 #include "cereal/types/vector.hpp"
 #include "debug.h"
 #include "monitor.h"
+#include "guest.h"
+#include <stdexcept>
 #include <arpa/inet.h>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <fmt/format.h>
 #include <climits>
-#include <sys/uio.h>
+#include <netinet/tcp.h>
 
 /* ==============================================================================
  * Utility Functions
@@ -39,6 +41,7 @@ bool parse_sockaddr(const std::string &str, struct sockaddr_in &addr)
   std::string ip_str = str.substr(0, colon);
   int port = std::stoi(str.substr(colon + 1));
 
+  addr = {};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
   return inet_pton(AF_INET, ip_str.c_str(), &addr.sin_addr) == 1;
@@ -49,14 +52,14 @@ bool parse_sockaddr(const std::string &str, struct sockaddr_in &addr)
  * ==============================================================================
  */
 
-int SockState::allocate_fd(FdType type)
+int SockState::allocate_fd(FdType type, int status_flags, int descriptor_flags)
 {
   if (!fd_manager_)
   {
     LOG_ERROR("FdManager not set!");
     return -1;
   }
-  return fd_manager_->allocate_fd(type);
+  return fd_manager_->allocate_fd(type, status_flags, descriptor_flags);
 }
 
 void SockState::release_fd(int fd)
@@ -65,6 +68,11 @@ void SockState::release_fd(int fd)
   {
     fd_manager_->release_fd(fd);
   }
+}
+
+int SockState::invalid_socket_error(int fd) const
+{
+  return fd_manager_ && fd_manager_->is_allocated(fd) ? -ENOTSOCK : -EBADF;
 }
 
 Socket *SockState::get_socket_mutable(int fd)
@@ -125,7 +133,10 @@ int SockState::do_socket(int domain, int type, int protocol)
     return -EPROTONOSUPPORT;
   }
 
-  int fd = allocate_fd();
+  const int effective_protocol = base_type == SOCK_STREAM ? IPPROTO_TCP : IPPROTO_UDP;
+  if (protocol != 0 && protocol != effective_protocol) return -EPROTONOSUPPORT;
+  int fd = allocate_fd(FdType::SOCKET, O_RDWR | ((type_flags & SOCK_NONBLOCK) ? O_NONBLOCK : 0),
+                       (type_flags & SOCK_CLOEXEC) ? FD_CLOEXEC : 0);
   if (fd < 0)
   {
     return -EMFILE;
@@ -135,8 +146,7 @@ int SockState::do_socket(int domain, int type, int protocol)
   sock.fd = fd;
   sock.domain = domain;
   sock.type = base_type;
-  sock.protocol = protocol;
-  sock.flags = type_flags;
+  sock.protocol = effective_protocol;
   sock.bound = false;
   sock.connected = false;
   sock.listening = false;
@@ -152,7 +162,7 @@ int SockState::do_bind(int fd, const struct sockaddr *addr, socklen_t addrlen)
   Socket *sock = get_socket_mutable(fd);
   if (!sock)
   {
-    return -EBADF;
+    return invalid_socket_error(fd);
   }
 
   if (sock->bound)
@@ -166,13 +176,51 @@ int SockState::do_bind(int fd, const struct sockaddr *addr, socklen_t addrlen)
   }
 
   /* addr is guest pointer, need to read from guest memory */
-  struct sockaddr_in sin;
-  memcpy_guest2host(&sin, addr, sizeof(struct sockaddr_in));
-  memcpy(&sock->local_addr, &sin, sizeof(struct sockaddr_in));
+  struct sockaddr_in sin{};
+  if (!guest_read_exact(ptmc_state.pids[ptmc_state.cursor], addr, &sin, sizeof(sin)))
+    return -EFAULT;
+  if (sin.sin_family != AF_INET) return -EAFNOSUPPORT;
+  for (const auto &[other_fd, other] : sockets_) {
+    if (other_fd == fd || !other.bound || other.type != sock->type ||
+        other.local_addr.sin_port != sin.sin_port || sin.sin_port == 0) continue;
+    if (sin.sin_addr.s_addr == INADDR_ANY || other.local_addr.sin_addr.s_addr == INADDR_ANY ||
+        sin.sin_addr.s_addr == other.local_addr.sin_addr.s_addr) return -EADDRINUSE;
+  }
+  memset(sin.sin_zero, 0, sizeof(sin.sin_zero));
+  sock->local_addr = sin;
   sock->bound = true;
 
   LOG_TRACE("bind(fd=%d, %s) = 0", fd, format_sockaddr(sin).c_str());
   return 0;
+}
+
+static int copy_socket_address(const sockaddr_in &address, sockaddr *output, socklen_t *length)
+{
+  int pid = ptmc_state.pids[ptmc_state.cursor];
+  socklen_t capacity = 0;
+  if (!guest_read_exact(pid, length, &capacity, sizeof(capacity))) return -EFAULT;
+  if (capacity > INT_MAX) return -EINVAL;
+  if (!guest_write_exact(pid, output, &address, std::min<size_t>(capacity, sizeof(address))))
+    return -EFAULT;
+  socklen_t actual = sizeof(address);
+  return guest_write_exact(pid, length, &actual, sizeof(actual)) ? 0 : -EFAULT;
+}
+
+int SockState::do_getsockname(int fd, sockaddr *address, socklen_t *length)
+{
+  const Socket *socket = get_socket(fd);
+  if (!socket) return invalid_socket_error(fd);
+  sockaddr_in local = socket->local_addr;
+  local.sin_family = AF_INET;
+  return copy_socket_address(local, address, length);
+}
+
+int SockState::do_getpeername(int fd, sockaddr *address, socklen_t *length)
+{
+  const Socket *socket = get_socket(fd);
+  if (!socket) return invalid_socket_error(fd);
+  if (!socket->connected) return -ENOTCONN;
+  return copy_socket_address(socket->peer_addr, address, length);
 }
 
 int SockState::do_listen(int fd, int backlog)
@@ -180,7 +228,7 @@ int SockState::do_listen(int fd, int backlog)
   Socket *sock = get_socket_mutable(fd);
   if (!sock)
   {
-    return -EBADF;
+    return invalid_socket_error(fd);
   }
 
   if (sock->type != SOCK_STREAM)
@@ -194,7 +242,7 @@ int SockState::do_listen(int fd, int backlog)
   }
 
   sock->listening = true;
-  sock->backlog = backlog;
+  sock->backlog = std::max(0, backlog);
 
   LOG_TRACE("listen(fd=%d, backlog=%d) = 0", fd, backlog);
   return 0;
@@ -203,11 +251,10 @@ int SockState::do_listen(int fd, int backlog)
 int SockState::do_connect(int fd, const struct sockaddr *addr,
                           socklen_t addrlen)
 {
-  (void)addrlen;
   Socket *sock = get_socket_mutable(fd);
   if (!sock)
   {
-    return -EBADF;
+    return invalid_socket_error(fd);
   }
 
   if (sock->type != SOCK_STREAM)
@@ -215,8 +262,13 @@ int SockState::do_connect(int fd, const struct sockaddr *addr,
     return -EOPNOTSUPP;
   }
 
-  struct sockaddr_in peer_addr;
-  memcpy_guest2host(&peer_addr, addr, sizeof(struct sockaddr_in));
+  if (sock->connected) return -EISCONN;
+  if (sock->listening) return -EINVAL;
+  if (addrlen < sizeof(sockaddr_in)) return -EINVAL;
+  struct sockaddr_in peer_addr{};
+  if (!guest_read_exact(ptmc_state.pids[ptmc_state.cursor], addr, &peer_addr, sizeof(peer_addr)))
+    return -EFAULT;
+  if (peer_addr.sin_family != AF_INET) return -EAFNOSUPPORT;
 
   // A connected socket uses the node's concrete source address, not ANY.
   // Stage both address and port so allocation failures leave the socket intact.
@@ -230,6 +282,17 @@ int SockState::do_connect(int fd, const struct sockaddr *addr,
       return -EADDRNOTAVAIL;
   }
 
+  auto reciprocal_tuple = [&](const Socket &candidate) {
+    return candidate.type == SOCK_STREAM && candidate.connected &&
+        candidate.local_addr.sin_addr.s_addr == peer_addr.sin_addr.s_addr &&
+        candidate.local_addr.sin_port == peer_addr.sin_port &&
+        candidate.peer_addr.sin_addr.s_addr == local_addr.sin_addr.s_addr;
+  };
+  auto pending_tuple = [&](const TcpConnection &connection) {
+    return connection.local_addr.sin_addr.s_addr == local_addr.sin_addr.s_addr &&
+        connection.peer_addr.sin_addr.s_addr == peer_addr.sin_addr.s_addr &&
+        connection.peer_addr.sin_port == peer_addr.sin_port;
+  };
   // Allocate from this node's saved socket state, never the search's host RNG.
   // Keep the existing modeled range, not the host's configurable Linux range.
   if (!sock->bound || local_addr.sin_port == 0)
@@ -245,6 +308,23 @@ int SockState::do_connect(int fd, const struct sockaddr *addr,
       if (port >= first_port && port < first_port + port_count)
         used[port - first_port] = true;
     }
+    // A closed client can leave a live accepted or pending peer. Reusing its
+    // tuple would route a new connection into that historical peer's queue.
+    // Reserve only this destination's reciprocal tuples, so unrelated endpoints
+    // remain independently reusable.
+    auto reserve = [&](in_port_t network_port) {
+      int port = ntohs(network_port);
+      if (port >= first_port && port < first_port + port_count)
+        used[port - first_port] = true;
+    };
+    for (int node = 0; node < NP; ++node) {
+      for (const auto &[remote_fd, remote] : ptmc_state.sock_states[node].sockets_) {
+        if (reciprocal_tuple(remote)) reserve(remote.peer_addr.sin_port);
+        if (!remote.listening) continue;
+        for (const auto &[key, connection] : remote.established_connections)
+          if (pending_tuple(connection)) reserve(connection.local_addr.sin_port);
+      }
+    }
     int index = 0;
     while (index < port_count && used[index])
       ++index;
@@ -252,49 +332,50 @@ int SockState::do_connect(int fd, const struct sockaddr *addr,
       return -EADDRNOTAVAIL;
     local_addr.sin_port = htons(first_port + index);
   }
-  sock->bound = true;
-  sock->local_addr = local_addr;
-
-  sock->connected = true;
-  sock->peer_addr = peer_addr;
-
-  // Cross-process: find listening socket by port (handle 0.0.0.0 binding)
-  bool listener_found = false;
-  for (int pid = 0; pid < NP; pid++)
-  {
-    // Match by port only, since server may bind to 0.0.0.0 (INADDR_ANY)
-    int listen_fd =
-        ptmc_state.sock_states[pid].find_socket_by_port(peer_addr.sin_port);
-    if (listen_fd >= 0)
-    {
-      Socket *listener =
-          ptmc_state.sock_states[pid].get_socket_mutable(listen_fd);
-      if (listener && listener->listening)
-      {
-        // Add to pending connections of the listener's process
-        listener->pending_connections.push_back(fd);
-
-        // Create TcpConnection in the listener's process (kernel-managed)
-        // This allows the client to send data before accept() is called
-        TcpConnection conn;
-        conn.local_fd = fd;
-        conn.local_addr = sock->local_addr;
-        conn.peer_addr = peer_addr;
-
-        // Use client address (IP:port) as key
-        uint64_t client_key =
-            ((uint64_t)sock->local_addr.sin_addr.s_addr << 32) |
-            sock->local_addr.sin_port;
-        listener->established_connections[client_key] = conn;
-
-        listener_found = true;
-        LOG_TRACE("connect(fd=%d) -> listener fd=%d on process %d (port=%d), "
-                  "created established connection",
-                  fd, listen_fd, pid, ntohs(peer_addr.sin_port));
-        break;
+  if (sock->bound && sock->local_addr.sin_port != 0) {
+    for (int node = 0; node < NP; ++node) {
+      for (const auto &[remote_fd, remote] : ptmc_state.sock_states[node].sockets_) {
+        if (reciprocal_tuple(remote) && remote.peer_addr.sin_port == local_addr.sin_port)
+          throw std::runtime_error("TCP bound endpoint reuse with a surviving peer is unsupported");
+        if (!remote.listening) continue;
+        for (const auto &[key, connection] : remote.established_connections)
+          if (pending_tuple(connection) && connection.local_addr.sin_port == local_addr.sin_port)
+            throw std::runtime_error("TCP bound endpoint reuse with a pending peer is unsupported");
       }
     }
   }
+  Socket *listener = nullptr;
+  for (int node = 0; node < NP; ++node) {
+    for (auto &[listen_fd, candidate] : ptmc_state.sock_states[node].sockets_) {
+      if (!candidate.listening || candidate.type != SOCK_STREAM ||
+          candidate.local_addr.sin_port != peer_addr.sin_port) continue;
+      in_addr effective = candidate.local_addr.sin_addr;
+      if (effective.s_addr == INADDR_ANY &&
+          inet_pton(AF_INET, ptmc_state.addrs[node].c_str(), &effective) != 1) continue;
+      if (effective.s_addr != peer_addr.sin_addr.s_addr) continue;
+      if (listener) throw std::runtime_error("Ambiguous TCP listener endpoint");
+      listener = &candidate;
+    }
+  }
+  if (!listener) return -ECONNREFUSED;
+  if (listener->established_connections.size() >= size_t(listener->backlog))
+    throw std::runtime_error("TCP backlog overflow requires unsupported blocking/connect state");
+  uint64_t client_key = (uint64_t(local_addr.sin_addr.s_addr) << 32) | local_addr.sin_port;
+  if (listener->established_connections.count(client_key))
+    throw std::runtime_error("TCP endpoint reuse while an older connection is pending is unsupported");
+  // All validation precedes state mutation. The FIFO identifies peers by their
+  // endpoint, so equal process-local fd numbers never create ambiguity.
+  sock->bound = true;
+  sock->local_addr = local_addr;
+  sock->connected = true;
+  memset(peer_addr.sin_zero, 0, sizeof(peer_addr.sin_zero));
+  sock->peer_addr = peer_addr;
+  TcpConnection pending;
+  pending.local_fd = fd;
+  pending.local_addr = local_addr;
+  pending.peer_addr = peer_addr;
+  listener->pending_connections.push_back(client_key);
+  listener->established_connections.emplace(client_key, std::move(pending));
 
   // Create or update TCP connection in our own process
   TcpConnection conn;
@@ -313,7 +394,7 @@ int SockState::do_accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
   Socket *listener = get_socket_mutable(fd);
   if (!listener)
   {
-    return -EBADF;
+    return invalid_socket_error(fd);
   }
 
   if (listener->type != SOCK_STREAM)
@@ -331,81 +412,35 @@ int SockState::do_accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
     return -EAGAIN; // No pending connections
   }
 
-  // Get the first pending connection
-  int client_fd = listener->pending_connections.front();
-
-  // FDs are process-local. Match the established endpoint as well as the fd.
-  // Find the client socket to get its address
-  const Socket *client_sock = nullptr;
-  int client_pid = -1;
-  for (int pid = 0; pid < NP; pid++)
-  {
-    const Socket *candidate = ptmc_state.sock_states[pid].get_socket(client_fd);
-    if (!candidate || !candidate->connected || candidate->listening ||
-        candidate->peer_addr.sin_port != listener->local_addr.sin_port)
-      continue;
-    in_addr server_addr{};
-    inet_pton(AF_INET, ptmc_state.addrs[ptmc_state.cursor].c_str(), &server_addr);
-    if (candidate->peer_addr.sin_addr.s_addr != server_addr.s_addr &&
-        candidate->peer_addr.sin_addr.s_addr != listener->local_addr.sin_addr.s_addr)
-      continue;
-    uint64_t key = (uint64_t(candidate->local_addr.sin_addr.s_addr) << 32) |
-                   candidate->local_addr.sin_port;
-    if (listener->established_connections.find(key) ==
-        listener->established_connections.end())
-      continue;
-    // The legacy queue stores only fds, so multiple matching peers cannot be
-    // ordered faithfully. Refuse the ambiguity instead of accepting a random one.
-    if (client_sock)
-    {
-      LOG_ERROR("accept: ambiguous pending client fd %d", client_fd);
-      return -EOPNOTSUPP;
-    }
-    client_sock = candidate;
-    client_pid = pid;
-  }
-  if (!client_sock)
-  {
-    // Unlike a copyout failure, this head cannot become acceptable on retry.
-    // Drop it so a disconnected client cannot block later live connections.
-    listener->pending_connections.pop_front();
-    return -ECONNRESET; // Client closed connection
-  }
-
-  // Compute client address key
-  uint64_t client_key =
-      ((uint64_t)client_sock->local_addr.sin_addr.s_addr << 32) |
-      client_sock->local_addr.sin_port;
-
-  // Look up existing established connection (created by connect())
+  const uint64_t client_key = listener->pending_connections.front();
   auto established_it = listener->established_connections.find(client_key);
-  if (established_it == listener->established_connections.end())
-  {
+  if (established_it == listener->established_connections.end()) {
     listener->pending_connections.pop_front();
-    return -ECONNRESET; // No established connection found
+    return -ECONNRESET;
   }
-
+  const TcpConnection &pending = established_it->second;
+  const int client_fd = pending.local_fd;
+  // The source endpoint and source fd come from the saved connection, rather
+  // than a scan which can select another node's same-numbered descriptor.
   // Create new socket for accepted connection
   Socket new_sock;
   new_sock.local_addr = {};
   new_sock.peer_addr = {};
   new_sock.domain = listener->domain;
   new_sock.type = SOCK_STREAM;
-  new_sock.protocol = 0;
+  new_sock.protocol = listener->protocol;
   new_sock.bound = true;
   new_sock.connected = true;
+  new_sock.reuse_address = listener->reuse_address;
+  new_sock.no_delay = listener->no_delay;
+  new_sock.keep_alive = listener->keep_alive;
+  new_sock.keep_idle = listener->keep_idle;
+  new_sock.keep_interval = listener->keep_interval;
+  new_sock.keep_count = listener->keep_count;
 
-  // Server's local address: use real IP from config, not 0.0.0.0
-  new_sock.local_addr.sin_family = AF_INET;
-  inet_pton(AF_INET, ptmc_state.addrs[ptmc_state.cursor].c_str(),
-            &new_sock.local_addr.sin_addr);
-  new_sock.local_addr.sin_port = listener->local_addr.sin_port;
+  new_sock.local_addr = pending.peer_addr;
 
-  // Client's peer address: use client's real IP
-  new_sock.peer_addr.sin_family = AF_INET;
-  inet_pton(AF_INET, ptmc_state.addrs[client_pid].c_str(),
-            &new_sock.peer_addr.sin_addr);
-  new_sock.peer_addr.sin_port = client_sock->local_addr.sin_port;
+  new_sock.peer_addr = pending.local_addr;
 
   // addr and addrlen belong to the tracee. Checked copies are required here:
   // the general guest helpers cannot report a failed/short transfer to callers.
@@ -413,27 +448,14 @@ int SockState::do_accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
   {
     int guest_pid = ptmc_state.pids[ptmc_state.cursor];
     socklen_t capacity = 0;
-    iovec local{&capacity, sizeof(capacity)};
-    iovec remote{addrlen, sizeof(capacity)};
-    if (process_vm_readv(guest_pid, &local, 1, &remote, 1, 0) !=
-        static_cast<ssize_t>(sizeof(capacity)))
+    if (!guest_read_exact(guest_pid, addrlen, &capacity, sizeof(capacity)))
       return -EFAULT;
-    if (capacity > INT_MAX)
-      return -EINVAL;
+    if (capacity > INT_MAX) return -EINVAL;
     size_t copied = std::min<size_t>(capacity, sizeof(new_sock.peer_addr));
-    if (copied)
-    {
-      local = {&new_sock.peer_addr, copied};
-      remote = {addr, copied};
-      if (process_vm_writev(guest_pid, &local, 1, &remote, 1, 0) !=
-          static_cast<ssize_t>(copied))
-        return -EFAULT;
-    }
+    if (!guest_write_exact(guest_pid, addr, &new_sock.peer_addr, copied))
+      return -EFAULT;
     socklen_t actual = sizeof(new_sock.peer_addr);
-    local = {&actual, sizeof(actual)};
-    remote = {addrlen, sizeof(actual)};
-    if (process_vm_writev(guest_pid, &local, 1, &remote, 1, 0) !=
-        static_cast<ssize_t>(sizeof(actual)))
+    if (!guest_write_exact(guest_pid, addrlen, &actual, sizeof(actual)))
       return -EFAULT;
   }
 
@@ -460,11 +482,12 @@ int SockState::do_accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
 
 ssize_t SockState::do_send(int fd, const void *buf, size_t len, int flags)
 {
-  (void)flags;
+  if (flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL))
+    throw std::runtime_error("Unsupported TCP send flags");
   Socket *sock = get_socket_mutable(fd);
   if (!sock)
   {
-    return -EBADF;
+    return invalid_socket_error(fd);
   }
 
   if (!sock->connected)
@@ -472,9 +495,10 @@ ssize_t SockState::do_send(int fd, const void *buf, size_t len, int flags)
     return -ENOTCONN;
   }
 
-  // Read data from guest
+  if (len == 0) return 0;
   std::string data(len, '\0');
-  memcpy_guest2host(&data[0], buf, len);
+  if (!guest_read_exact(ptmc_state.pids[ptmc_state.cursor], buf, data.data(), len))
+    return -EFAULT;
 
   // Compute our address key to look up in peer's established_connections
   uint64_t our_key = ((uint64_t)sock->local_addr.sin_addr.s_addr << 32) |
@@ -505,7 +529,9 @@ ssize_t SockState::do_send(int fd, const void *buf, size_t len, int flags)
       }
 
       if (effective_addr == sock->peer_addr.sin_addr.s_addr &&
-          remote_sock.local_addr.sin_port == sock->peer_addr.sin_port)
+          remote_sock.local_addr.sin_port == sock->peer_addr.sin_port &&
+          remote_sock.peer_addr.sin_addr.s_addr == sock->local_addr.sin_addr.s_addr &&
+          remote_sock.peer_addr.sin_port == sock->local_addr.sin_port)
       {
         auto conn_it = remote_state.tcp_connections_.find(kv.first);
         if (conn_it != remote_state.tcp_connections_.end())
@@ -528,7 +554,9 @@ ssize_t SockState::do_send(int fd, const void *buf, size_t len, int flags)
 
       // Check if this listener has our connection in established_connections
       auto established_it = remote_sock.established_connections.find(our_key);
-      if (established_it != remote_sock.established_connections.end())
+      if (established_it != remote_sock.established_connections.end() &&
+          established_it->second.peer_addr.sin_addr.s_addr == sock->peer_addr.sin_addr.s_addr &&
+          established_it->second.peer_addr.sin_port == sock->peer_addr.sin_port)
       {
         established_it->second.recv_buffer.push_back(data);
         LOG_TRACE(
@@ -545,11 +573,12 @@ ssize_t SockState::do_send(int fd, const void *buf, size_t len, int flags)
 
 ssize_t SockState::do_recv(int fd, void *buf, size_t len, int flags)
 {
-  (void)flags;
+  if (flags & ~(MSG_DONTWAIT | MSG_PEEK))
+    throw std::runtime_error("Unsupported TCP receive flags");
   Socket *sock = get_socket_mutable(fd);
   if (!sock)
   {
-    return -EBADF;
+    return invalid_socket_error(fd);
   }
 
   if (!sock->connected)
@@ -563,6 +592,7 @@ ssize_t SockState::do_recv(int fd, void *buf, size_t len, int flags)
     return -ECONNRESET;
   }
 
+  if (len == 0) return 0;
   TcpConnection &conn = it->second;
   if (conn.recv_buffer.empty())
   {
@@ -575,13 +605,14 @@ ssize_t SockState::do_recv(int fd, void *buf, size_t len, int flags)
   // Empty string is EOF marker (peer closed connection)
   if (data.empty())
   {
-    conn.recv_buffer.pop_front();
-    return 0; // EOF
+    return 0; // Persistent EOF
   }
 
   size_t to_copy = len < data.size() ? len : data.size();
-  memcpy_host2guest(buf, data.c_str(), to_copy);
+  if (!guest_write_exact(ptmc_state.pids[ptmc_state.cursor], buf, data.data(), to_copy))
+    return -EFAULT;
 
+  if (flags & MSG_PEEK) return to_copy;
   if (to_copy < data.size())
   {
     // Partial read, keep remaining data
@@ -602,14 +633,26 @@ ssize_t SockState::do_recv(int fd, void *buf, size_t len, int flags)
  * ==============================================================================
  */
 
+static int addr_to_node(const sockaddr_in *addr);
+
 ssize_t SockState::do_sendto(int fd, const void *buf, size_t len, int flags,
-                             const struct sockaddr *dest_addr,
-                             socklen_t addrlen)
+                             const struct sockaddr *dest_addr, socklen_t addrlen)
 {
-  Socket *sock = get_socket_mutable(fd);
+  if (flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL))
+    throw std::runtime_error("Unsupported UDP send flags");
+  LOG_TRACE("emu_sendto(%d, %p, %ld, %d, %p, %d)", fd, (void *)buf, len,
+            flags, (void *)dest_addr, addrlen);
+
+  int cur = ptmc_state.cursor;
+  const Socket *sock = get_socket(fd);
   if (!sock)
   {
-    return -EBADF;
+    return invalid_socket_error(fd);
+  }
+
+  if (sock->type == SOCK_STREAM) {
+    if (dest_addr) throw std::runtime_error("TCP sendto with explicit destination is unsupported");
+    return do_send(fd, buf, len, flags);
   }
 
   if (sock->type != SOCK_DGRAM)
@@ -617,41 +660,73 @@ ssize_t SockState::do_sendto(int fd, const void *buf, size_t len, int flags,
     return -EOPNOTSUPP;
   }
 
-  if (!dest_addr && !sock->connected)
+  /* Get destination info */
+  struct sockaddr_in dest{};
+  if (dest_addr)
+  {
+    if (addrlen < sizeof(dest)) return -EINVAL;
+    if (!guest_read_exact(ptmc_state.pids[cur], dest_addr, &dest, sizeof(dest)))
+      return -EFAULT;
+    if (dest.sin_family != AF_INET) return -EAFNOSUPPORT;
+  }
+  else if (sock->connected)
+  {
+    dest = sock->peer_addr;
+  }
+  else
   {
     return -EDESTADDRREQ;
   }
 
-  char *data = (char *)malloc(len);
-  if (!data)
+  int node = addr_to_node(&dest);
+  if (node < 0)
   {
-    return -ENOMEM;
-  }
-  memcpy_guest2host(data, buf, len);
-
-  struct sockaddr_in dest;
-  if (dest_addr)
-  {
-    /* dest_addr is guest pointer, need to read from guest memory */
-    memcpy_guest2host(&dest, dest_addr, sizeof(struct sockaddr_in));
-  }
-  else
-  {
-    dest = sock->peer_addr;
+    return -ENETUNREACH;
   }
 
-  struct sockaddr_in from;
-  memset(&from, 0, sizeof(from));
-  from.sin_family = AF_INET;
-  from.sin_port = sock->bound ? sock->local_addr.sin_port : 0;
+  uint16_t port = dest.sin_port;
+  if (!port) return -EINVAL;
+  std::string data(len, '\0');
+  if (!guest_read_exact(ptmc_state.pids[cur], buf, data.data(), len)) return -EFAULT;
+
+  /* Find receiving socket by port */
+  int recvfd = -1;
+  const auto &recv_sockets = ptmc_state.sock_states[node].sockets();
+  for (const auto &kv : recv_sockets)
+  {
+    const Socket &rs = kv.second;
+    if (rs.type == SOCK_DGRAM && rs.bound && rs.local_addr.sin_port == port &&
+        (rs.local_addr.sin_addr.s_addr == INADDR_ANY ||
+         rs.local_addr.sin_addr.s_addr == dest.sin_addr.s_addr))
+    {
+      recvfd = kv.first;
+      break;
+    }
+  }
+
+  if (recvfd == -1)
+  {
+    /* No receiver - drop packet but report success */
+    return len;
+  }
 
   UdpDatagram dg;
-  dg.content = std::string(data, len);
-  dg.from = from;
-  free(data);
+  dg.content = std::move(data);
+  dg.from = {};
 
-  LOG_TRACE("sendto(fd=%d, len=%zu) to %s", fd, len,
-            format_sockaddr(dest).c_str());
+  /* Set source address */
+  dg.from.sin_family = AF_INET;
+  dg.from.sin_port = sock->bound ? sock->local_addr.sin_port : 0;
+  dg.from.sin_addr = sock->local_addr.sin_addr;
+  if (dg.from.sin_addr.s_addr == INADDR_ANY &&
+      inet_pton(AF_INET, ptmc_state.addrs[cur].c_str(), &dg.from.sin_addr) != 1)
+    return -EADDRNOTAVAIL;
+
+  /* Deliver to receiver */
+  ptmc_state.sock_states[node].deliver_udp_datagram(recvfd, dg);
+
+  LOG_TRACE("emu_sendto: delivered %zu bytes to node %d fd %d", len, node,
+            recvfd);
 
   return len;
 }
@@ -667,10 +742,17 @@ ssize_t SockState::do_recvfrom_with_choice(int fd, void *buf, size_t len,
                                            int flags, struct sockaddr *src_addr,
                                            socklen_t *addrlen, int choice)
 {
+  if (flags & ~(MSG_DONTWAIT | MSG_PEEK | MSG_TRUNC))
+    throw std::runtime_error("Unsupported UDP receive flags");
   Socket *sock = get_socket_mutable(fd);
   if (!sock)
   {
-    return -EBADF;
+    return invalid_socket_error(fd);
+  }
+
+  if (sock->type == SOCK_STREAM) {
+    if (src_addr || addrlen) throw std::runtime_error("TCP recvfrom source address is unsupported");
+    return do_recv(fd, buf, len, flags);
   }
 
   if (sock->type != SOCK_DGRAM)
@@ -685,7 +767,7 @@ ssize_t SockState::do_recvfrom_with_choice(int fd, void *buf, size_t len,
   }
 
   // Validate choice
-  if (choice < 0 || choice >= static_cast<int>(it->second.size()))
+  if (choice < 0 || choice > 1)
   {
     return -EAGAIN;
   }
@@ -702,7 +784,6 @@ ssize_t SockState::do_recvfrom_with_choice(int fd, void *buf, size_t len,
   if (choice == 1 && it->second.size() >= 2)
   {
     // Choice 1: receive second message (for message reordering)
-    ptmc_state.error_bound--;
     ++dg_it;
   }
 
@@ -710,33 +791,40 @@ ssize_t SockState::do_recvfrom_with_choice(int fd, void *buf, size_t len,
 
   /* Copy data to guest buffer */
   size_t copy_len = std::min(len, dg.content.size());
-  memcpy_host2guest(buf, dg.content.c_str(), copy_len);
+  if (!guest_write_exact(ptmc_state.pids[ptmc_state.cursor], buf, dg.content.data(), copy_len))
+    return -EFAULT;
 
   /* Handle output parameters - src_addr and addrlen are guest pointers */
-  if (src_addr && addrlen)
+  if (src_addr)
   {
     /* Read input addrlen value from guest */
     socklen_t guest_addrlen = 0;
-    memcpy_guest2host(&guest_addrlen, addrlen, sizeof(socklen_t));
+    if (!guest_read_exact(ptmc_state.pids[ptmc_state.cursor], addrlen, &guest_addrlen, sizeof(guest_addrlen)))
+      return -EFAULT;
 
     /* Calculate actual address length to write */
     socklen_t addr_len =
         std::min(guest_addrlen, (socklen_t)sizeof(struct sockaddr_in));
 
     /* Write source address to guest */
-    memcpy_host2guest(src_addr, &dg.from, addr_len);
+    if (!guest_write_exact(ptmc_state.pids[ptmc_state.cursor], src_addr, &dg.from, addr_len))
+      return -EFAULT;
 
     /* Write actual address length back to guest */
-    memcpy_host2guest(addrlen, &addr_len, sizeof(socklen_t));
+    socklen_t actual = sizeof(sockaddr_in);
+    if (!guest_write_exact(ptmc_state.pids[ptmc_state.cursor], addrlen, &actual, sizeof(actual)))
+      return -EFAULT;
   }
 
-  // Remove the received datagram from queue
-  it->second.erase(dg_it);
+  size_t result_len = (flags & MSG_TRUNC) ? dg.content.size() : copy_len;
+  std::string source = format_sockaddr(dg.from);
+  if (choice == 1) --ptmc_state.error_bound;
+  if (!(flags & MSG_PEEK)) it->second.erase(dg_it);
 
   LOG_TRACE("recvfrom(fd=%d, choice=%d) -> len=%zu from %s", fd, choice,
-            copy_len, format_sockaddr(dg.from).c_str());
+            copy_len, source.c_str());
 
-  return copy_len;
+  return result_len;
 }
 
 int SockState::get_recvfrom_choices(int fd) const
@@ -785,6 +873,17 @@ int SockState::do_close(int fd)
       }
     }
 
+    uint64_t endpoint = (uint64_t(effective_local_addr) << 32) | sock.local_addr.sin_port;
+    for (int node = 0; node < NP; ++node) {
+      for (auto &[listener_fd, listener] : ptmc_state.sock_states[node].sockets_) {
+        if (!listener.listening) continue;
+        auto pending = listener.established_connections.find(endpoint);
+        if (pending != listener.established_connections.end() &&
+            pending->second.peer_addr.sin_addr.s_addr == sock.peer_addr.sin_addr.s_addr &&
+            pending->second.peer_addr.sin_port == sock.peer_addr.sin_port)
+          pending->second.recv_buffer.emplace_back();
+      }
+    }
     // Find peer socket and add EPOLLIN event to wake up epoll_wait
     for (int pid = 0; pid < NP; pid++)
     {
@@ -794,7 +893,9 @@ int SockState::do_close(int fd)
         Socket &remote_sock = kv.second;
         if (remote_sock.connected &&
             remote_sock.peer_addr.sin_addr.s_addr == effective_local_addr &&
-            remote_sock.peer_addr.sin_port == sock.local_addr.sin_port)
+            remote_sock.peer_addr.sin_port == sock.local_addr.sin_port &&
+            remote_sock.local_addr.sin_addr.s_addr == sock.peer_addr.sin_addr.s_addr &&
+            remote_sock.local_addr.sin_port == sock.peer_addr.sin_port)
         {
           // Found peer, add EOF marker to recv_buffer and notify
           auto conn_it = remote_state.tcp_connections_.find(kv.first);
@@ -802,19 +903,6 @@ int SockState::do_close(int fd)
           {
             // Push empty string as EOF marker
             conn_it->second.recv_buffer.push_back("");
-          }
-          for (auto &epoll_kv : remote_state.epoll_instances_)
-          {
-            EpollInstance &inst = epoll_kv.second;
-            if (inst.watched_fds.find(kv.first) != inst.watched_fds.end())
-            {
-              EpollEvent ev;
-              ev.events = EPOLLIN;
-              ev.fd = kv.first;
-              inst.ready_events.push_back(ev);
-              LOG_TRACE("close(fd=%d): notified peer fd=%d in process %d", fd,
-                        kv.first, pid);
-            }
           }
           break;
         }
@@ -825,6 +913,7 @@ int SockState::do_close(int fd)
   udp_recv_buffers_.erase(fd);
   tcp_connections_.erase(fd);
   sockets_.erase(it);
+  forget_fd(fd);
   release_fd(fd);
 
   LOG_TRACE("close(fd=%d) = 0", fd);
@@ -890,7 +979,8 @@ void Socket::serialize(Archive &ar)
 
   ar(fd, domain, type, protocol, bound, local_family, local_port,
      local_addr_val, connected, listening, peer_family, peer_port,
-     peer_addr_val, backlog, pending_connections);
+     peer_addr_val, backlog, pending_connections, established_connections,
+     reuse_address, no_delay, keep_alive, keep_idle, keep_interval, keep_count);
 
   local_addr.sin_family = local_family;
   local_addr.sin_port = local_port;
@@ -938,15 +1028,9 @@ void TcpConnection::serialize(Archive &ar)
 }
 
 template <class Archive>
-void EpollEvent::serialize(Archive &ar)
-{
-  ar(events, fd);
-}
-
-template <class Archive>
 void EpollInstance::serialize(Archive &ar)
 {
-  ar(epoll_fd, watched_fds, ready_events);
+  ar(epoll_fd, watched_fds);
 }
 
 template <class Archive>
@@ -967,10 +1051,6 @@ template void UdpDatagram::serialize<cereal::BinaryOutputArchive>(
 template void TcpConnection::serialize<cereal::BinaryInputArchive>(
     cereal::BinaryInputArchive &);
 template void TcpConnection::serialize<cereal::BinaryOutputArchive>(
-    cereal::BinaryOutputArchive &);
-template void
-EpollEvent::serialize<cereal::BinaryInputArchive>(cereal::BinaryInputArchive &);
-template void EpollEvent::serialize<cereal::BinaryOutputArchive>(
     cereal::BinaryOutputArchive &);
 template void EpollInstance::serialize<cereal::BinaryInputArchive>(
     cereal::BinaryInputArchive &);
@@ -1013,26 +1093,6 @@ void SockState::dump_state() const
  * ==============================================================================
  */
 
-/* Helper: Convert string address to sockaddr_in */
-static void addr_str_to_sockaddr(const std::string &addr_str,
-                                 struct sockaddr_in *sin)
-{
-  if (addr_str.size() >= sizeof(struct sockaddr_in))
-  {
-    memcpy(sin, addr_str.c_str(), sizeof(struct sockaddr_in));
-  }
-  else
-  {
-    memset(sin, 0, sizeof(*sin));
-  }
-}
-
-/* Helper: Convert sockaddr_in to string address */
-static std::string sockaddr_to_addr_str(const struct sockaddr_in *sin)
-{
-  return std::string((const char *)sin, sizeof(*sin));
-}
-
 int emu_socket(int domain, int type, int protocol)
 {
   int cur = ptmc_state.cursor;
@@ -1043,6 +1103,16 @@ int emu_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 {
   int cur = ptmc_state.cursor;
   return ptmc_state.sock_states[cur].do_bind(sockfd, addr, addrlen);
+}
+
+int emu_getsockname(int fd, sockaddr *address, socklen_t *length)
+{
+  return ptmc_state.sock_states[ptmc_state.cursor].do_getsockname(fd, address, length);
+}
+
+int emu_getpeername(int fd, sockaddr *address, socklen_t *length)
+{
+  return ptmc_state.sock_states[ptmc_state.cursor].do_getpeername(fd, address, length);
 }
 
 int emu_listen(int sockfd, int backlog)
@@ -1104,275 +1174,131 @@ static int addr_to_node(const struct sockaddr_in *addr)
 ssize_t emu_sendto(int sockfd, const void *buf, size_t len, int flags,
                    struct sockaddr *dest_addr, socklen_t addrlen)
 {
-  LOG_TRACE("emu_sendto(%d, %p, %ld, %d, %p, %d)", sockfd, (void *)buf, len,
-            flags, (void *)dest_addr, addrlen);
-
-  int cur = ptmc_state.cursor;
-  const Socket *sock = ptmc_state.sock_states[cur].get_socket(sockfd);
-  if (!sock)
-  {
-    return -ENOTSOCK;
-  }
-
-  if (sock->type != SOCK_DGRAM)
-  {
-    return -EOPNOTSUPP;
-  }
-
-  /* Get destination info */
-  struct sockaddr_in dest;
-  if (dest_addr && addrlen > 0)
-  {
-    memcpy_guest2host(&dest, dest_addr, sizeof(struct sockaddr_in));
-  }
-  else if (sock->connected)
-  {
-    dest = sock->peer_addr;
-  }
-  else
-  {
-    return -EDESTADDRREQ;
-  }
-
-  int node = addr_to_node(&dest);
-  if (node < 0)
-  {
-    return -ENETUNREACH;
-  }
-
-  uint16_t port = dest.sin_port;
-  assert(port > 0);
-
-  /* Find receiving socket by port */
-  int recvfd = -1;
-  const auto &recv_sockets = ptmc_state.sock_states[node].sockets();
-  for (const auto &kv : recv_sockets)
-  {
-    const Socket &rs = kv.second;
-    if (rs.bound && rs.local_addr.sin_port == port)
-    {
-      recvfd = kv.first;
-      break;
-    }
-  }
-
-  if (recvfd == -1)
-  {
-    /* No receiver - drop packet but report success */
-    return len;
-  }
-
-  /* Read data from guest */
-  char *data = (char *)malloc(len);
-  if (!data)
-  {
-    return -ENOMEM;
-  }
-  memcpy_guest2host(data, buf, len);
-
-  /* Create datagram with proper source address */
-  UdpDatagram dg;
-  dg.content = std::string(data, len);
-  free(data);
-
-  /* Set source address */
-  dg.from.sin_family = AF_INET;
-  dg.from.sin_port = sock->bound ? sock->local_addr.sin_port : 0;
-  inet_pton(AF_INET, ptmc_state.addrs[cur].c_str(), &dg.from.sin_addr);
-
-  /* Deliver to receiver */
-  ptmc_state.sock_states[node].deliver_udp_datagram(recvfd, dg);
-
-  LOG_TRACE("emu_sendto: delivered %zu bytes to node %d fd %d", len, node,
-            recvfd);
-
-  return len;
+  return ptmc_state.sock_states[ptmc_state.cursor].do_sendto(
+      sockfd, buf, len, flags, dest_addr, addrlen);
 }
 
 /* ==============================================================================
- * Epoll Implementation for Redis
+ * Epoll Implementation
  * ==============================================================================
  */
 
+void SockState::forget_fd(int fd)
+{
+  for (auto &[epfd, instance] : epoll_instances_) {
+    instance.watched_fds.erase(fd);
+  }
+}
+
+int SockState::do_epoll_close(int fd)
+{
+  if (!epoll_instances_.erase(fd)) return -EBADF;
+  forget_fd(fd);
+  release_fd(fd);
+  return 0;
+}
+
 int SockState::do_epoll_create(int size)
 {
-  (void)size;
-
-  int epfd = allocate_fd(FdType::EPOLL);
-  if (epfd < 0)
-  {
-    LOG_ERROR("do_epoll_create: failed to allocate fd");
-    return -EMFILE;
-  }
-
-  EpollInstance inst;
-  inst.epoll_fd = epfd;
-  epoll_instances_[epfd] = inst;
-
-  LOG_TRACE("do_epoll_create: created epoll fd %d", epfd);
-  return epfd;
+  if (size <= 0) return -EINVAL;
+  return do_epoll_create1(0);
 }
 
 int SockState::do_epoll_create1(int flags)
 {
-  (void)flags;
-  return do_epoll_create(1);
+  if (flags & ~EPOLL_CLOEXEC) return -EINVAL;
+  int epfd = allocate_fd(FdType::EPOLL, O_RDWR, flags ? FD_CLOEXEC : 0);
+  if (epfd < 0) return -EMFILE;
+  EpollInstance instance;
+  instance.epoll_fd = epfd;
+  epoll_instances_[epfd] = instance;
+  return epfd;
 }
 
 int SockState::do_epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
 {
   auto it = epoll_instances_.find(epfd);
-  if (it == epoll_instances_.end())
-  {
-    LOG_ERROR("do_epoll_ctl: invalid epoll fd %d", epfd);
-    return -EBADF;
-  }
-
-  EpollInstance &inst = it->second;
-
-  // Read event from guest memory
-  struct epoll_event host_event;
-  if (event)
-  {
-    memcpy_guest2host(&host_event, event, sizeof(struct epoll_event));
-  }
-  else if (op != EPOLL_CTL_DEL)
-  {
-    LOG_ERROR("do_epoll_ctl: invalid operation %d", op);
+  if (it == epoll_instances_.end()) return -EBADF;
+  if (!fd_manager_ || !fd_manager_->is_allocated(fd)) return -EBADF;
+  if (fd == epfd) return -EINVAL;
+  FdType type = fd_manager_->get_fd_type(fd);
+  if (type == FdType::EPOLL)
+    throw std::runtime_error("Nested epoll is unsupported");
+  if (type != FdType::SOCKET && type != FdType::PIPE) return -EPERM;
+  if (op != EPOLL_CTL_ADD && op != EPOLL_CTL_MOD && op != EPOLL_CTL_DEL)
     return -EINVAL;
+  auto &instance = it->second;
+  auto watch = instance.watched_fds.find(fd);
+  if (op == EPOLL_CTL_ADD && watch != instance.watched_fds.end()) return -EEXIST;
+  if (op != EPOLL_CTL_ADD && watch == instance.watched_fds.end()) return -ENOENT;
+  if (op == EPOLL_CTL_DEL) {
+    instance.watched_fds.erase(watch);
+    return 0;
   }
-
-  switch (op)
-  {
-    case EPOLL_CTL_ADD:
-      inst.watched_fds[fd] = host_event.events;
-      LOG_TRACE("do_epoll_ctl: ADD fd %d to epoll %d, events=%u", fd, epfd,
-                host_event.events);
-      break;
-    case EPOLL_CTL_MOD:
-      inst.watched_fds[fd] = host_event.events;
-      LOG_TRACE("do_epoll_ctl: MOD fd %d on epoll %d, events=%u", fd, epfd,
-                host_event.events);
-      break;
-    case EPOLL_CTL_DEL:
-      inst.watched_fds.erase(fd);
-      LOG_TRACE("do_epoll_ctl: DEL fd %d from epoll %d", fd, epfd);
-      break;
-    default:
-      LOG_ERROR("do_epoll_ctl: invalid operation %d", op);
-      return -EINVAL;
-  }
-
+  epoll_event input{};
+  if (!guest_read_exact(ptmc_state.pids[ptmc_state.cursor], event, &input, sizeof(input)))
+    return -EFAULT;
+  if (input.events & (EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE | EPOLLWAKEUP))
+    throw std::runtime_error("Unsupported epoll watch mode");
+  if (input.events & ~(EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP))
+    throw std::runtime_error("Unsupported epoll readiness mask");
+  instance.watched_fds[fd] = EpollWatch{input.events, input.data.u64};
   return 0;
 }
 
-int SockState::do_epoll_wait(int epfd, struct epoll_event *events,
-                             int maxevents, int timeout)
+int SockState::do_epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)
 {
-  (void)timeout;
-
+  (void)timeout; // Blocking/time progression remains part of the scheduling profile.
   auto it = epoll_instances_.find(epfd);
-  if (it == epoll_instances_.end())
-  {
-    LOG_ERROR("do_epoll_wait: invalid epoll fd %d", epfd);
-    return -EBADF;
-  }
-
-  EpollInstance &inst = it->second;
-
-  // Collect ready events in host buffer first
-  std::vector<struct epoll_event> ready_host_events;
-  while (!inst.ready_events.empty() &&
-         (int)ready_host_events.size() < maxevents)
-  {
-    int fd = inst.ready_events.front().fd;
-    // Skip events for sockets that no longer exist
-    if (get_socket(fd) == nullptr)
-    {
-      LOG_TRACE("do_epoll_wait: skipping event for closed fd=%d", fd);
-      inst.ready_events.pop_front();
-      continue;
-    }
-    struct epoll_event ev;
-    ev.events = inst.ready_events.front().events;
-    ev.data.fd = fd;
-    ready_host_events.push_back(ev);
-    inst.ready_events.pop_front();
-  }
-
-  if (!ready_host_events.empty())
-  {
-    memcpy_host2guest(events, ready_host_events.data(),
-                      ready_host_events.size() * sizeof(struct epoll_event));
-    LOG_TRACE("do_epoll_wait: returned %zu ready events",
-              ready_host_events.size());
-    return ready_host_events.size();
-  }
-
-  // Collect events in host buffer first, then copy to guest
-  std::vector<struct epoll_event> host_events;
-  for (const auto &kv : inst.watched_fds)
-  {
-    if ((int)host_events.size() >= maxevents)
-      break;
-
-    int fd = kv.first;
-    uint32_t mask = kv.second;
-    uint32_t revents = 0;
-
-    if ((mask & EPOLLIN) && get_udp_buffer_size(fd) > 0)
-    {
-      revents |= EPOLLIN;
-    }
-
-    const Socket *sock = get_socket(fd);
-    if (sock && sock->listening && (mask & EPOLLIN))
-    {
-      LOG_TRACE("epoll_wait: fd=%d is listening, pending=%zu", fd,
-                sock->pending_connections.size());
-      if (!sock->pending_connections.empty())
-      {
-        revents |= EPOLLIN;
-        LOG_TRACE("epoll_wait: fd=%d has pending connection, setting EPOLLIN",
-                  fd);
+  if (it == epoll_instances_.end()) return -EBADF;
+  if (maxevents <= 0 || maxevents > INT_MAX / int(sizeof(epoll_event))) return -EINVAL;
+  std::vector<epoll_event> output;
+  for (const auto &[fd, watch] : it->second.watched_fds) {
+    if (int(output.size()) >= maxevents) break;
+    uint32_t ready = 0;
+    const Socket *socket = get_socket(fd);
+    if (socket) {
+      if (socket->type == SOCK_DGRAM) {
+        if (get_udp_buffer_size(fd)) ready |= EPOLLIN;
+        ready |= EPOLLOUT;
+      } else if (socket->listening) {
+        if (!socket->pending_connections.empty()) ready |= EPOLLIN;
+      } else if (socket->connected) {
+        auto connection = tcp_connections_.find(fd);
+        if (connection != tcp_connections_.end()) {
+          const auto &queue = connection->second.recv_buffer;
+          if (!queue.empty()) ready |= EPOLLIN;
+          if (!queue.empty() && queue.back().empty()) ready |= EPOLLRDHUP;
+          ready |= EPOLLOUT;
+        }
+      }
+    } else {
+      const auto &fs = ptmc_state.fs_states[ptmc_state.cursor];
+      auto pipe_fd = fs.pipe_fds_.find(fd);
+      if (pipe_fd != fs.pipe_fds_.end()) {
+        auto pipe = fs.pipes_.find(std::abs(pipe_fd->second));
+        if (pipe != fs.pipes_.end()) {
+          if (pipe_fd->second > 0) {
+            if (!pipe->second.buffer.empty() || pipe->second.write_closed) ready |= EPOLLIN;
+            if (pipe->second.write_closed) ready |= EPOLLHUP;
+          } else {
+            if (pipe->second.read_closed) ready |= EPOLLERR;
+            else ready |= EPOLLOUT;
+          }
+        }
       }
     }
-
-    if (sock && sock->connected && (mask & EPOLLIN))
-    {
-      auto conn_it = tcp_connections_.find(fd);
-      if (conn_it != tcp_connections_.end() &&
-          !conn_it->second.recv_buffer.empty())
-      {
-        revents |= EPOLLIN;
-      }
-    }
-
-    if (revents != 0)
-    {
-      struct epoll_event ev;
-      ev.events = revents;
-      ev.data.fd = fd;
-      host_events.push_back(ev);
+    ready &= watch.events | EPOLLERR | EPOLLHUP;
+    if (ready) {
+      epoll_event event{};
+      event.events = ready;
+      event.data.u64 = watch.data;
+      output.push_back(event);
     }
   }
-
-  // Copy events to guest memory
-  if (!host_events.empty())
-  {
-    LOG_TRACE("epoll_wait: copying %zu events to guest at %p",
-              host_events.size(), events);
-    for (size_t i = 0; i < host_events.size(); i++)
-    {
-      LOG_TRACE("epoll_wait: event[%zu] fd=%d events=%u", i,
-                host_events[i].data.fd, host_events[i].events);
-    }
-    memcpy_host2guest(events, host_events.data(),
-                      host_events.size() * sizeof(struct epoll_event));
-    LOG_TRACE("epoll_wait: copied successfully");
-  }
-
-  return host_events.size();
+  if (!guest_write_exact(ptmc_state.pids[ptmc_state.cursor], events,
+                        output.data(), output.size() * sizeof(epoll_event))) return -EFAULT;
+  return output.size();
 }
 
 int emu_epoll_create(int size)
@@ -1401,8 +1327,7 @@ int emu_epoll_wait(int epfd, struct epoll_event *events, int maxevents,
 int emu_epoll_pwait(int epfd, struct epoll_event *events, int maxevents,
                     int timeout, const sigset_t *sigmask, size_t sigsetsize)
 {
-  // sigmask is handled by ptrace, just delegate to epoll_wait
-  (void)sigmask;
+  if (sigmask) throw std::runtime_error("epoll_pwait signal masks are unsupported");
   (void)sigsetsize;
   return ptmc_state.sock_states[ptmc_state.cursor].do_epoll_wait(
       epfd, events, maxevents, timeout);
@@ -1412,12 +1337,16 @@ int emu_epoll_pwait2(int epfd, struct epoll_event *events, int maxevents,
                      const struct timespec *timeout, const sigset_t *sigmask,
                      size_t sigsetsize)
 {
-  // Convert timespec to milliseconds and delegate
-  int timeout_ms = -1;  // Default to infinite
+  if (sigmask) throw std::runtime_error("epoll_pwait2 signal masks are unsupported");
+  int timeout_ms = -1;
   if (timeout) {
-    timeout_ms = timeout->tv_sec * 1000 + timeout->tv_nsec / 1000000;
+    timespec local{};
+    if (!guest_read_exact(ptmc_state.pids[ptmc_state.cursor], timeout, &local, sizeof(local)))
+      return -EFAULT;
+    if (local.tv_sec < 0 || local.tv_nsec < 0 || local.tv_nsec >= 1000000000) return -EINVAL;
+    timeout_ms = local.tv_sec > INT_MAX / 1000 ? INT_MAX :
+        std::min<long long>(INT_MAX, local.tv_sec * 1000LL + (local.tv_nsec + 999999) / 1000000);
   }
-  (void)sigmask;
   (void)sigsetsize;
   return ptmc_state.sock_states[ptmc_state.cursor].do_epoll_wait(
       epfd, events, maxevents, timeout_ms);
@@ -1436,16 +1365,10 @@ ssize_t emu_send(int sockfd, const void *buf, size_t len, int flags)
   if (!sock)
   {
     LOG_ERROR("emu_send: invalid socket fd %d", sockfd);
-    return -EBADF;
+    return ptmc_state.fd_managers[ptmc_state.cursor]->is_allocated(sockfd) ? -ENOTSOCK : -EBADF;
   }
 
-  if (sock->type == SOCK_STREAM && sock->connected)
-  {
-    return emu_sendto(sockfd, buf, len, flags,
-                      (struct sockaddr *)&sock->peer_addr,
-                      sizeof(sock->peer_addr));
-  }
-
+  if (sock->type == SOCK_STREAM) return sock_state.do_send(sockfd, buf, len, flags);
   return emu_sendto(sockfd, buf, len, flags, nullptr, 0);
 }
 
@@ -1469,13 +1392,36 @@ int emu_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
 int emu_setsockopt(int sockfd, int level, int optname, const void *optval,
                    socklen_t optlen)
 {
-  (void)sockfd;
-  (void)level;
-  (void)optname;
-  (void)optval;
-  (void)optlen;
-  LOG_TRACE("emu_setsockopt: fd=%d, level=%d, optname=%d", sockfd, level,
-            optname);
+  auto &state = ptmc_state.sock_states[ptmc_state.cursor];
+  auto it = state.sockets().find(sockfd);
+  if (it == state.sockets().end())
+    return ptmc_state.fd_managers[ptmc_state.cursor]->is_allocated(sockfd) ? -ENOTSOCK : -EBADF;
+  Socket &socket = it->second;
+  bool *setting = nullptr;
+  int *numeric_setting = nullptr;
+  int maximum = 0;
+  if (level == SOL_SOCKET && optname == SO_REUSEADDR) setting = &socket.reuse_address;
+  else if (level == SOL_SOCKET && optname == SO_KEEPALIVE) setting = &socket.keep_alive;
+  else if (level == IPPROTO_TCP && optname == TCP_NODELAY && socket.type == SOCK_STREAM)
+    setting = &socket.no_delay;
+  else if (level == IPPROTO_TCP && socket.type == SOCK_STREAM) {
+    switch (optname) {
+      case TCP_KEEPIDLE: numeric_setting = &socket.keep_idle; maximum = 32767; break;
+      case TCP_KEEPINTVL: numeric_setting = &socket.keep_interval; maximum = 32767; break;
+      case TCP_KEEPCNT: numeric_setting = &socket.keep_count; maximum = 127; break;
+      default: throw std::runtime_error("Unsupported setsockopt option");
+    }
+  } else throw std::runtime_error("Unsupported setsockopt option");
+  if (optlen < sizeof(int)) return -EINVAL;
+  int value = 0;
+  if (!guest_read_exact(ptmc_state.pids[ptmc_state.cursor], optval, &value, sizeof(value)))
+    return -EFAULT;
+  // These tunings are saved and queryable. The network profile has no TIME_WAIT,
+  // Nagle delays, or keepalive timers; they do not enable endpoint aliasing.
+  if (numeric_setting) {
+    if (value < 1 || value > maximum) return -EINVAL;
+    *numeric_setting = value;
+  } else *setting = value != 0;
   return 0;
 }
 
@@ -1487,69 +1433,36 @@ int emu_getsockopt(int sockfd, int level, int optname, void *optval,
 
   if (!sock)
   {
-    return -EBADF;
+    return ptmc_state.fd_managers[ptmc_state.cursor]->is_allocated(sockfd) ? -ENOTSOCK : -EBADF;
   }
 
-  if (level == SOL_SOCKET && optname == SO_ACCEPTCONN)
-  {
-    int accepting = sock->listening ? 1 : 0;
-    memcpy_host2guest(optval, &accepting, sizeof(int));
-    if (optlen)
-    {
-      socklen_t len = sizeof(int);
-      memcpy_host2guest(optlen, &len, sizeof(socklen_t));
+  int value = 0;
+  if (level == IPPROTO_TCP && sock->type == SOCK_STREAM) {
+    switch (optname) {
+      case TCP_NODELAY: value = sock->no_delay; break;
+      case TCP_KEEPIDLE: value = sock->keep_idle; break;
+      case TCP_KEEPINTVL: value = sock->keep_interval; break;
+      case TCP_KEEPCNT: value = sock->keep_count; break;
+      default: throw std::runtime_error("Unsupported getsockopt option");
     }
-    LOG_TRACE("getsockopt(fd=%d, SO_ACCEPTCONN) = %d", sockfd, accepting);
-    return 0;
   }
-
-  LOG_TRACE("getsockopt(fd=%d, level=%d, optname=%d) - not implemented", sockfd,
-            level, optname);
+  else if (level == SOL_SOCKET) switch (optname) {
+    case SO_REUSEADDR: value = sock->reuse_address; break;
+    case SO_KEEPALIVE: value = sock->keep_alive; break;
+    case SO_ACCEPTCONN: value = sock->listening; break;
+    case SO_TYPE: value = sock->type; break;
+    case SO_DOMAIN: value = sock->domain; break;
+    case SO_PROTOCOL: value = sock->protocol; break;
+    case SO_ERROR: value = 0; break; // Connections currently complete synchronously.
+    default: throw std::runtime_error("Unsupported getsockopt option");
+  } else throw std::runtime_error("Unsupported getsockopt level/option");
+  int pid = ptmc_state.pids[ptmc_state.cursor];
+  socklen_t capacity = 0;
+  if (!guest_read_exact(pid, optlen, &capacity, sizeof(capacity))) return -EFAULT;
+  if (capacity > INT_MAX) return -EINVAL;
+  if (!guest_write_exact(pid, optval, &value, std::min<size_t>(capacity, sizeof(value))))
+    return -EFAULT;
+  socklen_t actual = std::min<size_t>(capacity, sizeof(value));
+  if (!guest_write_exact(pid, optlen, &actual, sizeof(actual))) return -EFAULT;
   return 0;
-}
-
-/* ==============================================================================
- * File Sync Operations
- * ==============================================================================
- */
-
-int emu_fsync(int fd)
-{
-  (void)fd;
-  LOG_TRACE("emu_fsync: fd=%d", fd);
-  return 0;
-}
-
-int emu_fdatasync(int fd)
-{
-  (void)fd;
-  LOG_TRACE("emu_fdatasync: fd=%d", fd);
-  return 0;
-}
-
-/* ==============================================================================
- * Non-blocking I/O
- * ==============================================================================
- */
-
-int emu_fcntl(int fd, int cmd, long arg)
-{
-  (void)fd;
-  (void)arg;
-
-  switch (cmd)
-  {
-    case F_GETFL:
-      return 0;
-    case F_SETFL:
-      LOG_TRACE("emu_fcntl: F_SETFL fd=%d, arg=%ld", fd, arg);
-      return 0;
-    case F_GETFD:
-      return 0;
-    case F_SETFD:
-      return 0;
-    default:
-      LOG_TRACE("emu_fcntl: fd=%d, cmd=%d, arg=%ld", fd, cmd, arg);
-      return 0;
-  }
 }

@@ -336,3 +336,24 @@ Raft verify可在前述benchmark命令前加`DETSIM_SOFT_DIRTY_EXPERIMENT=verify
 本次产物保留在`build/soft-dirty/results-v1.json`、`results-v2.json`、
 `summary-v2.json`及对应run目录。新增runner另以深度8、每档每模式1次验证入口。
 产品构建、`make check`、NP1原生scenario/state-io/mappings及上述capture gates通过。
+
+## 虚拟 I/O 修复后的复核（2026-10-15）
+
+快照格式7/8新增 typed FD flags、捕获的标准流、pipe 和 pre-accept TCP 等状态。
+同一固定seed、100轮手控、DFS深度12、每档每后端一次，四次都是5593 visits、
+2867 new states，协议检查点和剩余 error budget 相同。过去3433/1776属于旧
+I/O语义，不能直接用两组墙钟说明优化/退化；这里仅比较本版 flat/pages。
+计数和检查点相等不是完整 successor-set 等价性证明。
+
+| Hot/Warm MiB | flat墙钟 / CPU s | pages墙钟 / CPU s | flat/pages峰值RSS MiB | flat/pages存储MB |
+| --- | --- | --- | --- | --- |
+| 32/64 | 21.051 /23.30 | 12.521 /11.56 | 321.7 /50.4 | 349.14 /3.88 |
+| 256/512 | 15.886 /18.19 | 12.527 /11.41 | 1364.2 /48.3 | 349.13 /3.84 |
+
+最终复核期间没有并发构建或其他DetSim测试。单次数据只能说明此有限工作量；
+没有声称network重构本身带来加速。产物为
+`build/io-boundary-benchmark-quiet/{results,summary}.json`。命令：
+
+```sh
+python3 tests/page_snapshot_benchmark.py --repeats 1 --depth 12 --output build/io-boundary-benchmark-quiet
+```

@@ -8,6 +8,7 @@
 #include "common.h"
 #include "fd_manager.h"
 #include <deque>
+#include <fcntl.h>
 #include <map>
 #include <memory>
 #include <netinet/in.h>
@@ -41,11 +42,11 @@ bool parse_sockaddr(const std::string &str, struct sockaddr_in &addr);
 struct TcpConnection
 {
   // Connection identifiers (for debugging)
-  int local_fd;
+  int local_fd = -1;
 
   // Connection endpoints
-  struct sockaddr_in local_addr; // Our address
-  struct sockaddr_in peer_addr;  // Remote address
+  struct sockaddr_in local_addr{}; // Our address
+  struct sockaddr_in peer_addr{};  // Remote address
 
   // Data buffer
   std::deque<std::string> recv_buffer;
@@ -58,7 +59,7 @@ struct TcpConnection
 struct UdpDatagram
 {
   std::string content;     // Payload
-  struct sockaddr_in from; // Source address
+  struct sockaddr_in from{}; // Source address
 
   template <class Archive>
   void serialize(Archive &ar);
@@ -71,7 +72,6 @@ struct Socket
   int domain;   // AF_INET, AF_UNIX, etc.
   int type;     // SOCK_STREAM, SOCK_DGRAM
   int protocol; // Protocol number (usually 0)
-  int flags;    // SOCK_NONBLOCK, SOCK_CLOEXEC flags from socket creation
 
   // Binding state
   bool bound;
@@ -84,15 +84,22 @@ struct Socket
 
   // For TCP listen: backlog queue
   int backlog;
-  std::deque<int> pending_connections; // FDs of incoming connections
+  std::deque<uint64_t> pending_connections; // FIFO of client endpoint keys
 
   // Established connections waiting for accept (kernel-managed)
   // Key: client address (IP:port) -> TcpConnection
   std::map<uint64_t, TcpConnection> established_connections;
 
+  bool reuse_address = false;
+  bool no_delay = false;
+  bool keep_alive = false;
+  int keep_idle = 7200;
+  int keep_interval = 75;
+  int keep_count = 9;
+
   Socket()
-      : fd(-1), domain(0), type(0), protocol(0), flags(0), bound(false), connected(false),
-        listening(false), backlog(0)
+      : fd(-1), domain(0), type(0), protocol(0), bound(false), local_addr{}, connected(false),
+        listening(false), peer_addr{}, backlog(0)
   {
   }
 
@@ -100,20 +107,17 @@ struct Socket
   void serialize(Archive &ar);
 };
 
-struct EpollEvent
+struct EpollWatch
 {
-  uint32_t events;
-  int fd;
-
-  template <class Archive>
-  void serialize(Archive &ar);
+  uint32_t events = 0;
+  uint64_t data = 0;
+  template <class Archive> void serialize(Archive &ar) { ar(events, data); }
 };
 
 struct EpollInstance
 {
   int epoll_fd;
-  std::map<int, uint32_t> watched_fds;
-  std::deque<EpollEvent> ready_events;
+  std::map<int, EpollWatch> watched_fds;
 
   EpollInstance() : epoll_fd(-1) {}
 
@@ -155,6 +159,8 @@ class SockState
 
   /* bind(fd, addr, addrlen) -> 0 or -errno */
   int do_bind(int fd, const struct sockaddr *addr, socklen_t addrlen);
+  int do_getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen);
+  int do_getpeername(int fd, struct sockaddr *addr, socklen_t *addrlen);
 
   /* listen(fd, backlog) -> 0 or -errno */
   int do_listen(int fd, int backlog);
@@ -190,9 +196,11 @@ class SockState
 
   /* close(fd) -> 0 or -errno */
   int do_close(int fd);
+  int do_epoll_close(int fd);
+  void forget_fd(int fd);
 
   /* --------------------------------------------------------------------------
-   * Epoll Operations (for Redis)
+   * Epoll Operations
    * --------------------------------------------------------------------------
    */
 
@@ -284,13 +292,14 @@ class SockState
   std::map<int, EpollInstance> epoll_instances_;
 
   /* Helper: allocate new fd via FdManager */
-  int allocate_fd(FdType type = FdType::SOCKET);
+  int allocate_fd(FdType type = FdType::SOCKET, int status_flags = O_RDWR, int descriptor_flags = 0);
 
   /* Helper: release fd */
   void release_fd(int fd);
 
   /* Helper: get socket by fd (non-const) */
   Socket *get_socket_mutable(int fd);
+  int invalid_socket_error(int fd) const;
 
   /* Helper: find socket by local address (for UDP routing) */
   int find_socket_by_local_addr(const struct sockaddr_in &addr) const;
@@ -306,6 +315,8 @@ class SockState
  */
 
 int emu_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
+int emu_getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen);
+int emu_getpeername(int fd, struct sockaddr *addr, socklen_t *addrlen);
 ssize_t emu_recvfrom(int sockfd, void *buf, size_t len, int flags,
                      struct sockaddr *src_addr, socklen_t *addrlen);
 int emu_recvfrom_get_choices(int sockfd);
@@ -334,10 +345,6 @@ int emu_setsockopt(int sockfd, int level, int optname, const void *optval,
 int emu_getsockopt(int sockfd, int level, int optname, void *optval,
                    socklen_t *optlen);
 
-int emu_fsync(int fd);
-int emu_fdatasync(int fd);
-
-int emu_fcntl(int fd, int cmd, long arg);
 
 int emu_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 

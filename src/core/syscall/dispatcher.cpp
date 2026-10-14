@@ -15,6 +15,9 @@
 #include <sys/syscall.h>
 #include <sys/user.h>
 #include <sys/mman.h>
+#include <stdexcept>
+#include <fcntl.h>
+#include <algorithm>
 
 // External functions from state_transition.cpp
 extern int analyze_choose(struct syscall_info &info);
@@ -36,7 +39,7 @@ void handle_auto_choice();
  * ====================================================================== */
 
 SyscallDispatcher::SyscallDispatcher()
-    : vfs_mmap_state_{false, -1, 0, 0}
+    : vfs_mmap_state_{}
 {
 }
 
@@ -54,6 +57,8 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         case SYS_accept4:
         case SYS_setsockopt:
         case SYS_getsockopt:
+        case SYS_getsockname:
+        case SYS_getpeername:
             return SyscallRoute(SyscallCategory::EMULATED,
                                SyscallAction::EMULATE,
                                "Network syscall - emulated");
@@ -89,9 +94,52 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         case SYS_chdir:
         case SYS_pipe:
         case SYS_pipe2:
+        case SYS_fcntl:
+        case SYS_fsync:
+        case SYS_fdatasync:
+        case SYS_ioctl:
+        case SYS_newfstatat:
+        case SYS_getcwd:
+        case SYS_lstat:
             return SyscallRoute(SyscallCategory::EMULATED,
                                SyscallAction::EMULATE,
                                "VFS syscall - emulated");
+
+        // These operations must not escape into the host descriptor namespace.
+        case SYS_dup: case SYS_dup2: case SYS_dup3:
+        case SYS_readv: case SYS_writev: case SYS_pread64: case SYS_pwrite64:
+        case SYS_preadv: case SYS_pwritev: case SYS_preadv2: case SYS_pwritev2:
+        case SYS_sendmsg: case SYS_recvmsg: case SYS_sendmmsg: case SYS_recvmmsg:
+        case SYS_socketpair: case SYS_shutdown:
+        case SYS_poll: case SYS_ppoll: case SYS_select: case SYS_pselect6:
+        case SYS_sendfile: case SYS_splice: case SYS_tee: case SYS_vmsplice: case SYS_copy_file_range:
+        case SYS_getdents: case SYS_getdents64: case SYS_ftruncate:
+        case SYS_fchdir: case SYS_flock: case SYS_sync: case SYS_syncfs:
+        case SYS_readahead: case SYS_fadvise64:
+        case SYS_eventfd: case SYS_eventfd2:
+        case SYS_timerfd_create: case SYS_timerfd_settime: case SYS_timerfd_gettime:
+        case SYS_inotify_init: case SYS_inotify_init1: case SYS_inotify_add_watch: case SYS_inotify_rm_watch:
+        case SYS_io_uring_setup: case SYS_io_uring_register: case SYS_io_uring_enter:
+        case SYS_close_range:
+        case SYS_memfd_create:
+        case SYS_creat: case SYS_openat2: case SYS_truncate:
+        case SYS_unlink: case SYS_unlinkat: case SYS_rename: case SYS_renameat: case SYS_renameat2:
+        case SYS_mkdir: case SYS_mkdirat: case SYS_rmdir:
+        case SYS_link: case SYS_linkat: case SYS_symlink: case SYS_symlinkat:
+        case SYS_mknod: case SYS_mknodat:
+        case SYS_chmod: case SYS_fchmod: case SYS_fchmodat:
+        case SYS_chown: case SYS_lchown: case SYS_fchown: case SYS_fchownat:
+        case SYS_utime: case SYS_utimes: case SYS_utimensat: case SYS_futimesat:
+        case SYS_setxattr: case SYS_lsetxattr: case SYS_fsetxattr:
+        case SYS_removexattr: case SYS_lremovexattr: case SYS_fremovexattr:
+        case SYS_mount: case SYS_umount2: case SYS_pivot_root: case SYS_chroot:
+        case SYS_access: case SYS_faccessat: case SYS_faccessat2:
+        case SYS_statx: case SYS_readlink: case SYS_readlinkat:
+        case SYS_getxattr: case SYS_lgetxattr: case SYS_fgetxattr:
+        case SYS_listxattr: case SYS_llistxattr: case SYS_flistxattr:
+        case SYS_execve: case SYS_execveat:
+            return SyscallRoute(SyscallCategory::UNSUPPORTED,SyscallAction::REJECT,
+                                "Unsupported virtual I/O or descriptor lifecycle");
 
         // Clone syscalls - modified
         case SYS_clone:
@@ -163,6 +211,8 @@ bool SyscallDispatcher::on_enter(pid_t pid, int syscall_nr, syscall_info& info)
     LOG_TRACE("Syscall %d enter: %s", syscall_nr, route.description);
 
     switch (route.action) {
+        case SyscallAction::REJECT:
+            throw std::runtime_error(std::string(route.description)+": syscall "+std::to_string(syscall_nr));
         case SyscallAction::EMULATE:
             // Block the syscall - will be emulated on exit
             tracee_set_orig_rax(pid, -1);
@@ -223,6 +273,8 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
         case SYS_accept4:
         case SYS_setsockopt:
         case SYS_getsockopt:
+        case SYS_getsockname:
+        case SYS_getpeername:
         case SYS_epoll_create:
         case SYS_epoll_create1:
         case SYS_epoll_ctl:
@@ -248,6 +300,10 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
         case SYS_fsync:
         case SYS_fdatasync:
         case SYS_fcntl:
+        case SYS_ioctl:
+        case SYS_newfstatat:
+        case SYS_getcwd:
+        case SYS_lstat:
             return handle_fs_exit(pid, info);
 
         // Thread syscalls
@@ -276,36 +332,43 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
 
 void SyscallDispatcher::handle_mmap_enter(pid_t pid, syscall_info& info)
 {
-    // Check if this is a VFS file mmap
-    int fd = ptrace(PTRACE_PEEKUSER, pid,
-                    offsetof(struct user_regs_struct, r8), NULL);
-    auto &fs = ptmc_state.fs_states[ptmc_state.cursor];
-
-    if (fd >= 0 && fs.open_files.find(fd) != fs.open_files.end()) {
-        // Save VFS mmap state
-        vfs_mmap_state_.active = true;
-        vfs_mmap_state_.fd = fd;
-        vfs_mmap_state_.offset = ptrace(PTRACE_PEEKUSER, pid,
-                                        offsetof(struct user_regs_struct, r9), NULL);
-        vfs_mmap_state_.length = ptrace(PTRACE_PEEKUSER, pid,
-                                        offsetof(struct user_regs_struct, rsi), NULL);
-        int prot = ptrace(PTRACE_PEEKUSER, pid,
-                          offsetof(struct user_regs_struct, rdx), NULL);
-        int flags = ptrace(PTRACE_PEEKUSER, pid,
-                           offsetof(struct user_regs_struct, r10), NULL);
-
-        // Change to anonymous mmap (fd = -1)
-        ptrace(PTRACE_POKEUSER, pid, offsetof(struct user_regs_struct, rdx),
-               prot | PROT_WRITE);
-        ptrace(PTRACE_POKEUSER, pid, offsetof(struct user_regs_struct, r10),
-               flags | MAP_ANONYMOUS);
-        ptrace(PTRACE_POKEUSER, pid, offsetof(struct user_regs_struct, r8), -1);
-
-        LOG_DEBUG("VFS mmap: fd=%d, offset=%ld, len=%zu", fd,
-                  vfs_mmap_state_.offset, vfs_mmap_state_.length);
-    } else {
-        vfs_mmap_state_.active = false;
-    }
+    vfs_mmap_state_ = {};
+    const int flags=static_cast<int>(info.args[3]);
+    if (flags & MAP_ANONYMOUS) return; // fd is ignored by the kernel.
+    auto& fs=ptmc_state.fs_states[ptmc_state.cursor];
+    auto manager=ptmc_state.fd_managers[ptmc_state.cursor];
+    if (!manager) throw std::runtime_error("Missing virtual descriptor manager");
+    const int fd=static_cast<int>(info.args[4]);
+    vfs_mmap_state_.active=true;
+    auto reject=[&](long error) {
+        vfs_mmap_state_.error=error;
+        tracee_set_orig_rax(pid,-1);
+    };
+    if (!manager->is_allocated(fd)) {reject(-EBADF);return;}
+    if (manager->get_fd_type(fd)!=FdType::FILE) {reject(-ENODEV);return;}
+    if (!(flags&MAP_PRIVATE) || (flags&MAP_SHARED))
+        throw std::runtime_error("Shared virtual file mappings are unsupported");
+    if (!info.args[1] || info.args[5]%4096 || info.args[5]>uint64_t(INT64_MAX)) {reject(-EINVAL);return;}
+    if ((manager->get_status_flags(fd)&O_ACCMODE)==O_WRONLY) {reject(-EACCES);return;}
+    const auto file=fs.open_files.find(fd);
+    if (file==fs.open_files.end()) throw std::runtime_error("Mapped descriptor has no file payload");
+    const auto& node=fs.filesystem.at(file->second.path);
+    const size_t tail=node.content.size()%4096;
+    const size_t backing=node.content.size()+(tail?4096-tail:0);
+    if (info.args[5]>=backing || info.args[1]>backing-info.args[5])
+        throw std::runtime_error("Virtual mapping with SIGBUS-backed pages is unsupported");
+    vfs_mmap_state_.fd=fd;
+    vfs_mmap_state_.offset=info.args[5];
+    vfs_mmap_state_.length=info.args[1];
+    vfs_mmap_state_.protection=info.args[2];
+    vfs_mmap_state_.flags=flags;
+    user_regs_struct registers;
+    ptrace_right(PTRACE_GETREGS,pid,nullptr,&registers);
+    registers.rdx=info.args[2]|PROT_WRITE;
+    registers.r10=flags|MAP_ANONYMOUS;
+    registers.r8=uint64_t(-1);
+    registers.r9=0;
+    ptrace_right(PTRACE_SETREGS,pid,nullptr,&registers);
 }
 
 void SyscallDispatcher::handle_clone_enter(pid_t pid, syscall_info& info)
@@ -355,30 +418,30 @@ int SyscallDispatcher::handle_fs_exit(pid_t pid, syscall_info& info)
     // Delegate to FS handlers
     int result = handlers::fs::handle(pid, info);
 
-    // Handle VFS mmap special case
     if (info.nr == SYS_mmap && vfs_mmap_state_.active) {
-        void *addr = (void *)info.rval;
-        if (addr != MAP_FAILED) {
-            auto &fs = ptmc_state.fs_states[ptmc_state.cursor];
-            auto fd_it = fs.open_files.find(vfs_mmap_state_.fd);
-            if (fd_it != fs.open_files.end()) {
-                auto node_it = fs.filesystem.find(fd_it->second.path);
-                if (node_it != fs.filesystem.end()) {
-                    // Write file content to tracee memory
-                    auto& node = node_it->second;
-                    size_t offset = vfs_mmap_state_.offset;
-                    size_t len = vfs_mmap_state_.length;
-
-                    if (offset > node.content.size())
-                        offset = node.content.size();
-                    if (offset + len > node.content.size())
-                        len = node.content.size() - offset;
-
-                    memcpy_host2guest(addr, node.content.data() + offset, len);
-                }
+        const auto operation=vfs_mmap_state_;
+        vfs_mmap_state_={};
+        if (operation.error) {
+            info.rval=operation.error;tracee_set_rax(pid,info.rval);
+        } else {
+            user_regs_struct registers;
+            ptrace_right(PTRACE_GETREGS,pid,nullptr,&registers);
+            registers.rdx=operation.protection;registers.r10=operation.flags;
+            registers.r8=operation.fd;registers.r9=operation.offset;
+            ptrace_right(PTRACE_SETREGS,pid,nullptr,&registers);
+            if (static_cast<int64_t>(info.rval)>=0) {
+                const auto& fs=ptmc_state.fs_states[ptmc_state.cursor];
+                const auto& description=fs.open_files.at(operation.fd);
+                const auto& content=fs.filesystem.at(description.path).content;
+                const size_t offset=operation.offset;
+                const size_t length=offset<content.size()?std::min(operation.length,content.size()-offset):0;
+                if (length && !guest_write_exact(pid,reinterpret_cast<void*>(info.rval),content.data()+offset,length))
+                    throw std::runtime_error("Virtual mapping copyout failed");
+                if (!(operation.protection&PROT_WRITE) &&
+                    tracee_do_syscall(pid,SYS_mprotect,info.rval,operation.length,operation.protection,0,0,0)!=0)
+                    throw std::runtime_error("Virtual mapping protection restore failed");
             }
         }
-        vfs_mmap_state_.active = false;
     }
 
     return result;

@@ -6,6 +6,7 @@
 #include <cereal/types/vector.hpp>
 #include <cerrno>
 #include <cstdlib>
+#include <fcntl.h>
 #include <iostream>
 #include <sstream>
 
@@ -29,6 +30,8 @@ static void fd_snapshot_and_copy()
   CHECK(socket != file);
   CHECK(original.is_allocated(file));
   CHECK(original.is_allocated(socket));
+  CHECK(original.get_fd_type(file) == FdType::FILE);
+  CHECK(original.get_fd_type(socket) == FdType::SOCKET);
   original.release_fd(file);
   CHECK(!original.is_allocated(file));
 
@@ -46,6 +49,7 @@ static void fd_snapshot_and_copy()
   CHECK(!restored.is_allocated(file));
   CHECK(restored.is_allocated(socket));
   const int next = restored.allocate_fd(FdType::PIPE);
+  CHECK(next == file);
   CHECK(next == original.get_next_fd());
   CHECK(!original.is_allocated(next));
 
@@ -60,6 +64,79 @@ static void fd_snapshot_and_copy()
   assigned.release_fd(socket);
   CHECK(original.is_allocated(socket));
   CHECK(!assigned.is_allocated(socket));
+}
+
+static void fd_flags_and_stdio()
+{
+  FdManager manager;
+  CHECK(manager.get_next_fd() == 3);
+  CHECK(manager.get_fd_type(0) == FdType::STDIO);
+  CHECK(manager.get_status_flags(0) == O_RDONLY);
+  CHECK(manager.get_status_flags(1) == O_WRONLY);
+  manager.release_fd(0);
+  const int fd = manager.allocate_fd(FdType::SOCKET, O_RDWR | O_NONBLOCK,
+                                     FD_CLOEXEC);
+  CHECK(fd == 0);
+  CHECK(manager.do_fcntl(fd, F_GETFD, 0) == FD_CLOEXEC);
+  CHECK(manager.do_fcntl(fd, F_SETFL, O_RDONLY | O_APPEND | O_CREAT) == 0);
+  CHECK(manager.get_status_flags(fd) == (O_RDWR | O_APPEND));
+  CHECK(manager.do_fcntl(fd, F_SETFD, 0x100) == 0);
+  CHECK(manager.get_descriptor_flags(fd) == 0);
+  CHECK(manager.do_fcntl(100, F_SETFL, O_APPEND) == -EBADF);
+  CHECK(manager.get_status_flags(100) == -EBADF);
+  bool rejected = false;
+  try { manager.do_fcntl(fd, F_SETFL, O_ASYNC); }
+  catch (const std::runtime_error &) { rejected = true; }
+  CHECK(rejected);
+  CHECK(manager.get_status_flags(fd) == (O_RDWR | O_APPEND));
+  rejected = false;
+  try { manager.do_fcntl(fd, F_DUPFD, 10); }
+  catch (const std::runtime_error &) { rejected = true; }
+  CHECK(rejected);
+
+  FdManager copy = manager;
+  CHECK(copy.do_fcntl(fd, F_SETFL, O_NONBLOCK) == 0);
+  CHECK(copy != manager);
+  CHECK(manager.get_status_flags(fd) == (O_RDWR | O_APPEND));
+  CHECK(copy.do_fcntl(fd, F_SETFD, FD_CLOEXEC) == 0);
+  std::stringstream bytes;
+  { cereal::BinaryOutputArchive ar(bytes); ar(copy); }
+  FdManager restored;
+  { cereal::BinaryInputArchive ar(bytes); ar(restored); }
+  CHECK(restored == copy);
+  CHECK(restored.get_fd_type(fd) == FdType::SOCKET);
+  CHECK(restored.get_status_flags(fd) == (O_RDWR | O_NONBLOCK));
+  CHECK(restored.get_descriptor_flags(fd) == FD_CLOEXEC);
+}
+
+static void fd_archive_validation()
+{
+  for (int variant = 0; variant < 6; ++variant)
+  {
+    std::stringstream bytes;
+    {
+      cereal::BinaryOutputArchive ar(bytes);
+      uint64_t count = variant == 4 ? (1U << 20) + 1 :
+                       variant == 5 ? 2 : 1;
+      ar(count);
+      if (variant != 4)
+      {
+        int fd = variant == 0 ? -1 : 3;
+        FdType kind = variant == 1 ? FdType::UNKNOWN : FdType::FILE;
+        int status = variant == 2 ? O_ASYNC : O_RDONLY;
+        int descriptor = variant == 3 ? 0x100 : 0;
+        ar(fd, kind, status, descriptor);
+        if (variant == 5) ar(fd, kind, status, descriptor);
+      }
+    }
+    FdManager restored;
+    const FdManager before = restored;
+    bool rejected = false;
+    try { cereal::BinaryInputArchive ar(bytes); ar(restored); }
+    catch (const std::runtime_error &) { rejected = true; }
+    CHECK(rejected);
+    CHECK(restored == before);
+  }
 }
 
 static void wait(FutexState &state, pid_t tid, uint64_t address,
@@ -221,10 +298,12 @@ int main()
 {
   futex_requeue_validation();
   fd_snapshot_and_copy();
+  fd_flags_and_stdio();
+  fd_archive_validation();
   futex_wait_and_wake();
   futex_snapshot_and_copy();
   futex_requeue_and_range();
   futex_requeue_index_and_archive();
-  std::cout << "PASS: 6 state component cases (allocation, copy, archive, "
+  std::cout << "PASS: 8 state component cases (allocation, flags, copy, archive, "
                "wait/wake/requeue/range)\n";
 }

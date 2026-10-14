@@ -204,6 +204,90 @@ int sys_state::save_metadata() const
  * Section 5: State Recovery (restore running process from snapshot)
  * ====================================================================== */
 
+void tracee_state::validate_io_state() const
+{
+  auto require = [](bool condition) {
+    if (!condition) throw std::runtime_error("Invalid snapshot descriptor/resource graph");
+  };
+  const auto &manager = fd_manager_state;
+  const auto &files = fs_state.open_files;
+  const auto &sockets = sock_state.sockets();
+  const auto &epolls = sock_state.epoll_instances();
+  const auto &pipe_fds = fs_state.pipe_fds_;
+  for (int fd : manager.get_allocated_fds()) {
+    const auto kind = manager.get_fd_type(fd);
+    const bool file = files.contains(fd), socket = sockets.contains(fd);
+    const bool epoll = epolls.contains(fd), pipe = pipe_fds.contains(fd);
+    require(int(file) + int(socket) + int(epoll) + int(pipe) == 1);
+    require((file && (kind == FdType::FILE || kind == FdType::STDIO)) ||
+            (socket && kind == FdType::SOCKET) ||
+            (epoll && kind == FdType::EPOLL) || (pipe && kind == FdType::PIPE));
+  }
+  for (const auto &[fd, file] : files) {
+    const auto kind = manager.get_fd_type(fd);
+    require(manager.is_allocated(fd) && (kind == FdType::FILE || kind == FdType::STDIO));
+    require(file.offset >= 0 && fs_state.filesystem.contains(file.path));
+  }
+  std::map<int, std::pair<unsigned, unsigned>> pipe_ends;
+  for (const auto &[fd, signed_id] : pipe_fds) {
+    require(manager.get_fd_type(fd) == FdType::PIPE && signed_id != 0 && signed_id != INT_MIN);
+    const int id = signed_id > 0 ? signed_id : -signed_id;
+    require(fs_state.pipes_.contains(id));
+    const bool read_end = signed_id > 0;
+    require((manager.get_status_flags(fd) & O_ACCMODE) == (read_end ? O_RDONLY : O_WRONLY));
+    auto &ends = pipe_ends[id];
+    if (read_end) ++ends.first;
+    else ++ends.second;
+  }
+  for (const auto &[id, pipe] : fs_state.pipes_) {
+    require(id > 0 && !(pipe.read_closed && pipe.write_closed));
+    const auto ends = pipe_ends[id];
+    require(ends.first == unsigned(!pipe.read_closed) && ends.second == unsigned(!pipe.write_closed));
+  }
+  auto same_address = [](const sockaddr_in &a, const sockaddr_in &b) {
+    return a.sin_family == b.sin_family && a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
+  };
+  for (const auto &[fd, socket] : sockets) {
+    require(manager.get_fd_type(fd) == FdType::SOCKET && socket.fd == fd &&
+            socket.domain == AF_INET && (socket.type == SOCK_STREAM || socket.type == SOCK_DGRAM));
+    require(socket.keep_idle > 0 && socket.keep_idle <= 32767 && socket.keep_interval > 0 &&
+            socket.keep_interval <= 32767 && socket.keep_count > 0 && socket.keep_count <= 127);
+    const auto &connections = sock_state.tcp_connections();
+    require(connections.contains(fd) == socket.connected);
+    require(!socket.connected || (socket.type == SOCK_STREAM && !socket.listening));
+    require(!socket.listening || (socket.type == SOCK_STREAM && socket.bound && socket.backlog >= 0));
+    if (!socket.listening) require(socket.pending_connections.empty() && socket.established_connections.empty());
+    std::set<uint64_t> pending;
+    for (uint64_t endpoint : socket.pending_connections) {
+      require(pending.insert(endpoint).second && socket.established_connections.contains(endpoint));
+      const auto &connection = socket.established_connections.at(endpoint);
+      require(connection.local_fd >= 0 && connection.local_addr.sin_family == AF_INET &&
+              connection.peer_addr.sin_family == AF_INET &&
+              endpoint == ((uint64_t(connection.local_addr.sin_addr.s_addr) << 32) | connection.local_addr.sin_port));
+    }
+    require(pending.size() == socket.established_connections.size());
+  }
+  for (const auto &[fd, connection] : sock_state.tcp_connections()) {
+    const auto it = sockets.find(fd);
+    require(it != sockets.end() && it->second.type == SOCK_STREAM && it->second.connected);
+    require(connection.local_fd == fd && same_address(connection.local_addr, it->second.local_addr) &&
+            same_address(connection.peer_addr, it->second.peer_addr));
+  }
+  for (const auto &[fd, queue] : sock_state.udp_recv_buffers()) {
+    (void)queue;
+    const auto it = sockets.find(fd);
+    require(it != sockets.end() && it->second.type == SOCK_DGRAM);
+  }
+  for (const auto &[fd, epoll] : epolls) {
+    require(manager.get_fd_type(fd) == FdType::EPOLL && epoll.epoll_fd == fd);
+    for (const auto &[watched, watch] : epoll.watched_fds) {
+      const auto kind = manager.get_fd_type(watched);
+      require(watched != fd && (kind == FdType::SOCKET || kind == FdType::PIPE) &&
+              !(watch.events & ~(EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP)));
+    }
+  }
+}
+
 /* Load tracee_state from integrated StateStore data */
 tracee_state::tracee_state(hash_type hash)
   : threads(), thread_create_records(), main_tid(0), current_thread_idx(0), futex_state()
@@ -217,6 +301,7 @@ tracee_state::tracee_state(hash_type hash)
     archive(*this);
     if (encoded.peek() != std::char_traits<char>::eof())
       throw std::runtime_error("Trailing tracee metadata bytes");
+    validate_io_state();
   } catch (...) {
     throw std::runtime_error("Failed to deserialize tracee_state snapshot");
   }
@@ -530,6 +615,7 @@ void tracee_state::recover_running_state(int index, hash_type ts_hash) const
 
 void tracee_state::restore_runtime_state(int index) const
 {
+  validate_io_state();
   auto& runtime = ptmc_state.running_state.child[index];
   runtime.threads = threads;
   runtime.thread_create_records = thread_create_records;
@@ -622,6 +708,7 @@ void sys_state::clear()
  */
 hash_type tracee_state::save_full_state_to_state_store(int pid, hash_type comparison_hash)
 {
+  validate_io_state();
   std::string maps_path = fmt::format("/proc/{}/maps", pid);
 
   auto maps_fp = fileutils::open_cfile(maps_path, "r");
@@ -741,7 +828,7 @@ hash_type tracee_state::save_full_state_to_state_store(int pid, hash_type compar
 
   StateDataHeader *header = (StateDataHeader *)all_data;
   header->magic = 0x4453544D;
-  header->version = 5;
+  header->version = FLAT_SNAPSHOT_VERSION;
   header->num_regions = regions.size();
   header->tstate_offset = header_size + regions_size;
   header->tstate_size = tstate_size;

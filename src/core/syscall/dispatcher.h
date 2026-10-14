@@ -28,6 +28,7 @@ enum class SyscallCategory {
     PASSTHROUGH,    // Execute normally (most syscalls)
     BLOCKED,        // Not allowed (exit_group)
     SPECIAL,        // Special handling required
+    UNSUPPORTED,    // Outside the modeled I/O/resource profile
 };
 
 /* ======================================================================
@@ -39,7 +40,8 @@ enum class SyscallAction {
     MODIFY,         // Modify args, then passthrough
     EXECUTE,        // Execute normally
     BLOCK,          // Return error/block
-    DEFERRED        // Handle on exit
+    DEFERRED,       // Handle on exit
+    REJECT          // Stop before an unsupported host-side effect
 };
 
 /* ======================================================================
@@ -118,6 +120,9 @@ private:
         int fd;
         off_t offset;
         size_t length;
+        int protection;
+        int flags;
+        long error;
     };
     VfsMmapState vfs_mmap_state_;
 };

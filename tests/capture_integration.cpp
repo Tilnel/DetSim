@@ -7,6 +7,7 @@
 #include "proc_status.h"
 #include "page_snapshot.h"
 #include <cstdio>
+#include <arpa/inet.h>
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
@@ -59,6 +60,41 @@ int main(int argc, char**)
         syscall_info info[NP][MAX_THREADS_PER_PROCESS]{};
         ptmc_state.cursor = -1;
         auto_mode = 1;
+        // Use actual allocated descriptors: resource queues may never exist
+        // outside the captured process descriptor namespace.
+        ptmc_state.addrs[0] = "127.0.0.1"; ptmc_state.addrs[1] = "127.0.0.2";
+        ptmc_state.cursor = 1;
+        const int udp_fd = ptmc_state.sock_states[1].do_socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+        const int listener_fd = ptmc_state.sock_states[1].do_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        require(udp_fd >= 0 && listener_fd >= 0, "allocate fixture sockets");
+        sockaddr_in endpoint{};
+        endpoint.sin_family = AF_INET; endpoint.sin_port = htons(23117);
+        require(inet_pton(AF_INET, "127.0.0.2", &endpoint.sin_addr) == 1, "listener address");
+        void* guest_address = reinterpret_cast<void*>(scratch_page);
+        require(guest_write_exact(children[1], guest_address, &endpoint, sizeof(endpoint)), "write listener address");
+        require(ptmc_state.sock_states[1].do_bind(listener_fd, static_cast<sockaddr*>(guest_address), sizeof(endpoint)) == 0 &&
+                ptmc_state.sock_states[1].do_listen(listener_fd, 2) == 0, "create listener");
+        int pipe_ends[2];
+        require(ptmc_state.fs_states[1].do_pipe(pipe_ends, O_NONBLOCK | O_CLOEXEC) == 0, "create saved pipe");
+        const int epfd = ptmc_state.sock_states[1].do_epoll_create1(EPOLL_CLOEXEC);
+        epoll_event watch{}; watch.events = EPOLLIN; watch.data.u64 = 0xfedcba9876543210ULL;
+        require(guest_write_exact(children[1], guest_address, &watch, sizeof(watch)), "write epoll fixture");
+        require(ptmc_state.sock_states[1].do_epoll_ctl(epfd, EPOLL_CTL_ADD, pipe_ends[0], static_cast<epoll_event*>(guest_address)) == 0,
+                "watch saved pipe");
+        const char pipe_payload[] = "pipe branch";
+        require(guest_write_exact(children[1], guest_address, pipe_payload, sizeof(pipe_payload)), "write pipe fixture");
+        require(ptmc_state.fs_states[1].do_pipe_write(pipe_ends[1], guest_address, sizeof(pipe_payload)) == sizeof(pipe_payload),
+                "buffer saved pipe");
+        ptmc_state.cursor = 0;
+        const int client_fd = ptmc_state.sock_states[0].do_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        require(guest_write_exact(children[0], guest_address, &endpoint, sizeof(endpoint)), "write client address");
+        require(ptmc_state.sock_states[0].do_connect(client_fd, static_cast<sockaddr*>(guest_address), sizeof(endpoint)) == 0,
+                "create preaccept connection");
+        const char tcp_payload[] = "pending branch";
+        require(guest_write_exact(children[0], guest_address, tcp_payload, sizeof(tcp_payload)), "write TCP fixture");
+        require(ptmc_state.sock_states[0].do_send(client_fd, guest_address, sizeof(tcp_payload), 0) == sizeof(tcp_payload),
+                "buffer preaccept TCP");
+        ptmc_state.cursor = -1;
         sys_state source(info);
         ptmc_state.running_state = source;
         ptmc_state.cursor = 0;
@@ -127,12 +163,36 @@ int main(int argc, char**)
         source.recover_running_state();
         UdpDatagram datagram{};
         datagram.content = "peer delivery";
-        ptmc_state.sock_states[1].udp_recv_buffers()[7].push_back(datagram);
+        ptmc_state.sock_states[1].deliver_udp_datagram(udp_fd, datagram);
         sys_state socket_changed(info, &source);
         require(socket_changed.ts_hash[1] != source.ts_hash[1], "inactive socket update lost");
         compare_full(socket_changed);
         ptmc_state.running_state = socket_changed;
         source.recover_running_state();
+        // Restoring reconstitutes queued data, descriptor flags and opaque
+        // watches, independently of later branch mutations and accepted sockets.
+        ptmc_state.cursor = 1;
+        require(ptmc_state.fd_managers[1]->get_descriptor_flags(pipe_ends[0]) == FD_CLOEXEC &&
+                (ptmc_state.fd_managers[1]->get_status_flags(pipe_ends[0]) & O_NONBLOCK), "restored pipe flags");
+        require(ptmc_state.sock_states[1].epoll_instances().at(epfd).watched_fds.at(pipe_ends[0]).data == watch.data.u64,
+                "restored epoll opaque data");
+        const int accepted = ptmc_state.sock_states[1].do_accept(listener_fd, nullptr, nullptr);
+        require(accepted >= 0 && ptmc_state.sock_states[1].do_recv(accepted, guest_address, sizeof(tcp_payload), 0) == sizeof(tcp_payload),
+                "restored preaccept TCP data missing");
+        char received[sizeof(tcp_payload)]{};
+        require(guest_read_exact(children[1], guest_address, received, sizeof(received)) &&
+                !memcmp(received, tcp_payload, sizeof(received)), "restored TCP payload changed");
+        require(ptmc_state.fs_states[1].do_pipe_read(pipe_ends[0], guest_address, sizeof(pipe_payload)) == sizeof(pipe_payload),
+                "restored pipe data missing");
+        require(ptmc_state.fs_states[1].do_pipe_close(pipe_ends[1]) == 0, "close branch pipe end");
+        ptmc_state.cursor = 0;
+        sys_state consumed(info, &source);
+        require(consumed.ts_hash[1] != source.ts_hash[1], "I/O branch mutation absent from identity");
+        ptmc_state.running_state = consumed;
+        source.recover_running_state();
+        sys_state replayed(info, &source);
+        require(replayed.ss_hash == source.ss_hash, "I/O branch restore identity drift");
+        compare_full(replayed);
         // The selected actor is always recaptured even when modeled metadata agrees.
         user_regs_struct regs;
         require(ptrace(PTRACE_GETREGS, children[0], nullptr, &regs) == 0, "read actor registers");

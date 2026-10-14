@@ -2,6 +2,9 @@
 #include "monitor.h"
 #include "ncurses_ui.h"
 #include "state_store.h"
+#include "cereal/archives/binary.hpp"
+#include <climits>
+#include <sstream>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -51,7 +54,7 @@ static std::vector<uint8_t> snapshot(uint64_t address)
     // A bogus cereal payload deliberately tests that malformed archives fail.
     std::vector<uint8_t> data(sizeof(StateDataHeader) + sizeof(RegionInfo) + 1 + 8 + sizeof(user_regs_struct), 0);
     auto* h = reinterpret_cast<StateDataHeader*>(data.data());
-    h->magic = 0x4453544D; h->version = 5; h->num_regions = 1;
+    h->magic = 0x4453544D; h->version = FLAT_SNAPSHOT_VERSION; h->num_regions = 1;
     h->tstate_offset = sizeof(StateDataHeader) + sizeof(RegionInfo);
     h->tstate_size = 1; h->maps_offset = h->tstate_offset + 1; h->maps_size = 0;
     h->regs_offset = h->maps_offset + 8;
@@ -60,6 +63,87 @@ static std::vector<uint8_t> snapshot(uint64_t address)
     r->prot = PROT_READ | PROT_WRITE; memcpy(r->flags, "rw-p", 5);
     memcpy(data.data() + r->offset, "snapshot", 8);
     return data;
+}
+static hash_type archive_snapshot(const tracee_state& state)
+{
+    std::ostringstream encoded(std::ios::binary);
+    { cereal::BinaryOutputArchive archive(encoded); archive(state); }
+    const auto metadata = encoded.str();
+    StateDataHeader header{};
+    header.magic = 0x4453544D; header.version = FLAT_SNAPSHOT_VERSION;
+    header.tstate_offset = sizeof(header); header.tstate_size = metadata.size();
+    header.maps_offset = header.tstate_offset + header.tstate_size;
+    header.regs_offset = header.maps_offset;
+    std::vector<uint8_t> bytes(header.regs_offset + sizeof(user_regs_struct), 0);
+    memcpy(bytes.data(), &header, sizeof(header));
+    memcpy(bytes.data() + header.tstate_offset, metadata.data(), metadata.size());
+    return StateStore::instance().save(bytes.data(), bytes.size());
+}
+static void check_io_archive_validation()
+{
+    tracee_state valid;
+    tracee_state decoded(archive_snapshot(valid));
+    require(decoded.fd_manager_state == valid.fd_manager_state, "valid descriptor archive changed");
+    auto rejected = [](tracee_state invalid, const char* why) {
+        const auto hash = archive_snapshot(invalid);
+        must_fail([&] { tracee_state decoded(hash); }, why);
+    };
+    auto invalid = valid;
+    invalid.fd_manager_state.allocate_fd(FdType::FILE, O_RDONLY);
+    rejected(invalid, "file descriptor without payload accepted");
+    invalid = valid;
+    invalid.fs_state.open_files[12] = {invalid.fs_state.open_files.at(0).path, 0};
+    rejected(invalid, "orphan file payload accepted");
+    invalid = valid;
+    invalid.fs_state.open_files.at(0).path = "/missing";
+    rejected(invalid, "file payload without VFS node accepted");
+    invalid = valid;
+    invalid.fd_manager_state.allocate_fd(FdType::SOCKET, O_RDWR);
+    rejected(invalid, "socket descriptor without payload accepted");
+    invalid = valid;
+    Socket socket; socket.fd = 12; socket.domain = AF_INET; socket.type = SOCK_DGRAM;
+    invalid.sock_state.add_socket(socket);
+    rejected(invalid, "orphan socket accepted");
+    invalid = valid;
+    invalid.sock_state.udp_recv_buffers()[12].push_back(UdpDatagram{});
+    rejected(invalid, "orphan UDP queue accepted");
+    invalid = valid;
+    invalid.fd_manager_state.allocate_fd(FdType::EPOLL, O_RDWR);
+    rejected(invalid, "epoll descriptor without payload accepted");
+    auto manager = std::make_shared<FdManager>();
+    FileSystemState fs(manager);
+    int ends[2]; require(fs.do_pipe(ends, O_NONBLOCK | O_CLOEXEC) == 0, "pipe fixture");
+    tracee_state pipe;
+    pipe.fs_state = fs; pipe.fd_manager_state = *manager;
+    tracee_state pipe_decoded(archive_snapshot(pipe));
+    require(pipe_decoded.fs_state.pipe_fds_ == fs.pipe_fds_, "valid pipe archive changed");
+    for (int id : {0, INT_MIN, 99}) {
+        invalid = pipe; invalid.fs_state.pipe_fds_[ends[0]] = id;
+        rejected(invalid, "malformed pipe reference accepted");
+    }
+    invalid = pipe; invalid.fs_state.pipes_.begin()->second.read_closed = true;
+    rejected(invalid, "pipe closed end with descriptor accepted");
+    invalid = pipe; invalid.fs_state.pipe_fds_.erase(ends[0]);
+    rejected(invalid, "pipe descriptor without end accepted");
+    invalid = pipe; invalid.fs_state.pipes_[99] = FileSystemState::Pipe{};
+    rejected(invalid, "orphan pipe accepted");
+    SockState net(manager);
+    const int epfd = net.do_epoll_create1(0);
+    tracee_state epoll = pipe; epoll.sock_state = net; epoll.fd_manager_state = *manager;
+    auto& instances = const_cast<std::map<int, EpollInstance>&>(epoll.sock_state.epoll_instances());
+    instances.at(epfd).watched_fds[ends[0]] = {EPOLLIN, UINT64_MAX};
+    tracee_state epoll_decoded(archive_snapshot(epoll));
+    require(epoll_decoded.sock_state.epoll_instances().at(epfd).watched_fds.at(ends[0]).data == UINT64_MAX,
+            "valid epoll userdata archive changed");
+    invalid = epoll;
+    const_cast<std::map<int, EpollInstance>&>(invalid.sock_state.epoll_instances()).at(epfd).watched_fds[99] = {};
+    rejected(invalid, "epoll missing watched descriptor accepted");
+    invalid = epoll;
+    const_cast<std::map<int, EpollInstance>&>(invalid.sock_state.epoll_instances()).at(epfd).epoll_fd = 99;
+    rejected(invalid, "epoll payload descriptor mismatch accepted");
+    invalid = epoll;
+    const_cast<std::map<int, EpollInstance>&>(invalid.sock_state.epoll_instances()).at(epfd).watched_fds.at(ends[0]).events |= EPOLLET;
+    rejected(invalid, "unsupported archived epoll mode accepted");
 }
 int main()
 {
@@ -82,6 +166,7 @@ int main()
         require(waitpid(child, &status, 0) == child && WIFSTOPPED(status), "tracee stop");
         auto& store = StateStore::instance();
         tracee_state state;
+        check_io_archive_validation();
         for (int mode : {1, 2}) {
             const auto saves = store.get_stats().save_calls;
             read_failure = mode;
@@ -130,13 +215,13 @@ int main()
         std::vector<maps_item> empty_maps;
         must_fail([&] { state.recover_mem_reg_snapshot(empty_maps, hash, child); }, "missing restore region accepted");
         auto* h = reinterpret_cast<StateDataHeader*>(data.data());
-        h->version = 4;
-        auto old_hash = save();
-        must_fail([&] { tracee_state invalid(old_hash); }, "v4 archive accepted");
-        must_fail([&] { free(read_mem(child, old_hash, map.start, 1)); }, "v4 read accepted");
-        must_fail([&] { state.recover_mem_reg_snapshot(maps, old_hash, child); }, "v4 restore accepted");
-        must_fail([&] { state.restore_memory_mappings(old_hash, child, maps); }, "v4 mappings accepted");
         h->version = 5;
+        auto old_hash = save();
+        must_fail([&] { tracee_state invalid(old_hash); }, "old I/O archive accepted");
+        must_fail([&] { free(read_mem(child, old_hash, map.start, 1)); }, "old-format read accepted");
+        must_fail([&] { state.recover_mem_reg_snapshot(maps, old_hash, child); }, "old-format restore accepted");
+        must_fail([&] { state.restore_memory_mappings(old_hash, child, maps); }, "old-format mappings accepted");
+        h->version = FLAT_SNAPSHOT_VERSION;
         auto* r = reinterpret_cast<RegionInfo*>(data.data() + sizeof(StateDataHeader));
         r->offset = UINT64_MAX;
         auto bad_hash = save();
@@ -146,7 +231,7 @@ int main()
         munmap(page, 4096);
         std::filesystem::current_path(cwd);
         std::filesystem::remove_all(directory);
-        puts("PASS state I/O: short/error capture not published; short/error restore rejected; saved reads, missing ranges/states, corrupt archives/regions and all v4 readers");
+        puts("PASS state I/O: short/error capture not published; short/error restore rejected; saved reads, missing ranges/states, corrupt archives/regions and all old-format readers");
         return 0;
     } catch (const std::exception& error) {
         if (child > 0) { kill(child, SIGKILL); waitpid(child, nullptr, 0); }

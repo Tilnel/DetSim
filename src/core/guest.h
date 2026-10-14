@@ -26,6 +26,10 @@ uint8_t tracee_read_byte(int pid, void *addr);
 int tracee_write_word(int pid, void *addr, long data);
 void tracee_write_mem(int pid, void *addr, const void *data, int len);
 void tracee_read_mem(int pid, const void *addr, void *data, int len);
+// Exact transfers: no zero-fill and no manufactured success. A failed copyout
+// may have written a prefix, but callers must not consume queued/offset state.
+bool guest_read_exact(pid_t pid, const void* guest, void* host, size_t size);
+bool guest_write_exact(pid_t pid, void* guest, const void* host, size_t size);
 void remove_vdso(int pid);
 int patch_at_random(pid_t pid);
 void patch_cpu_features_elf(pid_t pid);

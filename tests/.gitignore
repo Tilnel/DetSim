@@ -53,6 +53,10 @@
 !page_snapshot.mk
 !page_snapshot_integration.cpp
 !page_snapshot_benchmark.py
+!io_boundary.mk
+!io_boundary_integration.cpp
+!fs_boundary_extra.cpp
+!network_boundary_extra.cpp
 !redisraft.mk
 
 !capture.mk

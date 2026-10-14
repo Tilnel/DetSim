@@ -20,11 +20,14 @@
  * State Data Format (shared with StateStore)
  * ====================================================================== */
 
+inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 7;
+inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 8;
+
 /* Packed to avoid alignment padding */
 struct __attribute__((packed)) StateDataHeader
 {
   uint32_t magic;         // 'DSTM' = 0x4453544D
-  uint32_t version;       // 5: flat snapshot; 6: page manifest prefix
+  uint32_t version;       // 7: flat; 8: pages (typed descriptors + owned I/O state)
   uint32_t num_regions;   // number of memory regions
   uint64_t tstate_offset; // offset to serialized tracee_state
   uint64_t tstate_size;   // size of serialized tracee_state
@@ -39,7 +42,7 @@ struct __attribute__((packed)) RegionInfo
 {
   uint64_t start;
   uint64_t end;
-  uint64_t offset; // v5: byte offset in blob; v6: first PageRef index
+  uint64_t offset; // flat: byte offset in blob; pages: first PageRef index
   uint32_t prot;   // protection flags (PROT_READ/WRITE/EXEC)
   char flags[5];   // original flags string from /proc/pid/maps (e.g., "rwxp")
 };
@@ -248,6 +251,9 @@ typedef struct tracee_state
   // Explicit memory cleanup - call after copying to ptmc_state to free source
   void clear();
 
+  // Reject inconsistent captured descriptor/resource graphs before use.
+  void validate_io_state() const;
+
   // Equality comparison (for incremental save optimization)
   // Compares all metadata fields to detect state changes
   bool metadata_equal(const tracee_state &other) const;
@@ -337,6 +343,7 @@ typedef struct sys_state
 
   // Explicit memory cleanup - call after copying to ptmc_state to free source
   void clear();
+
 
   /* ---------------------------------------------------------
    * Persistence

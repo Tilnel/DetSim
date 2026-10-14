@@ -4,6 +4,7 @@
 
 #include "handlers.h"
 #include "guest.h"
+#include "io.h"
 #include "log_wrapper.h"
 #include "monitor.h"
 #include "proc_status.h"
@@ -40,6 +41,8 @@ int handle(pid_t pid, syscall_info &info) {
         case SYS_accept4:     return handle_accept(pid, info);
         case SYS_setsockopt:  return handle_setsockopt(pid, info);
         case SYS_getsockopt:  return handle_getsockopt(pid, info);
+        case SYS_getsockname: return handle_getsockname(pid, info);
+        case SYS_getpeername: return handle_getpeername(pid, info);
         case SYS_epoll_create: return handle_epoll_create(pid, info);
         case SYS_epoll_create1: return handle_epoll_create1(pid, info);
         case SYS_epoll_ctl:   return handle_epoll_ctl(pid, info);
@@ -132,6 +135,15 @@ int handle_epoll_create(pid_t pid, syscall_info &info) {
     return CKPT_YES;
 }
 
+int handle_getsockname(pid_t pid, syscall_info& info) {
+    const long result=emu_getsockname(info.args[0],(sockaddr*)info.args[1],(socklen_t*)info.args[2]);
+    tracee_set_rax(pid,result);info.rval=result;return CKPT_NO;
+}
+int handle_getpeername(pid_t pid, syscall_info& info) {
+    const long result=emu_getpeername(info.args[0],(sockaddr*)info.args[1],(socklen_t*)info.args[2]);
+    tracee_set_rax(pid,result);info.rval=result;return CKPT_NO;
+}
+
 int handle_epoll_create1(pid_t pid, syscall_info &info) {
     long ret = emu_epoll_create1(info.args[0]);
     tracee_set_rax(pid, ret);
@@ -202,6 +214,10 @@ int handle(pid_t pid, syscall_info &info) {
         case SYS_fsync:     return handle_fsync(pid, info);
         case SYS_fdatasync: return handle_fdatasync(pid, info);
         case SYS_fcntl:     return handle_fcntl(pid, info);
+        case SYS_ioctl:     return handle_ioctl(pid, info);
+        case SYS_newfstatat:return handle_statat(pid,info);
+        case SYS_getcwd:    return handle_getcwd(pid,info);
+        case SYS_lstat:     return handle_stat(pid,info);
         default:            return CKPT_NO;
     }
 }
@@ -221,21 +237,21 @@ int handle_openat(pid_t pid, syscall_info &info) {
 }
 
 int handle_read(pid_t pid, syscall_info &info) {
-    long ret = emu_vfs_read(info.args[0], (void *)info.args[1], info.args[2]);
+    long ret = emu_read(info.args[0], (void *)info.args[1], info.args[2]);
     tracee_set_rax(pid, ret);
     info.rval = ret;
     return CKPT_YES;
 }
 
 int handle_write(pid_t pid, syscall_info &info) {
-    long ret = emu_vfs_write(info.args[0], (const void *)info.args[1], info.args[2]);
+    long ret = emu_write(info.args[0], (const void *)info.args[1], info.args[2]);
     tracee_set_rax(pid, ret);
     info.rval = ret;
     return CKPT_YES;
 }
 
 int handle_close(pid_t pid, syscall_info &info) {
-    long ret = emu_vfs_close(info.args[0]);
+    long ret = emu_close(info.args[0]);
     tracee_set_rax(pid, ret);
     info.rval = ret;
     return CKPT_YES;
@@ -256,7 +272,7 @@ int handle_stat(pid_t pid, syscall_info &info) {
 }
 
 int handle_fstat(pid_t pid, syscall_info &info) {
-    long ret = emu_vfs_fstat(info.args[0], (struct stat *)info.args[1]);
+    long ret = emu_fstat(info.args[0], (struct stat *)info.args[1]);
     tracee_set_rax(pid, ret);
     info.rval = ret;
     return CKPT_NO;
@@ -271,9 +287,11 @@ int handle_chdir(pid_t pid, syscall_info &info) {
 
 int handle_pipe(pid_t pid, syscall_info &info) {
     int pipefd[2];
-    long ret = emu_pipe(pipefd, info.args[1]);
+    long ret = emu_pipe(pipefd, info.nr == SYS_pipe2 ? info.args[1] : 0);
     if (ret == 0) {
-        memcpy_host2guest((void *)info.args[0], pipefd, sizeof(pipefd));
+        if (!guest_write_exact(pid, (void*)info.args[0], pipefd, sizeof(pipefd))) {
+            emu_close(pipefd[0]); emu_close(pipefd[1]); ret = -EFAULT;
+        }
     }
     tracee_set_rax(pid, ret);
     info.rval = ret;
@@ -286,9 +304,8 @@ int handle_mmap(pid_t pid, syscall_info &info) {
 }
 
 int handle_munmap(pid_t pid, syscall_info &info) {
-    long ret = emu_munmap((void *)info.args[0], info.args[1]);
-    tracee_set_rax(pid, ret);
-    info.rval = ret;
+    (void)pid; (void)info;
+    // The kernel already performed this operation in the guest address space.
     return CKPT_NO;
 }
 
@@ -319,6 +336,20 @@ int handle_fcntl(pid_t pid, syscall_info &info) {
     tracee_set_rax(pid, ret);
     info.rval = ret;
     return CKPT_YES;
+}
+
+int handle_ioctl(pid_t pid, syscall_info& info) {
+    const long result=emu_ioctl(info.args[0],info.args[1],(void*)info.args[2]);
+    tracee_set_rax(pid,result);info.rval=result;return CKPT_YES;
+}
+
+int handle_statat(pid_t pid, syscall_info& info) {
+    const long result=emu_vfs_statat(info.args[0],(const char*)info.args[1],(struct stat*)info.args[2],info.args[3]);
+    tracee_set_rax(pid,result);info.rval=result;return CKPT_NO;
+}
+int handle_getcwd(pid_t pid, syscall_info& info) {
+    const long result=emu_getcwd((char*)info.args[0],info.args[1]);
+    tracee_set_rax(pid,result);info.rval=result;return CKPT_NO;
 }
 
 } // namespace fs

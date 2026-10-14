@@ -19,16 +19,11 @@ void *memcpy_guest2host(void *dest, const void *src, size_t n);
  * They follow the naming convention of other emulated syscalls (emu_*).
  */
 long emu_vfs_openat(int dirfd, const char *path, int flags, mode_t mode);
-long emu_vfs_read(int fd, void *buf, size_t count);
-long emu_vfs_write(int fd, const void *buf, size_t count);
-long emu_vfs_close(int fd);
 long emu_vfs_lseek(int fd, off_t offset, int whence);
 long emu_vfs_stat(const char *path, struct stat *statbuf);
-long emu_vfs_fstat(int fd, struct stat *statbuf);
+long emu_vfs_statat(int dirfd, const char* path, struct stat* statbuf, int flags);
+long emu_getcwd(char* destination, size_t size);
 long emu_chdir(const char *path);
-long emu_mmap(void *addr, size_t length, int prot, int flags, int fd,
-              off_t offset);
-long emu_munmap(void *addr, size_t length);
 long emu_pipe(int pipefd[2], int flags);
 long emu_pipe2(int pipefd[2], int flags);
 
@@ -66,9 +61,6 @@ struct OpenFileDescription
   // The current read/write offset into the file's content.
   off_t offset;
 
-  // The flags used when opening the file (e.g., O_RDONLY, O_WRONLY, O_APPEND).
-  int flags;
-
   template <class Archive>
   void serialize(Archive &ar);
 };
@@ -91,23 +83,13 @@ class FileSystemState
   // target_base)
   std::vector<std::pair<std::string, std::string>> mappings;
 
-  // Mmap regions for VFS files: address -> (fd, offset, length, prot)
-  struct MmapRegion
-  {
-    int fd;
-    off_t offset;
-    size_t length;
-    int prot;
-  };
-  std::map<uintptr_t, MmapRegion> mmap_regions;
-
   private:
   // FdManager for unified fd allocation (shared with SockState)
   FdManagerPtr fd_manager_;
 
   public:
   // Default constructor - ensures all members are properly initialized
-  FileSystemState() : cwd(""), fd_manager_() {}
+  FileSystemState();
 
   // Copy control
   FileSystemState(const FileSystemState &other) = default;
@@ -117,13 +99,10 @@ class FileSystemState
   FileSystemState(FileSystemState &&other) noexcept = default;
   FileSystemState &operator=(FileSystemState &&other) noexcept = default;
 
-  explicit FileSystemState(FdManagerPtr fd_mgr) : fd_manager_(fd_mgr) {}
+  explicit FileSystemState(FdManagerPtr fd_mgr);
 
-  // Set the fd manager (must be called before using get_new_fd)
+  // Attach the captured descriptor namespace without creating any descriptors.
   void set_fd_manager(FdManagerPtr fd_mgr) { fd_manager_ = fd_mgr; }
-
-  // Allocate a new file descriptor via FdManager
-  int get_new_fd();
 
   template <class Archive>
   void serialize(Archive &ar);
@@ -145,6 +124,7 @@ class FileSystemState
   // Resolve a pathname according to dirfd and cwd. Returns an absolute VFS
   // path.
   std::string resolve_path(int dirfd, const std::string &path);
+  int resolve_path_checked(int dirfd, const std::string& path, std::string& result);
 
   // Set/get cwd
   void set_cwd(const std::string &path);
@@ -175,10 +155,7 @@ class FileSystemState
   ssize_t do_pipe_write(int fd, const void *buf, size_t count);
   int do_pipe_close(int fd);
   int do_chdir(const std::string &path);
-  void *do_mmap(void *addr, size_t length, int prot, int flags, int fd,
-                off_t offset);
-  int do_munmap(void *addr, size_t length);
-  int allocate_fd(FdType type);
+  int allocate_fd(FdType type, int status_flags = 0, int descriptor_flags = 0);
   void release_fd(int fd);
 };
 

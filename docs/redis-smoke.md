@@ -128,11 +128,13 @@ core dump；测试结束清理所属进程组。测试客户端强制启用 asse
 
 仍需保留的边界：
 
-- 为保持快照格式，pending queue 仍存 FD；多个同 FD 对端无法明确排序时返回
-  `EOPNOTSUPP`，不会随机选择一个。
+- 后续 I/O 修复将 pending queue 改为 endpoint key，并保存未 accept 的数据；
+  同 FD 跨节点不再混淆，格式升级到7/8，旧5/6拒绝。
 - EFAULT 保留虚拟 pending connection 是当前显式模型选择；部分 guest copyout
   不回滚，不声称与所有 Linux 错误路径的副作用完全一致。
-- stdout 模拟仍返回 EBADF；这里通过 socket 的真实 RESP 内容和客户端断言
-  验证命令结果，而不是依赖日志输出成功。
+- stdout/stderr 后续改为捕获的虚拟文件；这里仍通过 socket 的实际 RESP 内容
+  和客户端断言验证命令结果。
 - 原始 static PIE 的运行时变量重定位、BFS、快照重放、fork/多线程和持久化
   均不在本次 Redis 成功用例的覆盖范围内。
+
+2026-10-15 I/O 修复后复测：默认和 verify-pages 后端均通过269 server steps /119 client steps 的精确 SET/GET，客户端及 tracer 正常退出。

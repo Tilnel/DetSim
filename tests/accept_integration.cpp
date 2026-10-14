@@ -194,12 +194,13 @@ static void check_closed_pending_client()
           "second queued connect");
   require(client.do_close(closed_fd) == 0, "close pending client");
   ptmc_state.cursor = 0;
-  int next_fd = manager->get_next_fd();
-  require(server.do_accept(listener, nullptr, nullptr) == -ECONNRESET,
-          "closed client reset");
-  require(manager->get_next_fd() == next_fd, "reset allocated fd");
+  int closed_accepted = server.do_accept(listener, nullptr, nullptr);
+  require(closed_accepted >= 0, "closed pending client remains acceptable");
+  require(server.do_recv(closed_accepted, nullptr, 1, 0) == 0 &&
+          server.do_recv(closed_accepted, nullptr, 1, 0) == 0,
+          "closed pending client yields persistent EOF");
   require(server.get_socket(listener)->pending_connections.size() == 1,
-          "reset must discard stale head");
+          "accept must consume exactly one pending peer");
   int accepted = server.do_accept(listener, nullptr, nullptr);
   require(accepted >= 0, "live queued client remains reachable");
   require(server.get_socket(accepted)->peer_addr.sin_port ==
@@ -207,6 +208,32 @@ static void check_closed_pending_client()
           "accepted live peer");
   require(server.do_accept(listener, nullptr, nullptr) == -EAGAIN,
           "stale queue drained");
+}
+
+static void native_closed_pending_oracle()
+{
+  int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  require(listener >= 0, "native listener");
+  sockaddr_in local{};
+  local.sin_family = AF_INET;
+  local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  require(bind(listener, reinterpret_cast<sockaddr*>(&local), sizeof(local)) == 0,
+          "native bind");
+  socklen_t length = sizeof(local);
+  require(getsockname(listener, reinterpret_cast<sockaddr*>(&local), &length) == 0,
+          "native getsockname");
+  require(listen(listener, 1) == 0, "native listen");
+  int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  require(client >= 0 && connect(client, reinterpret_cast<sockaddr*>(&local), sizeof(local)) == 0,
+          "native connect");
+  close(client);
+  int accepted = accept(listener, nullptr, nullptr);
+  require(accepted >= 0, "native accept after client close");
+  char byte;
+  require(recv(accepted, &byte, 1, 0) == 0 && recv(accepted, &byte, 1, 0) == 0,
+          "native closed pending connection gives persistent EOF");
+  close(accepted);
+  close(listener);
 }
 
 int main()
@@ -217,6 +244,7 @@ int main()
   setrlimit(RLIMIT_CORE, &no_core);
   try
   {
+    native_closed_pending_oracle();
     Guest guest;
     check_accept(guest, 32, 0, false);
     check_accept(guest, 2, 0, false);

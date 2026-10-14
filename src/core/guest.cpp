@@ -11,6 +11,7 @@
  */
 
 #include "guest.h"
+#include <climits>
 #include "monitor.h"
 #include "dwarf_info.h"
 #include <cstdint>
@@ -269,6 +270,31 @@ static inline struct iovec make_iovec(void *base, size_t len)
 {
   struct iovec iov = { base, len };
   return iov;
+}
+
+static bool guest_transfer_exact(bool write, pid_t pid, void* guest,
+                                 void* host, size_t size)
+{
+  if (!size) return true;
+  const auto address = reinterpret_cast<uintptr_t>(guest);
+  if (pid <= 0 || !guest || !host || size > size_t(SSIZE_MAX) ||
+      size > UINTPTR_MAX - address) return false;
+  iovec local{host, size}, remote{guest, size};
+  ssize_t transferred;
+  do {
+    transferred = write ? process_vm_writev(pid, &local, 1, &remote, 1, 0)
+                        : process_vm_readv(pid, &local, 1, &remote, 1, 0);
+  } while (transferred < 0 && errno == EINTR);
+  return transferred >= 0 && size_t(transferred) == size;
+}
+
+bool guest_read_exact(pid_t pid, const void* guest, void* host, size_t size)
+{
+  return guest_transfer_exact(false, pid, const_cast<void*>(guest), host, size);
+}
+bool guest_write_exact(pid_t pid, void* guest, const void* host, size_t size)
+{
+  return guest_transfer_exact(true, pid, guest, const_cast<void*>(host), size);
 }
 
 void tracee_write_mem(int pid, void *addr, const void *data, int len)

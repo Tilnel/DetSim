@@ -40,6 +40,8 @@ int handle_listen(pid_t pid, syscall_info &info);
 int handle_accept(pid_t pid, syscall_info &info);
 int handle_setsockopt(pid_t pid, syscall_info &info);
 int handle_getsockopt(pid_t pid, syscall_info &info);
+int handle_getsockname(pid_t pid, syscall_info &info);
+int handle_getpeername(pid_t pid, syscall_info &info);
 int handle_epoll_create(pid_t pid, syscall_info &info);
 int handle_epoll_create1(pid_t pid, syscall_info &info);
 int handle_epoll_ctl(pid_t pid, syscall_info &info);
@@ -77,6 +79,9 @@ int handle_madvise(pid_t pid, syscall_info &info);
 int handle_fsync(pid_t pid, syscall_info &info);
 int handle_fdatasync(pid_t pid, syscall_info &info);
 int handle_fcntl(pid_t pid, syscall_info &info);
+int handle_ioctl(pid_t pid, syscall_info &info);
+int handle_statat(pid_t pid, syscall_info &info);
+int handle_getcwd(pid_t pid, syscall_info &info);
 
 } // namespace fs
 } // namespace handlers

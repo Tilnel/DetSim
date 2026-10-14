@@ -1,5 +1,56 @@
 # Maintenance baseline
 
+## Joint virtual I/O boundary plan (2026-10-15)
+
+Lock mixed file/socket/pipe/epoll read-write-close, flags, guest-copy failure,
+TCP zero-write/EOF, epoll opaque data and resource archive behavior before edits.
+Remove unused host-mmap helpers and success-only sync/fcntl stubs; guest addresses
+must never be passed to tracer mmap/munmap. Make the existing per-process shared
+FdManager track kinds/status/descriptor flags deterministically, rather than
+pretending UNKNOWN is useful type tracking. Keep resource payloads in FS/net.
+
+Consolidate descriptor syscall dispatch in one small function boundary, not a new
+framework. Copy input before mutation; commit offsets/queues only after successful
+output transfer. Include omitted pipe and pre-accept TCP state and epoll userdata
+in archives. Pipe IDs derive from captured state, not a static host counter.
+Represent deterministic stdin EOF and captured stdout/stderr in the existing FS
+payload model; no live terminal passthrough. Reuse checks for close/invalid flags.
+
+Changing semantic FD metadata and resource archives requires flat format7/page
+format8; reject5/6 explicitly before decoding. Preserve old runtime stores, do not
+migrate/delete them. Test copy/archive/restore/identity plus actual ptrace entry
+blocking, ephemeral native programs and existing Redis/Raft workloads. Keep dup,
+blocking wakeups, advanced epoll and cross-node filesystem semantics explicit
+follow-ups; do not report a complete Linux I/O implementation.
+
+Verification: the initial joint fixture failed16 cases before implementation;
+extra UDP dispatch and full TCP endpoint regressions independently failed before
+their fixes. `make check` passes8 component cases and10 build contracts. New
+archive tests reject16 malformed descriptor/resource graphs. Ordinary and
+verify-pages NP2 capture oracles preserve queued TCP/pipe data, flags, epoll data
+and recapture identity after repeated restore with ordinary/tiny caches.
+
+Final commands (system GCC14, all exit0):
+
+```sh
+make check CC=/usr/bin/gcc CXX=/usr/bin/g++
+make NP=1 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4 tracer check-state-io check-page-snapshot check-mappings check-xstate check-futex-snapshot check-futex check-exec check-scenarios
+make NP=2 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4 tracer check-io-boundary check-port check-accept check-identity check-capture check-redis
+# Repeat NP1 gates and NP2 capture/Redis with DETSIM_SNAPSHOT_BACKEND=verify-pages.
+make NP=3 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4 tracer
+python3 tests/page_snapshot_benchmark.py --repeats 1 --depth 12 --output build/io-boundary-benchmark-quiet
+```
+
+Strict GCC `-Wall -Wextra -Werror -fsyntax-only` checks pass for state/FD/FS/net,
+common I/O and new tests. Guest/dispatcher/handlers also pass with the existing
+unused-parameter warnings disabled. No separate C++ lint framework is configured;
+`git diff --check` is clean. Native mmap error regression first reproduced an
+unsigned-return-value bug, then passed after checking a signed syscall result.
+Unused host-mmap helpers, duplicate FD dispatch/flag storage and cached epoll
+notification queues were removed. Changed code is in guest transfer, state format
+and graph validation, syscall dispatch, `subsys/io`, `subsys/fs`, `subsys/net`, and
+the corresponding Makefile/test/documentation gates.
+
 ## Page snapshot branch plan (2026-10-15)
 
 Branch: `experiment/page-snapshots`, based on `08ed190`.
