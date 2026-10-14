@@ -47,3 +47,6 @@
 
 !redisraft_benchmark.py
 !redisraft.mk
+
+!capture.mk
+!capture_integration.cpp

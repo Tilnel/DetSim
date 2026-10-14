@@ -181,7 +181,7 @@ TransitionResult state_transition(const sys_state &source_state,
 
   // save state with timing
   auto t3 = std::chrono::high_resolution_clock::now();
-  result.new_state = sys_state(new_syscalls);
+  result.new_state = sys_state(new_syscalls, &source_state);
   auto t4 = std::chrono::high_resolution_clock::now();
   result.save_time =
       std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3);

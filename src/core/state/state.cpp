@@ -175,67 +175,27 @@ void show_syscall_history()
  * Section 3: State Creation (from running processes)
  * ====================================================================== */
 
-/* Create sys_state from running processes' syscall info */
-/* will save ***ALL*** stuffs of a sys_state and its tracees */
-/* Create sys_state with incremental save optimization
- * Only the active process is fully saved.
- * Other processes reuse old hashes if their state is unchanged.
+/* A transition may name its restored source as a deduplication hint. We still
+ * capture every byte: a stopped task can have externally modified memory.
+ * Generic callers have no source hint and use the ordinary full-save path.
  */
-sys_state::sys_state(const struct syscall_info info[][MAX_THREADS_PER_PROCESS])
+sys_state::sys_state(const struct syscall_info info[][MAX_THREADS_PER_PROCESS],
+                     const sys_state *restored_source)
 {
-  auto old_state = ptmc_state.running_state;
-  auto active_idx = ptmc_state.cursor;
+  const char *mode = getenv("DETSIM_CAPTURE_MODE");
+  const bool force_full = mode && !strcmp(mode, "full");
   error_bound = ptmc_state.error_bound;
-  extern int auto_mode;  // For detecting manual mode
-
-  if (old_state.ss_hash == 0)
-  {
-    for (int j = 0; j < NP; j++)
-    {
-      child[j] = tracee_state(j, info[j]);
-      status[j] = ptmc_state.status[j];
-      ts_hash[j] = child[j].save(ptmc_state.pids[j]);
-    }
-    goto ret;
-  }
-
-  for (int j = 0; j < NP; j++)
-  {
-    /* Create new tracee_state from running process */
+  for (int j = 0; j < NP; ++j) {
     child[j] = tracee_state(j, info[j]);
     status[j] = ptmc_state.status[j];
-
-    if (j == active_idx)
-    {
-      /* Active process: always full save */
-      ts_hash[j] = child[j].save(ptmc_state.pids[j]);
-      LOG_DEBUG("Active tstate %d saved: " HASH_FORMAT, j, ts_hash[j]);
-    }
-    else
-    {
-      /* Inactive process: check if state changed */
-      if (auto_mode && child[j].metadata_equal(old_state.child[j]))  // Disable optimization in manual mode
-      {
-        /* State unchanged, reuse old hash */
-        ts_hash[j] = old_state.ts_hash[j];
-        LOG_DEBUG("Inactive tstate %d reused: " HASH_FORMAT, j, ts_hash[j]);
-      }
-      else
-      {
-        /* State changed, full save */
-        ts_hash[j] = child[j].save(ptmc_state.pids[j]);
-        LOG_DEBUG("Inactive tstate %d changed, saved: " HASH_FORMAT, j,
-                  ts_hash[j]);
-      }
-    }
-
+    const hash_type comparison_hash = !force_full && restored_source &&
+        j != ptmc_state.cursor && DISALIVE(status[j]) &&
+        DISALIVE(restored_source->status[j]) ? restored_source->ts_hash[j] : 0;
+    ts_hash[j] = child[j].save(ptmc_state.pids[j], comparison_hash);
+    if (!ts_hash[j]) throw std::runtime_error("Failed to capture tracee state");
   }
-
-ret:
-  for (hash_type hash : ts_hash)
-    if (!hash) throw std::runtime_error("Failed to capture tracee state");
   ss_hash = identity_hash();
-  LOG_DEBUG("Create sstate (incremental) " HASH_FORMAT, ss_hash);
+  LOG_DEBUG("Create sstate " HASH_FORMAT, ss_hash);
   save_metadata();
 }
 
@@ -845,7 +805,7 @@ void sys_state::clear()
  * Capture memory, registers, and tracee_state, store via StateStore
  * Optimized with batched process_vm_readv
  */
-hash_type tracee_state::save_full_state_to_state_store(int pid)
+hash_type tracee_state::save_full_state_to_state_store(int pid, hash_type comparison_hash)
 {
   std::string maps_path = fmt::format("/proc/{}/maps", pid);
 
@@ -1029,7 +989,13 @@ hash_type tracee_state::save_full_state_to_state_store(int pid)
 
   memcpy(all_data + header->regs_offset, &regs, sizeof(regs));
 
-  hash_type ts_hash = StateStore::instance().save(all_data, total_size);
+  // The store may avoid hashing only after equality of all captured bytes.
+  // It preserves write validation and never loads a cold comparison candidate.
+  hash_type ts_hash = StateStore::instance().save(all_data, total_size, comparison_hash);
+  const char *mode = getenv("DETSIM_CAPTURE_MODE");
+  if (comparison_hash && mode && !strcmp(mode, "verify") &&
+      StateStore::instance().save(all_data, total_size) != ts_hash)
+    throw std::runtime_error("Capture deduplication disagrees with full save");
 
 
   LOG_DEBUG("StateStore saved hash %016lx, size=%zu, regions=%zu, tstate=%zu, "
@@ -1075,14 +1041,14 @@ tracee_state::tracee_state(int which, const struct syscall_info info[])
 }
 
 /* Full save: capture memory, mappings, and serialize */
-hash_type tracee_state::save(int pid)
+hash_type tracee_state::save(int pid, hash_type comparison_hash)
 {
   /* Record brk */
   brk = tracee_do_syscall(pid, SYS_brk, 0, 0, 0, 0, 0, 0);
   LOG_DEBUG("recorded brk = 0x%x", brk);
 
   /* Capture memory state (includes tstate) */
-  return save_full_state_to_state_store(pid);
+  return save_full_state_to_state_store(pid, comparison_hash);
 }
 
 /* Equality comparison for incremental save optimization

@@ -9,7 +9,7 @@ ifneq ($(filter benchmark-redisraft,$(MAKECMDGOALS)),)
 NP ?= 3
 endif
 
-ifneq ($(filter check-accept check-redis check-port check-identity,$(MAKECMDGOALS)),)
+ifneq ($(filter check-accept check-redis check-port check-identity check-capture,$(MAKECMDGOALS)),)
 NP ?= 2
 endif
 
@@ -117,7 +117,7 @@ check-build-contracts:
 check: test check-build-contracts
 
 # Optional fragments are absent in the disposable build-contract fixtures.
--include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk tests/futex_snapshot.mk tests/futex.mk tests/storage.mk tests/store_cache.mk tests/store_packed.mk tests/redisraft.mk
+-include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk tests/futex_snapshot.mk tests/futex.mk tests/storage.mk tests/store_cache.mk tests/store_packed.mk tests/redisraft.mk tests/capture.mk
 check-integration: check-dwarf check-elf
 
 # This gate executes native programs via ptrace; keep it separate from make check.
@@ -143,6 +143,7 @@ help:
 	@echo 'make check-exec             Syscall input and automatic-step boundary regression'
 	@echo 'make check-state-io         Snapshot format and exact I/O failure regression'
 	@echo 'make check-mappings         Private mapping contents and protections regression'
+	@echo 'make check-capture         NP=2 full-versus-optimized snapshot equivalence'
 	@echo 'make check-identity         NP=2 ordered metadata identity regression'
 	@echo 'make check-port             NP=2 deterministic virtual TCP ports regression'
 	@echo 'make benchmark-redisraft    NP=3 bounded Raft replication and DFS benchmark'

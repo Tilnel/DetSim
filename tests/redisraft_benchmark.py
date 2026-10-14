@@ -149,6 +149,8 @@ try:
             if stats:
                 result['storage_stats']=dict(zip(['loads','l1_hits','l2_hits','disk_reads','saves','new_snapshots'],map(int,stats.groups()[:6])))
                 result['storage_stats']['dedup_percent']=float(stats[7])
+                reference=re.search(r'reference=(\d+)',reply)
+                if reference: result['storage_stats']['reference_hits']=int(reference[1])
         sample();begin=time.monotonic()
         proc.stdin.write(b'q\n');proc.stdin.flush()
         tail,_=proc.communicate(timeout=30);log.write(tail)

@@ -351,3 +351,51 @@ buffers held by callers and one oversized pending state can exceed cache budgets
 Verified benchmark result files: `before-verified-results.json` and
 `after-verified-results.json` under `build/storage-benchmark/`. RSS includes the
 benchmark's generated payloads and runtime, not only store-owned memory.
+
+## Conservative snapshot capture optimization
+
+Invariant: optimized capture produces exactly the same child blobs/system identity
+as fresh full capture, including inactive memory changed outside model metadata.
+Investigation found inactive metadata comparison always mismatched brk=0, while
+its source was stale runtime bookkeeping after branch restore. Do not repair this
+by assuming stopped-process bytes cannot change: cross-process writes, shared VM
+descendants and asynchronous kernel I/O make that unsafe with current emulation.
+
+Plan: retain full memory/maps/brk/GP/XSTATE capture; pass explicit restored source
+identity as a dedup hint only. Delete dead incremental comparison and full old-state
+copy. The store may compare only an already-hot/pending immutable candidate before
+hashing; cold hints follow the ordinary path without speculative disk reads. All
+store preconditions/error behavior remain enforced. Full/verify modes and a real
+NP2 branch-replay oracle cover changed memory and modeled cross-node state.
+Measure the same fixed-seed Raft depth12 workload against saved baseline binary,
+with both small and large caches, after equivalence gates pass.
+
+Result: introduced store-owned resident reference comparison without bypassing
+read-only/poison/length/lifecycle checks. All snapshots still capture full bytes.
+Cold hints have no additional reads; active nodes retain the ordinary save path.
+The source reference never authorizes metadata-only memory reuse. Diagnostics
+`DETSIM_CAPTURE_MODE=full/verify` and `reference` statistics expose the comparison.
+
+Paired fixed-seed Raft depth12,3 runs per binary/cache profile, all 3433 visits,
+1776 reported new states,11127 save requests,403 new snapshots and identical
+protocol checkpoint results. L1/L2 32/64MiB: save median7.872→7.202s (-8.5%),
+DFS14.028→13.029s; 256/512MiB: save6.360→5.879s (-7.6%), DFS10.889→9.881s.
+The wall-time reduction includes monitor's one-second quantization; memory is
+essentially unchanged. See redisraft-benchmark.md for caveats and raw result paths.
+
+Verification (explicit GCC14 compiler paths):
+
+- NP2 production build: `check-capture check-store-cache check-identity check-port
+  check-accept check-redis` all pass. Capture oracle runs with resident and1-byte
+  caches; external inactive memory and socket/time changes match full capture.
+- NP1 production build: `check check-storage check-scenarios check-futex-snapshot
+  check-state-io check-mappings check-xstate` all pass (12 native scenarios).
+- NP3 real Raft depth12 additionally passes full and verify modes: both retain
+  3433 visits/1776 new states/403 new snapshots; verify extra ordinary saves raise
+  calls to18545, with no hash disagreement. Full mode reference count is0.
+- `-Wall -Wextra -Werror -fsyntax-only` state.cpp, state_store.cpp and capture
+  test succeeds; Python syntax and git diff checks pass; independent review found
+  no remaining correctness blocker in this bounded change.
+
+Future large gains still require proven dirty tracking or an enforced closed
+execution profile. Stopping one thread does not prove its memory cannot change.

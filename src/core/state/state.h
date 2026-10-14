@@ -257,10 +257,10 @@ typedef struct tracee_state
    * --------------------------------------------------------- */
 
   /* Full state save: memory, mappings, serialization */
-  hash_type save(int pid);
+  hash_type save(int pid, hash_type comparison_hash = 0);
 
   /* Capture memory and registers */
-  hash_type save_full_state_to_state_store(int pid);
+  hash_type save_full_state_to_state_store(int pid, hash_type comparison_hash = 0);
 
   /* ---------------------------------------------------------
    * State Recovery (disk -> struct -> running)
@@ -327,7 +327,8 @@ typedef struct sys_state
   sys_state &operator=(sys_state &&other) noexcept = default;
 
   /* From running processes - save */
-  sys_state(const struct syscall_info info[][MAX_THREADS_PER_PROCESS]);  // Per-thread syscall info
+  sys_state(const struct syscall_info info[][MAX_THREADS_PER_PROCESS],
+            const sys_state *restored_source = nullptr);  // Per-thread syscall info
 
   /* From saved state (hash) */
   sys_state(hash_type hash);

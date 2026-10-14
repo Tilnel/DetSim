@@ -1,0 +1,140 @@
+#include "config.h"
+#include "monitor.h"
+#include "ncurses_ui.h"
+#include "state_store.h"
+#include "sysstate_store.h"
+#include "guest.h"
+#include "proc_status.h"
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <stdexcept>
+#include <sys/mman.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
+#include <sys/rseq.h>
+#include <sys/syscall.h>
+
+static long guest_value = 17;
+static_assert(NP == 2, "capture oracle requires two processes");
+extern "C" detsim::ui::NCursesUI *get_ncurses_ui() { return nullptr; }
+static void require(bool ok, const char *why) { if (!ok) throw std::runtime_error(why); }
+int main(int argc, char**)
+{
+    pid_t children[NP]{};
+    char directory[] = "/tmp/detsim-capture-XXXXXX";
+    const auto cwd = std::filesystem::current_path();
+    try {
+        require(mkdtemp(directory) && chdir(directory) == 0, "temporary directory");
+        // Fork before the stores start writer threads. Tiny caches force disk reloads.
+        for (int i = 0; i < NP; ++i) {
+            children[i] = fork(); require(children[i] >= 0, "fork");
+            if (!children[i]) {
+                // Fork inherits libc's rseq area; injected syscalls otherwise
+                // let the kernel change its CPU fields between oracle captures.
+                if (__rseq_size && syscall(SYS_rseq,
+                    static_cast<char*>(__builtin_thread_pointer()) + __rseq_offset,
+                    32, RSEQ_FLAG_UNREGISTER, RSEQ_SIG)) _exit(5);
+                if (mmap(reinterpret_cast<void*>(scratch_page), 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                         MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED) _exit(2);
+                auto *code = reinterpret_cast<unsigned char*>(scratch_page + 0xff0);
+                code[0] = 0x0f; code[1] = 0x05;
+                if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr)) _exit(3);
+                asm volatile("int3");
+                _exit(0);
+            }
+            int status;
+            require(waitpid(children[i], &status, 0) == children[i] && WIFSTOPPED(status), "child stop");
+            require(ptrace(PTRACE_SETOPTIONS, children[i], nullptr,
+                           PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL) == 0, "ptrace options");
+            ptmc_state.pids[i] = children[i];
+            ptmc_state.fd_managers[i] = std::make_shared<FdManager>();
+            ptmc_state.fs_states[i].set_fd_manager(ptmc_state.fd_managers[i]);
+            ptmc_state.sock_states[i].set_fd_manager(ptmc_state.fd_managers[i]);
+        }
+        StateStore::Config config;
+        if (argc > 1) config.hot_cache_size = config.warm_cache_size = 1;
+        StateStore::instance().init(config);
+        syscall_info info[NP][MAX_THREADS_PER_PROCESS]{};
+        ptmc_state.cursor = -1;
+        auto_mode = 1;
+        sys_state source(info);
+        ptmc_state.running_state = source;
+        ptmc_state.cursor = 0;
+        source.recover_running_state();
+        const auto before = StateStore::instance().get_stats();
+        sys_state reused(info, &source);
+        require(StateStore::instance().get_stats().save_calls == before.save_calls + NP,
+                "capture skipped ordinary store validation");
+        if (argc == 1) require(StateStore::instance().get_stats().save_reference_hits == before.save_reference_hits + 1,
+                "unchanged resident inactive snapshot did not bypass hashing");
+        require(reused.ss_hash == source.ss_hash, "unchanged capture identity drift");
+        auto compare_full = [&](const sys_state& optimized) {
+            setenv("DETSIM_CAPTURE_MODE", "full", 1);
+            sys_state full(info, &source);
+            unsetenv("DETSIM_CAPTURE_MODE");
+            require(full.ss_hash == optimized.ss_hash, "full capture system identity differs");
+            for (int i = 0; i < NP; ++i) {
+                std::vector<uint8_t> expected, actual;
+                require(StateStore::instance().load(full.ts_hash[i], expected) > 0 &&
+                        StateStore::instance().load(optimized.ts_hash[i], actual) > 0 && expected == actual,
+                        "optimized snapshot bytes differ");
+            }
+        };
+        compare_full(reused);
+        // Cross-node modeled delivery must invalidate the idle node's hash.
+        ptmc_state.time[1].tv_sec++;
+        sys_state changed(info, &source);
+        require(changed.ts_hash[1] != source.ts_hash[1], "inactive modeled update lost");
+        compare_full(changed);
+        ptmc_state.running_state = changed;
+        source.recover_running_state();
+        sys_state restored(info, &source);
+        require(restored.ss_hash == source.ss_hash, "branch restore reused stale running-state hash");
+        compare_full(restored);
+        setenv("DETSIM_CAPTURE_MODE", "verify", 1);
+        sys_state verified(info, &source);
+        require(verified.ss_hash == source.ss_hash, "verification mode identity differs");
+        unsetenv("DETSIM_CAPTURE_MODE");
+        // A stopped private process can still be changed by tracer expressions
+        // or another process: metadata equality alone is not a valid fast path.
+        require(ptrace(PTRACE_POKEDATA, children[1], &guest_value, 99) == 0, "inactive memory edit");
+        sys_state memory_changed(info, &source);
+        require(memory_changed.ts_hash[1] != source.ts_hash[1], "inactive memory edit lost");
+        compare_full(memory_changed);
+        ptmc_state.running_state = memory_changed;
+        source.recover_running_state();
+        UdpDatagram datagram{};
+        datagram.content = "peer delivery";
+        ptmc_state.sock_states[1].udp_recv_buffers()[7].push_back(datagram);
+        sys_state socket_changed(info, &source);
+        require(socket_changed.ts_hash[1] != source.ts_hash[1], "inactive socket update lost");
+        compare_full(socket_changed);
+        ptmc_state.running_state = socket_changed;
+        source.recover_running_state();
+        // The selected actor is always recaptured even when modeled metadata agrees.
+        user_regs_struct regs;
+        require(ptrace(PTRACE_GETREGS, children[0], nullptr, &regs) == 0, "read actor registers");
+        regs.rax ^= 1;
+        require(ptrace(PTRACE_SETREGS, children[0], nullptr, &regs) == 0, "change actor registers");
+        sys_state active_changed(info, &source);
+        require(active_changed.ts_hash[0] != source.ts_hash[0], "active actor incorrectly reused");
+        compare_full(active_changed);
+        // Generic captures have no comparison hint and use the ordinary store path.
+        const auto before_generic = StateStore::instance().get_stats().save_calls;
+        sys_state generic(info);
+        require(StateStore::instance().get_stats().save_calls == before_generic + NP,
+                "unanchored capture bypassed the ordinary store path");
+        if (argc > 1) require(StateStore::instance().get_stats().disk_reads > 0, "oracle did not exercise cache eviction");
+        StateStore::instance().shutdown();
+        SysStateStore::instance().shutdown();
+        for (pid_t &child : children) { kill(child, SIGKILL); waitpid(child, nullptr, 0); child = 0; }
+        std::filesystem::current_path(cwd); std::filesystem::remove_all(directory);
+        puts("PASS capture: idle reuse, full byte oracle, branch restore, memory/socket updates, active capture, cache eviction");
+        return 0;
+    } catch (const std::exception& error) {
+        for (pid_t child : children) if (child > 0) { kill(child, SIGKILL); waitpid(child, nullptr, 0); }
+        fprintf(stderr, "FAIL: %s (artifacts %s)\n", error.what(), directory);
+        return 1;
+    }
+}

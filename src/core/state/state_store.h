@@ -64,6 +64,8 @@ class StateStore
 
   // Save accepts immutable bytes with bounded backpressure; wait confirms durability.
   hash_type save(const void *data, size_t len);
+  // Optional byte-equality hint; only resident immutable buffers are consulted.
+  hash_type save(const void *data, size_t len, hash_type reference_hash);
 
   // Load data: check L1 -> L2 -> disk
   ssize_t load(hash_type hash, std::vector<uint8_t> &out_data);
@@ -117,6 +119,7 @@ class StateStore
     uint64_t prefetch_hits = 0;   // Prefetch hits (loaded before needed)
 
     // Save path statistics
+    uint64_t save_reference_hits = 0; // Equal resident hint avoided content hashing
     uint64_t save_calls = 0;      // Total save() calls
     uint64_t save_dedup_hot = 0;  // Deduplicated at hot cache
     uint64_t save_dedup_warm = 0; // Deduplicated at warm cache

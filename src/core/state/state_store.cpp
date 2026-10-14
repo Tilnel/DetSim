@@ -118,17 +118,36 @@ void StateStore::insert_cache(Cache &cache, std::list<hash_type> &lru,
 }
 
 hash_type StateStore::save(const void *data, size_t len) {
+  return save(data, len, 0);
+}
+
+hash_type StateStore::save(const void *data, size_t len, hash_type reference_hash) {
   if (!data || !len) throw std::invalid_argument("empty snapshot");
   if (len > UINT32_MAX) throw std::length_error("snapshot exceeds packed record limit");
   ensure_initialized();
   std::shared_lock lifecycle(lifecycle_mutex_);
   const auto started = std::chrono::steady_clock::now();
-  const auto hash = XXHash64::hash(data, len);
-  if (!hash) throw std::runtime_error("snapshot hash is reserved zero");
   std::unique_lock lock(mutex_);
   check_ready();
   if (config_.read_only) throw std::runtime_error("StateStore is read-only");
   ++stats_.save_calls;
+  if (reference_hash) {
+    Buffer candidate;
+    const auto pending = pending_.find(reference_hash);
+    if (pending != pending_.end()) candidate = pending->second;
+    if (!candidate) candidate = find_cache(hot_cache_, hot_lru_, reference_hash);
+    if (candidate && candidate->size() == len && !memcmp(candidate->data(), data, len)) {
+      ++stats_.save_reference_hits;
+      ++stats_.save_dedup_hot;
+      return reference_hash;
+    }
+  }
+  // A cold or unequal hint is not worth speculative I/O/decompression.
+  // Hash outside the cache mutex, then repeat readiness under the lock.
+  lock.unlock();
+  const auto hash = XXHash64::hash(data, len);
+  if (!hash) throw std::runtime_error("snapshot hash is reserved zero");
+  lock.lock();
   for (;;) {
     check_ready();
     Buffer existing;
@@ -346,8 +365,8 @@ size_t StateStore::get_l1_capacity() const { std::lock_guard lock(mutex_); retur
 size_t StateStore::get_l2_capacity() const { std::lock_guard lock(mutex_); return config_.warm_cache_size; }
 void StateStore::print_stats() const {
   const auto stats = get_stats();
-  detsim::ui::ui_printf("StateStore: loads=%lu L1=%lu L2=%lu disk=%lu hit=%.1f%% saves=%lu new=%lu dedup=%.1f%%\n",
-      stats.load_requests, stats.l1_hits, stats.l2_hits, stats.disk_reads, stats.hit_rate(), stats.save_calls, stats.save_new, stats.dedup_rate());
+  detsim::ui::ui_printf("StateStore: loads=%lu L1=%lu L2=%lu disk=%lu hit=%.1f%% saves=%lu new=%lu dedup=%.1f%% reference=%lu\n",
+      stats.load_requests, stats.l1_hits, stats.l2_hits, stats.disk_reads, stats.hit_rate(), stats.save_calls, stats.save_new, stats.dedup_rate(), stats.save_reference_hits);
   detsim::ui::ui_printf("  Cache bytes: L1=%zu/%zu L2=%zu/%zu; pending=%zu; prefetch=%lu\n",
       get_l1_usage(), get_l1_capacity(), get_l2_usage(), get_l2_capacity(), get_io_queue_size(), stats.prefetch_issued);
 }

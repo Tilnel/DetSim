@@ -21,6 +21,7 @@ make check-scenarios     # build NP=1 tracer and run isolated native ptrace scen
 make check-futex check-futex-snapshot # NP=1 wait/wake/requeue and branch restore
 make check-xstate check-exec check-state-io check-mappings # NP=1 state/atom gates
 make check-identity check-port # NP=2 identity and deterministic network state
+make check-capture       # NP=2 full/hinted snapshot byte-equivalence oracle
 make check-accept        # NP=2 cross-process accept address/length regressions
 make check-redis         # NP=2 fixed-schedule SET/GET with existing Redis debug binary
 make benchmark-redisraft # NP=3 bounded Raft-library replication and DFS benchmark

@@ -84,6 +84,29 @@ static void run_case(const char *mode, const char *executable, const char *hash_
     require(packed.load(std::stoull(hash_arg), result) == 4096 && result == payload(11), "fresh process cannot read completed write");
     packed.shutdown(); return;
   }
+  if (!strcmp(mode, "reference")) {
+    store.init(config(0, 0)); hold_compression = true;
+    auto data = payload(11); auto hash = store.save(data.data(), data.size());
+    await_compression();
+    require(store.save(data.data(), data.size(), hash) == hash, "pending reference changed hash");
+    require(store.get_stats().save_reference_hits == 1, "pending reference did not avoid hashing");
+    auto other = payload(12);
+    auto other_hash = store.save(other.data(), other.size(), hash);
+    require(other_hash != hash && store.get_stats().save_reference_hits == 1, "unequal reference reused hash");
+    require(store.save(data.data(), data.size() - 1, hash) != hash, "short reference reused hash");
+    release_compression(); store.wait_for_completion();
+    const auto before = store.get_stats();
+    require(store.save(data.data(), data.size(), hash) == hash, "cold reference changed hash");
+    const auto after = store.get_stats();
+    require(after.save_reference_hits == before.save_reference_hits && after.load_requests == before.load_requests,
+            "cold reference used speculative load");
+    require(store.save(data.data(), data.size(), 123) == hash, "missing reference changed hash");
+    store.shutdown(); store.init(config());
+    require(*store.load_shared(hash) == data, "reference reload");
+    require(store.save(data.data(), data.size(), hash) == hash && store.get_stats().save_reference_hits == 1,
+            "resident reference did not avoid hashing");
+    store.shutdown(); return;
+  }
   if (!strcmp(mode, "barrier")) {
     store.init(config());
     hold_compression = true;
@@ -194,6 +217,7 @@ static void run_case(const char *mode, const char *executable, const char *hash_
     fail_sync=true;
     rejects([&]{store.wait_for_completion();},"sync error hidden"); fail_sync=false;
     rejects([&]{store.save(data.data(),data.size());},"cached save after failed barrier");
+    rejects([&]{store.save(data.data(),data.size(),hash);},"reference save after failed barrier");
     rejects([&]{store.load_shared(hash);},"cached load after failed barrier");
     rejects([&]{store.wait_for_completion();},"repeat barrier after failure");
     rejects([&]{store.shutdown();},"shutdown hid barrier failure");
@@ -215,6 +239,7 @@ static void run_case(const char *mode, const char *executable, const char *hash_
     cfg=config(); cfg.read_only=true; store.init(cfg);
     require(*store.load_shared(hash)==bytes,"readonly reload");
     rejects([&]{store.save(bytes.data(),bytes.size());},"readonly save accepted");
+    rejects([&]{store.save(bytes.data(),bytes.size(),hash);},"readonly reference save accepted");
     store.shutdown(); return;
   }
   throw std::runtime_error("unknown case");
@@ -225,7 +250,7 @@ int main(int argc, char **argv) {
   try {
     const std::string executable = std::filesystem::canonical("/proc/self/exe");
     if (argc > 1) {run_case(argv[1], executable.c_str(), argc > 2 ? argv[2] : nullptr); return 0;}
-    for (auto mode : {"lifetime", "barrier", "concurrent", "shutdown", "errors", "backpressure", "multiworker", "prefetch", "sync_error", "config"}) {
+    for (auto mode : {"reference", "lifetime", "barrier", "concurrent", "shutdown", "errors", "backpressure", "multiworker", "prefetch", "sync_error", "config"}) {
       auto old = std::filesystem::current_path();
       char pattern[] = "/tmp/detsim-store-cache-XXXXXX";
       require(mkdtemp(pattern) != nullptr,"mkdtemp");
