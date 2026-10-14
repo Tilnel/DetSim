@@ -3,6 +3,8 @@
 These are source-supported findings, not all reproduced end to end. Component/build
 checks do not close these items. Priority reflects risk to exploration soundness.
 Use one item per focused change, with a failing regression before the fix.
+The [state/atom contract assessment](model-checking-contract.md) explains their
+relationship to the native-binary model-checking goal.
 
 | ID | Priority | Evidence / problem | Evidence required to close |
 | --- | --- | --- | --- |
@@ -17,13 +19,18 @@ Use one item per focused change, with a failing regression before the fix.
 | C09 | Fixed (scoped) | Replaced process-group termination with owned-child kill/reap; signal handler avoids store shutdown locks. | NP=1 scenarios verify unrelated sibling survives both normal exit and SIGTERM, and SIGTERM reaps tracees. Fork descendants, multithread races and initialization failures need additional coverage. |
 | C10 | Fixed | Migrated removed libdwarf calls to supported APIs; validated with installed libdwarf 0.11.1 and GCC 14.2. | Real production parser tests pass DWARF 4/5, two CUs, sizes/member offsets, symbols, arrays and cleanup/reinit; tracer compiles and links. Split DWARF and PIE relocation remain outside coverage. |
 | C11 | Fixed (distinct addresses) | Direct `futex_requeue` now updates `waiter_map_` when moving a waiter. | Both entry points agree on queue/address; archive round trip followed by `wake_thread` succeeds. Same-address requeue and full syscall ABI still need work (C16). |
-
 | C12 | Fixed | `handle_exit_group` wrote a raw wait status without the DetSim exited flag; successful exit became “running” and the next step crashed. | Finite program reaches counter 1/2/3, exits virtually, and further stepping reports exit status 0. |
 | C13 | Fixed | BFS reset an optional on violation, continued executing and printed a false completion message. | Reachable `counter < 3` violation interrupts BFS without printing completion; ordinary finite BFS explores the expected five states. |
 | C14 | Fixed | Batch command parser pointed at the NUL inserted by strtok and discarded all arguments. | Real batch handles whitespace, `sw 0`, `p counter` and `q`. |
 | C15 | P1 | Standard streams are absent from VFS open_files; intercepted `write(1, ...)` returns `-EBADF`. The counter fixture ignores that return value. | Define deterministic stdin/stdout/stderr semantics and test writes, errors, close and restore; do not silently pass through external I/O. |
 | C16 | P0 | Futex syscall handler clears blocked flags for remaining waiters rather than the woken ones. Requeue decoding/comparison semantics are incomplete; direct same-address requeue can invalidate vector references. | Wait/wake and requeue tests at the syscall boundary, including blocked-state updates, actual argument layout, same-address cases and snapshot branches. |
 | C17 | P1 | CPU-feature patch logs “Symbol not found” on ordinary dynamic workloads because the requested loader symbol is not resolved. | Define and test which nondeterministic CPU/runtime state must be normalized; avoid assuming this patch worked from a successful scenario. |
+| C20 | P0 / reproduced | No FP/SIMD/XSTATE capture. Raw-syscall XMM15 probe produces observed=11 on first execution, but observed=22 after restoring the same snapshot and replaying. | Preserve required architectural extended state; pass XMM/AVX/x87/MXCSR branch-replay tests without relying on C caller-saved registers across function calls. See contract assessment for exact probe. |
+| C21 | P0 | Snapshot saves only writable pages; mapping matching ignores protection/backing; recreation uses anonymous private RWX pages. | Write→read-only→save→modify→restore retains original data; protection changes restore correctly; explicitly support or reject shared/file-backed mapping semantics. |
+| C22 | P0 | Positive short process_vm I/O is accepted; failed reads can be zero-filled and missing snapshots replaced with live memory. | Fault-inject short reads/writes and corrupted/missing snapshots; fail without publishing or executing a successor. |
+| C23 | P0 | Runtime clock_gettime/getrandom pass through; connect uses host rand also used by search ordering. Kernel signal state is not restored. | Same state/action/outcome gives equal semantic successors regardless of elapsed wall time or exploration order. Virtualize or reject every relevant source. |
+| C24 | P0 | Syscall enter handler runs before current info.nr/args are filled; clone/futex entry logic can consume prior syscall arguments. | Validate each entry handler receives the current raw syscall arguments, including first call and alternating unrelated calls. |
+| C25 | P0 | Auto atom swallows CKPT_NO operations indefinitely; runnable threads and environment outcomes are not exhaustively enumerated. | Empty nonblocking receive loop must return control so a sender can run; preserve waiting states; enumerate enabled actors/outcomes and state the atom/property boundary. |
 
 ## Next development slice
 
@@ -41,10 +48,13 @@ Redis findings and resolution:
   EFAULT retains the virtual pending connection; partial copyout is not rolled back.
   These error-path modeling limits and accept4 flag fidelity need further coverage.
 
-Use the now-runnable tracer scenarios to fix C01/C16 with a minimal two-thread
-wait/wake workload. Protect virtual thread identity before consolidating scheduler
-implementations (C02/C03). Specify the standard-stream model (C15), then extend
-state-store verification (C08) to eviction, partial I/O and memory-map changes.
+First define the supported binary/environment/property profile. Repair the proven
+single-thread state contract failure C20, then mappings/I/O/input closure
+(C21/C22/C23) and state identity (C04). Use these oracles before adding concurrency.
+Next repair entry control C24, thread/futex state C01/C02/C16 and explicit actor
+enumeration/atom progress C03/C25. Consolidate schedulers only with successor-set
+and property-observation comparisons. Standard streams (C15), eviction and wider
+mapping coverage (C08) remain necessary for broader workloads.
 
 Current scenario evidence is NP=1, native non-PIE, single-thread, with inherited
 ASLR unchanged. It verifies repeated restore within one live process, not cross-run

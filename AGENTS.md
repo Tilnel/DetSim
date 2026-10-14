@@ -9,6 +9,8 @@ A successful build or a running Redis example does not establish that property.
 1. Read [docs/development.md](docs/development.md) for commands and active paths.
 2. Read [docs/correctness-backlog.md](docs/correctness-backlog.md) before touching
    scheduling, snapshots, state identity, or syscall emulation.
+   Use [the state/atom contract assessment](docs/model-checking-contract.md) to
+   distinguish runnable examples from a sound model and covered interleavings.
 3. Check `git status --short`. Preserve unrelated work, ignored local experiments,
    submodule changes, and runtime snapshots.
 

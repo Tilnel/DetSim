@@ -1,5 +1,10 @@
 # Developing DetSim
 
+For the project's actual model-checking requirements, start with the
+[state and atom contract assessment](model-checking-contract.md). It includes a
+reproduced SIMD restore failure and distinguishes state closure from schedule
+coverage; passing the current gates does not establish either general guarantee.
+
 ## Commands
 
 From the repository root, with GNU Make 4.3+, Python 3 and a C++20 compiler:
