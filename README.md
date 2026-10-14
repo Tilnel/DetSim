@@ -1,184 +1,55 @@
 # DetSim
 
-DetSim 是一个确定性模拟测试环境，用于分布式系统的确定性测试和调试。
+DetSim 是面向 Linux x86-64 原生程序的有状态模型检查器。它通过 `ptrace`
+控制执行、模拟系统调用、保存与恢复状态，并探索多节点系统的执行路径。
 
-## 特性
+项目处于恢复验证基线的阶段。已有 CLI、表达式求值、状态存储和探索实现；
+多线程快照及探索正确性尚未建立端到端验证，不能将示例运行成功当作保证。
+具体问题见 [正确性待办](docs/correctness-backlog.md)。
 
-- **确定性执行**: 通过控制调度消除非确定性，确保测试可重复
-- **全局状态管理**: 保存/恢复任意执行点的完整系统状态
-- **表达式求值**: 类似 GDB 的表达式求值，支持结构体、指针、类型转换
-- **状态比较**: 对比不同执行路径的系统状态差异
-- **分布式支持**: 支持多进程分布式系统的统一调试
+## 开发入口
 
-## 依赖
-
-- libdw
-- libcereal-dev
-- libdwarf-dev
-- libelf-dev
-- libreadline-dev
-- libcjson-dev
-- libunwind-dev
-- libfmt-dev
-- flex, bison
-
-## 编译
+先读 [AGENTS.md](AGENTS.md) 和 [开发指南](docs/development.md)。
+当前调用路径、构建约定与验证范围以开发指南为准，历史优化报告仅供参考。
 
 ```sh
-make NP=$(NODES)
+make help
+make check CC=/usr/bin/gcc CXX=/usr/bin/g++  # 本机已验证的编译器组合
+make NP=1 -j4       # 构建单节点 tracer；NP 必须与场景 Nodes 一致
+make check-integration CC=/usr/bin/gcc CXX=/usr/bin/g++
+make check-scenarios CC=/usr/bin/gcc CXX=/usr/bin/g++  # 需要允许 ptrace
+make check-redis CC=/usr/bin/gcc CXX=/usr/bin/g++      # NP=2，现有 Redis 调试二进制
 ```
 
-`NP` 指定被测系统的节点（进程）数量，必须与配置文件中的 `Nodes` 一致。
+需要 GNU Make 4.3+、Python 3、C++20 编译器。完整 tracer 还依赖 libdw、
+libdwarf、libelf、readline、zstd、xxhash、libunwind、fmt、ncurses；
+nlohmann/json 已随仓库提供，Cereal 可来自已初始化的子模块或系统开发包。
+Flex/Bison 用于重新生成表达式解析器。
+依赖兼容性与明确的编译器选择方式见开发指南。
 
-### 编译被测程序
+**已验证的基线：** GCC 14.2 与 libdwarf 0.11.1；完整 tracer 可以构建。
+默认 `make check` 验证组件和构建规则，`check-integration` 验证真实 DWARF/ELF
+解析，`check-scenarios` 验证九个隔离的单进程原生程序场景。多线程、标准流
+模拟和一般探索正确性仍有已知缺口，详见正确性待办。
 
-被测程序需要使用 `-gdwarf-4` 编译以保留调试信息：
+仓库内 Redis 样例已在固定手控调度下完成 SET/GET；原始调试二进制无需剥离
+调试信息。验证步骤与覆盖边界见 [Redis 实测](docs/redis-smoke.md)。
 
-```sh
-CFLAGS="-gdwarf-4 -g" make
-```
+## 目录
 
-## 启动
+- `src/`：调度、快照、系统调用模拟、表达式及交互界面。
+- `tests/`：默认自动化检查；未接入的本地历史测试不属于验证基线。
+- `examples/`：被测程序、插件及外部项目，不等同于 DetSim 回归测试。
+- `perf/`、`tools/`：性能测量和状态查询工具。
+- `docs/`：设计、使用参考及当前维护记录。
 
-为确保分析准确，需要关闭 Linux 系统的地址空间随机化机制：
+## 设计与使用参考
 
-```sh
-sudo echo 0 > /proc/sys/kernel/randomize_va_space
-```
+- [设计原理](docs/index.md)
+- [命令行接口](docs/cli.md)
+- [表达式求值](docs/expr.md)
+- [调用栈](docs/backtrace.md)
+- [内存映射与堆](docs/brk_and_mmap.md)
 
-### 运行测试
-
-```sh
-./tracer -c tests/expr_test.json
-```
-
-`tests/` 目录下提供了多个测试示例。
-
-## 快速开始
-
-### 1. 编写被测程序
-
-```c
-// test.c
-#include <stdio.h>
-
-int g_value = 42;
-
-int main() {
-    printf("value = %d\n", g_value);
-    return 0;
-}
-```
-
-编译：
-```sh
-gcc -gdwarf-4 -g -o test test.c
-```
-
-### 2. 编写配置文件
-
-```json
-{
-  "Loglevel": 0,
-  "Nodes": 1,
-  "Tracee": [["./test", "0"]],
-  "Addr": ["192.168.0.1"],
-  "Assertions": ["tracee0(g_value == 42)"]
-}
-```
-
-### 3. 运行测试
-
-```sh
-make NP=1
-./tracer -c test.json -a
-```
-
-## 命令行界面
-
-DetSim 提供交互式 CLI 用于调试：
-
-| 命令 | 描述 |
-|------|------|
-| `c` | 自动探索模式 |
-| `si` | 单步执行当前进程 |
-| `sw N` | 切换到第 N 个进程 |
-| `p EXPR` | 求值表达式 |
-| `diff A B` | 比较两个状态 |
-| `load HASH` | 加载指定状态 |
-| `bt` | 打印调用栈 |
-| `info` | 显示当前状态信息 |
-| `q` | 退出 |
-
-详细文档请参考 [CLI 文档](docs/cli.md)。
-
-## 表达式求值
-
-支持完整的 C 表达式语法：
-
-```
-# 基本变量
-p g_value
-
-# 数组和指针
-p g_arr[2]
-p *g_ptr
-p **g_double_ptr
-
-# 结构体访问
-p g_struct.field
-p g_ptr->field
-
-# 类型转换（将 void* 转回结构体指针）
-p ((hidden_struct*)g_container.hidden_ptr)->secret_value
-
-# 进程限定
-p tracee1(g_remote_data)
-```
-
-详见 [表达式求值文档](docs/expr.md)。
-
-## 状态比较
-
-使用 `diff` 命令比较两个系统状态：
-
-```
-(ptmc) diff 80a3 a87f
-
-=== State Diff: 80a3157e vs a87f8fb6 ===
-
-[Overview]
-  System state hash: 80a3157e != a87f8fb6 ✗
-  Process count: 2
-
-  [Process 0 - Registers]
-    rax    0x0000000000000009   0x0000000000000001
-    ...
-
-  [Process 0 - Memory]
-    0x404040: A=00 00 00 00  B=2a 00 00 00
-```
-
-## 项目结构
-
-```
-.
-├── src/
-│   ├── core/       # 核心功能（调度、状态管理、DWARF解析）
-│   ├── subsys/     # 子系统（文件系统、网络状态序列化）
-│   └── utils/      # 工具（表达式解析器）
-├── tests/          # 测试用例
-├── docs/           # 文档
-└── Makefile
-```
-
-## 文档
-
-- [表达式求值](docs/expr.md) - 详细表达式语法
-- [命令行接口](docs/cli.md) - CLI 命令参考
-- [回溯](docs/backtrace.md) - 调用栈分析
-- [内存管理](docs/brk_and_mmap.md) - brk/mmap 处理
-
-## 许可证
-
-[待补充]
+运行被测程序通常需要 DWARF-4 调试信息（`-gdwarf-4 -g`）。运行场景前请先
+查看开发指南中的 ptrace 隔离要求；默认检查不会运行这些场景。

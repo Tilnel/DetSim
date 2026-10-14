@@ -1,5 +1,10 @@
 # Refactoring Summary
 
+> Historical implementation notes. The build claims below are not a current
+> verification baseline. See [development.md](docs/development.md) and the
+> [correctness backlog](docs/correctness-backlog.md); the two scheduler paths
+> have not been consolidated or verified as equivalent.
+
 ## Iteration 7: Final State
 
 ### Code Metrics

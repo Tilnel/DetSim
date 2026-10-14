@@ -1,5 +1,9 @@
 # DetSim 测试 Redis 服务器完整研究报告
 
+> 本文是历史设计与适配建议，不是当前测试通过记录。2026-10-14 的实际结果见
+> [Redis 实测](redis-smoke.md)：修复 DWARF 和 accept 后，原始调试版 Redis
+> 已在指定手动调度下完成 SET/GET；多线程和一般模型检查仍未验证。
+
 ## 目录
 1. [Redis 服务器架构分析](#redis-服务器架构分析)
 2. [Redis 历史 Bug 分析](#redis-历史-bug-分析)
