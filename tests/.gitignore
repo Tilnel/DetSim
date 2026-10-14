@@ -46,6 +46,7 @@
 !storage_benchmark.py
 
 !redisraft_benchmark.py
+!redisraft_profile_summary.py
 !redisraft.mk
 
 !capture.mk

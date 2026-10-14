@@ -27,6 +27,8 @@ p.add_argument('--depth', type=int, default=5)
 p.add_argument('--hot-mb', type=int, default=32)
 p.add_argument('--warm-mb', type=int, default=64)
 p.add_argument('--timeout', type=float, default=60)
+p.add_argument('--perf', type=Path, help='perf executable: sample only DFS (all tracer threads)')
+p.add_argument('--perf-sudo', action='store_true', help='run perf with sudo -n; do not change sysctl')
 a = p.parse_args()
 if a.rounds <= 0 or a.depth < 0 or a.hot_mb < 0 or a.warm_mb < 0 or a.timeout <= 0:
     p.error("invalid rounds, depth, cache size or timeout")
@@ -43,6 +45,8 @@ config = {'Nodes':3,'Loglevel':4,'Tracee':[[str(a.binary.resolve()),str(i)] for 
 if a.check: config['UserCheck']=str(a.check.resolve())
 (work/'config.json').write_text(json.dumps(config,indent=2))
 proc = None
+profiler = None
+profile_log = None
 commands = []
 started = time.monotonic()
 
@@ -87,8 +91,10 @@ try:
                         return text
             raise TimeoutError('command timed out: '+str(command))
         prompt();result['startup_s']=time.monotonic()-started
-        def cpu_seconds():
-            fields=Path(f'/proc/{proc.pid}/stat').read_text().rsplit(')',1)[1].split()
+        def cpu_seconds(pid=None, main=False):
+            pid = proc.pid if pid is None else pid
+            path = f'/proc/{pid}/task/{pid}/stat' if main else f'/proc/{pid}/stat'
+            fields=Path(path).read_text().rsplit(')',1)[1].split()
             return (int(fields[11])+int(fields[12]))/os.sysconf('SC_CLK_TCK')
         cpu_start=cpu_seconds()
         begin=time.monotonic()
@@ -132,9 +138,35 @@ try:
         if a.depth and result['error_bound_after_manual']<=0:
             raise RuntimeError('manual schedule exhausted search error budget')
         if a.depth:
+            if a.perf:
+                profile_log = (work/'perf.log').open('wb')
+                prefix = ['sudo', '-n'] if a.perf_sudo else []
+                profiler = subprocess.Popen(prefix+[str(a.perf.resolve()), 'record',
+                    '-e', 'cpu-clock', '--clockid', 'mono', '-F', '199', '--call-graph', 'dwarf,32768',
+                    '-p', str(proc.pid), '-o', str(work/'perf.data')],
+                    stdout=profile_log, stderr=profile_log, start_new_session=True)
+                # Startup is outside the timed DFS; abort on permission/tool failures.
+                time.sleep(0.3)
+                if profiler.poll() is not None:
+                    raise RuntimeError('perf failed: '+(work/'perf.log').read_text())
             cpu_start=cpu_seconds()
-            begin=time.monotonic();reply=prompt(f'dfs {a.depth}');result['dfs_s']=time.monotonic()-begin
+            main_cpu_start=cpu_seconds(main=True)
+            tracee_pids=[int(re.search(r'pid=(\d+)',node['threads'])[1]) for node in result['nodes']]
+            tracee_cpu_start=sum(cpu_seconds(pid) for pid in tracee_pids)
+            begin=time.monotonic();reply=prompt(f'dfs {a.depth}');end=time.monotonic();result['dfs_s']=end-begin
             result['dfs_cpu_s']=cpu_seconds()-cpu_start
+            result['dfs_main_cpu_s']=cpu_seconds(main=True)-main_cpu_start
+            result['dfs_tracee_cpu_s']=sum(cpu_seconds(pid) for pid in tracee_pids)-tracee_cpu_start
+            if profiler:
+                if a.perf_sudo:
+                    subprocess.run(['sudo', '-n', 'kill', '-INT', str(profiler.pid)], check=True)
+                else:
+                    profiler.send_signal(signal.SIGINT)
+                if profiler.wait(timeout=15) not in (0, 130, -signal.SIGINT):
+                    raise RuntimeError('perf recording failed')
+                profiler = None
+                result['perf_data'] = str(work/'perf.data')
+                result['perf_window_monotonic_s'] = [begin, end]
             result['dfs_history_s']=result['dfs_s']-result.get('dfs_until_report_s',result['dfs_s'])
             (work/'dfs-report.txt').write_text(reply)
             result['dfs_report_tail']=reply[reply.rfind('Time elapsed:'):]
@@ -160,6 +192,26 @@ try:
 except Exception as e:
     result['error']=str(e)
 finally:
+    try:
+        if profiler and profiler.poll() is None:
+            if a.perf_sudo:
+                subprocess.run(['sudo', '-n', 'kill', '-INT', str(profiler.pid)], check=True)
+            else:
+                profiler.send_signal(signal.SIGINT)
+            profiler.wait(timeout=15)
+    except Exception as e:
+        result['passed'] = False
+        result['error'] = result.get('error', '')+'; profiler cleanup: '+str(e)
+        # The profiler owns a separate session; never let its failure skip tracee cleanup.
+        try:
+            if a.perf_sudo:
+                subprocess.run(['sudo', '-n', 'kill', '-KILL', '--', str(-profiler.pid)], check=True)
+            else:
+                os.killpg(profiler.pid, signal.SIGKILL)
+            profiler.wait(timeout=2)
+        except Exception as cleanup_error:
+            result['error'] += '; profiler kill: '+str(cleanup_error)
+    if profile_log: profile_log.close()
     if proc:
         try: os.killpg(proc.pid,signal.SIGKILL)
         except ProcessLookupError: pass

@@ -136,3 +136,113 @@ make benchmark-redisraft CC=/usr/bin/gcc CXX=/usr/bin/g++ \
 分支恢复、外部修改非活动节点内存、socket/时间变化及极小缓存。
 `DETSIM_CAPTURE_MODE=full` 可禁用提示；`verify` 会对提示路径额外执行普通保存
 并检查返回hash。结果保留在 `build/capture-optimization/results.json`。
+
+## 全链路 CPU profile（`8d58059`）
+
+结论：**仍有优化空间，当前主要限制是每条边对全部节点做完整捕获和恢复，
+尚未达到性能上限。** 下述测量覆盖正常 CLI 的 DFS、属性检查、后台工作、
+监控及结束后的历史输出；不把存储微基准当作探索性能。
+
+固定上述工作负载、seed=1、预热300步、DFS深度12，各缓存档不采样运行3次，
+中位数如下。每次仍为3,433次访问、1,776个新增状态；当前有限深度DFS的visited
+和Raft剪枝仍有覆盖限制，这些计数仅用于控制本次工作量。
+
+| 全链路指标 | L1/L2 32/64 MiB | L1/L2 256/512 MiB |
+| --- | ---: | ---: |
+| DFS墙钟，含历史 | 13.029 s | 9.889 s |
+| tracer全部线程CPU时间 | 15.390 s | 12.100 s |
+| 捕获/保存计时区间 | 7.373 s | 6.066 s |
+| 恢复计时区间 | 2.469 s | 2.217 s |
+| 完成消息后的历史输出 | 0.521 s | 0.378 s |
+
+另一次不采样运行新增了主线程及三个tracee的CPU计数：大缓存墙钟9.883s，tracer
+主线程8.640s，tracer全部线程12.790s，三个tracee合计0.300s；小缓存分别为
+14.035s、12.430s、15.410s、0.320s。这是单次交叉检查，不与上表中位数混算。
+tracee计数包括注入brk等辅助syscall；下面的“推进”比例只描述tracer调度/模拟
+CPU，不能解释为目标程序自身只消耗该比例的端到端时间。墙钟还包括等待与报告。
+
+使用可工作的 `/usr/lib/linux-tools-6.8.0-138/perf`，`sudo -n` 仅用于获得采样权限；
+没有改sysctl或ASLR。默认 `/usr/bin/perf` 包装器找不到当前内核工具，另一个
+6.8.12二进制缺libperl，均未用作正式采样。`cpu-clock` 199Hz、DWARF栈32KiB，
+在DFS前附加到tracer及其已有线程；三个tracee早已创建，不在采样对象内。
+按单调时钟过滤掉perf启动/停止阶段。主线程调用栈按已识别阶段固定优先级互斥归类；
+不能完整回溯的栈保留在“其他”，不强行归到某一阶段。
+捕获分类识别的是save_full_state_to_state_store主体；它之前的brk注入等工作进入
+“其他”，所以该表不是完整捕获计时区间的精确CPU分解。
+
+| 主探索线程CPU样本占比（约数） | 32/64 MiB | 256/512 MiB |
+| --- | ---: | ---: |
+| 完整捕获，含去重/保存 | 50% | 58% |
+| 恢复 | 18% | 23% |
+| 属性检查 | 15% | 9% |
+| 推进目标程序/模拟syscall | 1% | 2% |
+| 历史输出 | 2% | 2% |
+| DFS重载及其他未归类工作 | 13% | 6% |
+
+两档正式采样分别2,978/2,175个样本，其中主线程2,465/1,651个；这属于粗粒度定位，
+小函数的百分比不宜当成精确计时。大缓存采样9.941s、小缓存14.077s；后者相对
+不采样中位数多约1秒，受采样开销及monitor一秒join量化共同影响。采样运行也验证
+相同访问数、快照请求数与协议检查结果。一次与strace同时运行的试样未用于此表。
+
+后台worker占所有tracer线程CPU样本约16%/23%，主要是压缩、解压和落盘；这些
+工作与主线程重叠，不能将CPU百分比直接加到墙钟，或承诺删掉它们就节省同样时间。
+大缓存仍有约46%的全部CPU样本在内核，主要是process_vm读和页访问，不是磁盘等待。
+大缓存没有冷读；小缓存519次冷读，与历史样本518的差异来自当次缓存淘汰时序。
+
+### 可榨空间及优先级
+
+1. **删除多余清零和内存分配。** 大缓存主线程约6.4%的样本落在捕获路径清零；
+   `state.cpp` 的 `vector<uint8_t>(total_size)` 先清零整份约1.25MB缓冲区，紧接着
+   process_vm_readv又覆盖内存部分。可复用缓冲区或仅初始化格式头/表，必须证明
+   所有发布字节均已写入，保持padding/identity确定性并继续严格拒绝短读。
+   这是一项局部优化；即使完全消除该6.4%主线程CPU，Amdahl上限也只有约1.07倍，
+   不是承诺墙钟能提升7%。
+2. **减少重复元数据读取和ptrace往返。** 约3,709次transition产生11,127次子快照
+   捕获，累计构造约13.9GB快照字节；每次还注入brk、读maps、枚举线程、读GP/XSTATE。
+   对主线程做strace计数，并减去相同预热但depth=0运行，探索及历史大致额外产生
+   175,958次ptrace、38,230次wait4、49,582次process_vm_readv、11,419次process_vm_writev，
+   以及39,370次getdents64、39,372次openat。这里只使用计数：strace明显扰动速度，
+   它给出的时间比例不代表正常运行。优先复用同次捕获/恢复已取得的主线程寄存器和
+   线程列表；缓存brk/maps则需要明确的失效和外部变化契约，不能直接永远复用。
+3. **让属性读取持有已验证的不可变snapshot view。** 本次有662,872次load请求，
+   相当于每条transition约179次。检查一个long目前也要查缓存、验证区域、malloc、
+   扫描区域。每轮检查固定持有各节点快照、验证一次、读到调用者缓冲区可降低成本。
+   小缓存中检查约占主线程15%，部分是读取导致解压。AST解析缓存已经存在；
+   Raft checker会修改raft_states，不能直接按hash缓存check结果而忽略副作用。
+4. **减少恢复的重复全区域传输。** 当前先读完整live区域、memcmp；有任何差异就
+   写整区。可保持完整读取但逐页比较、合并不同页写回，尤其适合大heap小修改。
+   本次writev相关成本较小，收益需另测，不能仅凭结构就优先于捕获读取。
+5. **消除命令尾部等待。** monitor睡500ms后每秒轮询，stop直接join。
+   可唤醒等待能消除最多约1秒尾部延迟；历史按需输出可再少约0.4–0.5秒。
+   两项改善命令响应，不能当作持续搜索吞吐提升。
+6. **大幅提升需要减少工作量。** 同样边数下，用可靠dirty追踪、页级共享状态避免
+   完整内存反复搬运；或用经证明的独立性/POR减少边数。当前每条边只推进一个节点，
+   却完整捕获所有节点，成本随边数×节点数×地址空间增长。停止的节点仍可能被
+   跨进程或异步kernel写入；目前默认syscall passthrough未形成封闭支持契约，
+   因而不能仅因“没调度这个节点”就跳过它。直接合并syscall会改变属性观察点及
+   交织覆盖，必须先证明atom和约简规则。
+
+DFS把刚捕获的状态只以hash交给子帧，之后又从存储反序列化；直接传递已捕获状态
+也有可删的重复工作，但本次可识别CPU占比低，优先级低于前述热点。访问数相同
+只是本次性能对照依据；后续涉及剪枝/atom的优化必须检验successor及属性覆盖。
+
+### 复现profile
+
+```sh
+python3 tests/redisraft_benchmark.py \
+  --choose build/release/np3/tests/redisraft_choose.so \
+  --check build/release/np3/tests/redisraft_check.so \
+  --seed-shim build/release/np3/tests/redisraft_seed.so \
+  --depth 12 --hot-mb 256 --warm-mb 512 \
+  --perf /usr/lib/linux-tools-6.8.0-138/perf --perf-sudo \
+  --output build/exploration-profile/hot
+# 使用上一命令输出的workdir替换下面RUN：
+sudo -n /usr/lib/linux-tools-6.8.0-138/perf script \
+  -i RUN/perf.data -F comm,pid,tid,time,event,ip,sym,dso > RUN/stacks.txt
+python3 tests/redisraft_profile_summary.py RUN/result.json RUN/stacks.txt
+```
+
+采样产物和未采样基线保留在 `build/exploration-profile/`；正式大缓存
+`hot/run-97j2m9t2`、小缓存 `cold/run-qt4fq_5d`。新驱动另记录DFS单调时钟窗口；
+两份汇总是 `hot-summary.json`、`cold-summary.json`，syscall差分是
+`syscall-count-delta.json`。本轮没有修改产品捕获、恢复或搜索语义。
