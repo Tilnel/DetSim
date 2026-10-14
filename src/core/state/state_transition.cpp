@@ -171,7 +171,12 @@ TransitionResult state_transition(const sys_state &source_state,
 
   // Get current thread index for the active process
   int thread_idx = ptmc_state.current_thread_idx[process_index];
-  int ckpt = exec_once(source_state, new_syscalls[process_index][thread_idx]);
+  syscall_info executed = new_syscalls[process_index][thread_idx];
+  int ckpt = exec_once(source_state, executed);
+  // Automatic execution may skip a blocked/exited thread. Attribute the
+  // completed syscall to the actor that actually ran, preserving other slots.
+  thread_idx = ptmc_state.current_thread_idx[process_index];
+  new_syscalls[process_index][thread_idx] = executed;
 
   // save state with timing
   auto t3 = std::chrono::high_resolution_clock::now();

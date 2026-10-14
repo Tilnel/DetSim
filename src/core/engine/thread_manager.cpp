@@ -298,6 +298,10 @@ void ThreadManager::sync_from_tracee_state(const tracee_state& state)
             info.state = ThreadState::RUNNING;
         }
         info.blocked_on = 0;
+        if (ts.physical_tid && state.futex_state && state.futex_state->is_thread_waiting(ts.tid)) {
+            info.state = ThreadState::BLOCKED;
+            info.blocked_on = state.futex_state->get_wait_address(ts.tid);
+        }
 
         threads_.push_back(info);
     }

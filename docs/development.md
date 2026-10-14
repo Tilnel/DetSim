@@ -14,6 +14,7 @@ make help
 make check
 make check-integration   # production DWARF/ELF fixtures; default NP=1
 make check-scenarios     # build NP=1 tracer and run isolated native ptrace scenarios
+make check-futex check-futex-snapshot # NP=1 wait/wake/requeue and branch restore
 make check-xstate check-exec check-state-io check-mappings # NP=1 state/atom gates
 make check-identity check-port # NP=2 identity and deterministic network state
 make check-accept        # NP=2 cross-process accept address/length regressions
@@ -110,9 +111,12 @@ rejects standard-stream writes (C15). Loader CPU-feature normalization also logs
 an unresolved symbol (C17). Passing counter/replay tests does not close either gap,
 nor does it prove multithread, cross-process-run or eviction correctness.
 
-Snapshot format is now version 4; old snapshots are rejected without migration.
+Snapshot format is now version 5; old snapshots are rejected without migration.
 Private readable mappings are captured; shared/unreadable mappings, overlaps with
 the reserved scratch page and missing file-backed restore mappings fail explicitly.
+Thread slots and futex queues survive restore for unchanged live physical thread
+sets. Restoring across thread creation/exit is rejected. Timed/PI futex operations
+are unsupported and fail explicitly; successful waits remain suspended until wake.
 
 Run the NP=1 and NP=2 gates in separate make invocations. The Redis gate requires
 the existing `examples/redis/redis/src/redis-server`; it downloads nothing and

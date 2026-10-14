@@ -19,6 +19,11 @@ syscall 参数在 enter handler 前填充；自动执行以每个已完成 sysca
 拒绝，线程/futex 保存、actor 枚举、共享内存细粒度边界、时钟/随机/信号仍需修复。
 具体测试及剩余范围以 [correctness-backlog.md](correctness-backlog.md) 为准。
 
+后续 futex 修复：等待队列改为分支独立所有，保存/恢复同步重建 blocked 状态；
+WAIT 保留后继，WAKE/REQUEUE 修正线程选择与 syscall 参数。线程槽在捕获时保留，
+跨线程创建/销毁的恢复明确拒绝。当前快照为 v5，旧版本不会被默认为完整状态。
+同 hash 快速路径也恢复模型元数据。一般线程生命周期恢复与交织枚举仍未完成。
+
 ## 需要保证什么
 
 设 S 为模型状态，a 为选定 actor 的动作，o 为显式环境结果。至少需要：

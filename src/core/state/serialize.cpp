@@ -17,15 +17,13 @@ void syscall_info::serialize(Archive &ar)
 template <class Archive>
 void tracee_state::serialize(Archive &ar)
 {
-  // Serialize futex_state pointer specially
-  bool has_futex = (futex_state != nullptr);
+  bool has_futex = futex_state.has_value();
   ar(has_futex);
-  if (has_futex) {
-    if (Archive::is_loading::value && futex_state == nullptr) {
-      futex_state = new FutexState();
-    }
-    ar(*futex_state);
+  if constexpr (Archive::is_loading::value) {
+    if (has_futex) futex_state.emplace();
+    else futex_state.reset();
   }
+  if (has_futex) ar(*futex_state);
 
   // Safety check for threads vector size to prevent corruption
   size_t thread_count = threads.size();

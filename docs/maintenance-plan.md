@@ -238,3 +238,44 @@ BFS/DFS/random-search failure cleanup. Accept has 12 cases; the final Redis clie
 and tracer both exit 0 after exact SET/GET replies (7.65 seconds on this host).
 Touched state code passed warning checks; the scheduler retains its existing unused
 variable/parameter warnings. No whole-project static-analysis-clean claim is made.
+
+## Futex branch-state repair
+
+Invariant: waiting queues, thread blocked status and selected actor must describe
+the same saved state. Copying or exploring a wake/requeue branch must not mutate
+the source, and restoring must reconstruct eligibility before execution.
+
+Plan: regress copy/archive/capture/replay first; replace owning raw futex pointers
+with value ownership, derive blocked status from queues, preserve thread slots
+for unchanged thread sets and reject unsupported lifecycle restore. Correct wake
+selection and requeue ABI with syscall regressions; waiting becomes a saved
+successor. Keep unsupported timeout/PI paths explicit. Bump snapshots to v5 to
+reject older archives that omitted live queues. Test selected-actor publication
+when automatic execution skips a non-runnable slot. No scheduler consolidation.
+
+Results: queues use optional value ownership and archive loads clear stale queues;
+virtual slots and creation metadata survive capture. Restore rejects changed live
+thread sets before mutating memory, eliminating speculative recreation and positional
+register assignment. Same-hash restore still restores status and model metadata.
+REQUEUE paths are unified; WAIT is a suspended successor, WAKE updates removed
+waiters only. Dormant madvise handler no longer touches tracer memory or fabricates
+wakes. FIFO wake selection and complete actor enumeration remain unimplemented.
+
+Validation commands (GCC 14, all successful):
+
+```sh
+make NP=1 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4 tracer check check-exec check-state-io check-futex check-scenarios
+make NP=1 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j3 check-futex-snapshot check-mappings check-xstate
+make NP=2 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4 tracer check-identity check-port check-accept check-redis
+make NP=1 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4 check-scenarios check-futex-snapshot
+git diff --check
+```
+
+Evidence: six component cases, ten build-contract checks, thirteen ptrace futex
+cases, six execution-boundary cases, eleven native tracer scenarios, repeated
+snapshot restore and fresh-process disk read, existing mapping/XSTATE/I/O/identity/
+network gates, and Redis exact SET/GET (both client/tracer exit0, 7.65s).
+Independent review additionally checked Linux wake/requeue behavior experimentally.
+Touched units compile; warning checks retain existing unused parameters, so no
+whole-project lint-clean claim is made. Disk test uses shutdown/join as durability
+barrier; a discovered wait_for_completion race remains C26, not silently waived.

@@ -51,7 +51,7 @@ static std::vector<uint8_t> snapshot(uint64_t address)
     // A bogus cereal payload deliberately tests that malformed archives fail.
     std::vector<uint8_t> data(sizeof(StateDataHeader) + sizeof(RegionInfo) + 1 + 8 + sizeof(user_regs_struct), 0);
     auto* h = reinterpret_cast<StateDataHeader*>(data.data());
-    h->magic = 0x4453544D; h->version = 4; h->num_regions = 1;
+    h->magic = 0x4453544D; h->version = 5; h->num_regions = 1;
     h->tstate_offset = sizeof(StateDataHeader) + sizeof(RegionInfo);
     h->tstate_size = 1; h->maps_offset = h->tstate_offset + 1; h->maps_size = 0;
     h->regs_offset = h->maps_offset + 8;
@@ -130,13 +130,13 @@ int main()
         std::vector<maps_item> empty_maps;
         must_fail([&] { state.recover_mem_reg_snapshot(empty_maps, hash, child); }, "missing restore region accepted");
         auto* h = reinterpret_cast<StateDataHeader*>(data.data());
-        h->version = 3;
-        auto old_hash = save();
-        must_fail([&] { tracee_state invalid(old_hash); }, "v3 archive accepted");
-        must_fail([&] { free(read_mem(child, old_hash, map.start, 1)); }, "v3 read accepted");
-        must_fail([&] { state.recover_mem_reg_snapshot(maps, old_hash, child); }, "v3 restore accepted");
-        must_fail([&] { state.restore_memory_mappings(old_hash, child, maps); }, "v3 mappings accepted");
         h->version = 4;
+        auto old_hash = save();
+        must_fail([&] { tracee_state invalid(old_hash); }, "v4 archive accepted");
+        must_fail([&] { free(read_mem(child, old_hash, map.start, 1)); }, "v4 read accepted");
+        must_fail([&] { state.recover_mem_reg_snapshot(maps, old_hash, child); }, "v4 restore accepted");
+        must_fail([&] { state.restore_memory_mappings(old_hash, child, maps); }, "v4 mappings accepted");
+        h->version = 5;
         auto* r = reinterpret_cast<RegionInfo*>(data.data() + sizeof(StateDataHeader));
         r->offset = UINT64_MAX;
         auto bad_hash = save();
@@ -146,7 +146,7 @@ int main()
         munmap(page, 4096);
         std::filesystem::current_path(cwd);
         std::filesystem::remove_all(directory);
-        puts("PASS state I/O: short/error capture not published; short/error restore rejected; saved reads, missing ranges/states, corrupt archives/regions and all v3 readers");
+        puts("PASS state I/O: short/error capture not published; short/error restore rejected; saved reads, missing ranges/states, corrupt archives/regions and all v4 readers");
         return 0;
     } catch (const std::exception& error) {
         if (child > 0) { kill(child, SIGKILL); waitpid(child, nullptr, 0); }

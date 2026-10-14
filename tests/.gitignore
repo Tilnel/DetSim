@@ -32,3 +32,8 @@
 !/raft/*
 !fs_root/
 !/fs_root/**
+
+!futex_snapshot.mk
+!futex_snapshot_integration.cpp
+!futex.mk
+!futex_integration.cpp

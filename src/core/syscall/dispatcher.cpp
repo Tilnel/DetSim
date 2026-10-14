@@ -338,36 +338,10 @@ void SyscallDispatcher::handle_exit_group_enter(pid_t pid, syscall_info& info)
 
 void SyscallDispatcher::handle_futex_enter(pid_t pid, syscall_info& info)
 {
-    // For futex operations that can block (FUTEX_WAIT, FUTEX_WAIT_BITSET),
-    // we need to skip the real syscall to prevent blocking.
-    // The emulation will handle these in handle_futex_exit.
-    int futex_op = (int)info.args[1];
-    int op = futex_op & 0x7F;
-
-    switch (op) {
-        case FUTEX_WAIT:
-        case FUTEX_WAIT_BITSET:
-            // Skip the real syscall - it will be fully emulated on exit
-            tracee_set_orig_rax(pid, -1);
-            LOG_DEBUG("FUTEX_WAIT/WAIT_BITSET: skipping real syscall");
-            break;
-
-        case FUTEX_WAKE:
-        case FUTEX_WAKE_BITSET:
-        case FUTEX_REQUEUE:
-        case FUTEX_CMP_REQUEUE:
-            // These don't block, but we still want to emulate them
-            // Skip the real syscall
-            tracee_set_orig_rax(pid, -1);
-            LOG_DEBUG("FUTEX_WAKE/REQUEUE: skipping real syscall for emulation");
-            break;
-
-        default:
-            // For other futex operations, let them execute normally
-            // but they won't be emulated
-            LOG_DEBUG("FUTEX op %d: passing through", op);
-            break;
-    }
+    (void)info;
+    // Every futex operation is modeled or explicitly rejected on exit.
+    // Unsupported PI operations must never block or mutate host kernel state.
+    tracee_set_orig_rax(pid, -1);
 }
 
 int SyscallDispatcher::handle_network_exit(pid_t pid, syscall_info& info)

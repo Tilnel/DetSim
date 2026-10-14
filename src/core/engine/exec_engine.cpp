@@ -231,6 +231,11 @@ ExecResult ExecutionEngine::execute_step(const sys_state& state, syscall_info& i
             continue;
         }
 
+        // Handlers address per-thread state through this selected actor.
+        // Round-robin may have skipped the saved current thread.
+        ptmc_state.current_thread_idx[tracee_idx] = thread_idx;
+        ptmc_state.running_state.child[tracee_idx].current_thread_idx = thread_idx;
+
         int result = do_single_syscall(pid, info);
 
         switch (result) {

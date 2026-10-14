@@ -13,9 +13,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <optional>
+#include "futexstate.h"
 
-// Forward declaration for FutexState
-class FutexState;
 
 /* ======================================================================
  * State Data Format (shared with StateStore)
@@ -25,7 +24,7 @@ class FutexState;
 struct __attribute__((packed)) StateDataHeader
 {
   uint32_t magic;         // 'DSTM' = 0x4453544D
-  uint32_t version;       // 4 (per-thread XSTATE; older snapshots are incompatible)
+  uint32_t version;       // 5 (owned futex queues and stable thread slots)
   uint32_t num_regions;   // number of memory regions
   uint64_t tstate_offset; // offset to serialized tracee_state
   uint64_t tstate_size;   // size of serialized tracee_state
@@ -196,7 +195,7 @@ typedef struct tracee_state
   int current_thread_idx;                   // Currently selected thread index
 
   /* Futex state for thread synchronization */
-  struct FutexState *futex_state;           // Futex emulation state (pointer for lazy init)
+  std::optional<FutexState> futex_state;   // Branch-owned queues, keyed by virtual TID
 
   /* ---------------------------------------------------------
    * Thread Management Methods
@@ -232,7 +231,7 @@ typedef struct tracee_state
   tracee_state()
       : si{}, brk(0), tv{0, 0}, fs_state(), sock_state(),
         raft_state(), threads(), thread_create_records(),
-        main_tid(0), current_thread_idx(0), futex_state(nullptr)
+        main_tid(0), current_thread_idx(0), futex_state()
   {
   }
 
@@ -269,6 +268,7 @@ typedef struct tracee_state
 
   /* Main recovery entry */
   void recover_running_state(int index, hash_type ts_hash) const;
+  void restore_runtime_state(int index) const;
 
   /* Restore memory mappings for brk */
   void restore_memory_mappings(hash_type ts_hash, int pid, std::vector<maps_item> &maps_out) const;
@@ -280,8 +280,6 @@ typedef struct tracee_state
    * Thread Recovery Helpers
    * --------------------------------------------------------- */
 private:
-  void terminate_extra_threads(pid_t main_pid, int threads_to_terminate) const;
-  void create_missing_threads(pid_t main_pid) const;
   void restore_thread_registers(pid_t main_pid) const;
 
 public:

@@ -146,7 +146,7 @@ static void futex_requeue_and_range()
   wait(state, 2, 0x1000);
   wait(state, 3, 0x1000);
   // Exercise the dispatcher path; the direct helper is covered separately.
-  CHECK(state.handle_futex(9, 0x1000, FUTEX_REQUEUE, 1, 0, 0x2000, 1) == 1);
+  CHECK(state.handle_futex(9, 0x1000, FUTEX_REQUEUE, 1, 1, 0x2000, 99) == 2);
   CHECK(!state.is_thread_waiting(1));
   CHECK(state.get_wait_address(2) == 0x2000);
   CHECK((state.get_waiters(0x1000) == std::vector<pid_t>{3}));
@@ -170,9 +170,9 @@ static void futex_requeue_index_and_archive()
     wait(direct, tid, 0x1000);
     wait(dispatched, tid, 0x1000);
   }
-  CHECK(direct.futex_requeue(0x1000, 0x2000, 1, 1) == 1);
-  CHECK(dispatched.handle_futex(9, 0x1000, FUTEX_REQUEUE, 1, 0, 0x2000, 1) ==
-        1);
+  CHECK(direct.futex_requeue(0x1000, 0x2000, 1, 1) == 2);
+  CHECK(dispatched.handle_futex(9, 0x1000, FUTEX_REQUEUE, 1, 1, 0x2000, 99) ==
+        2);
   CHECK(direct.get_wait_address(2) == 0x2000);
   CHECK(direct.get_wait_address(2) == dispatched.get_wait_address(2));
   CHECK(direct.get_waiters(0x1000) == dispatched.get_waiters(0x1000));
@@ -195,13 +195,36 @@ static void futex_requeue_index_and_archive()
   CHECK(direct.is_thread_waiting(2));
 }
 
+static void futex_requeue_validation()
+{
+  FutexState state;
+  for (pid_t tid : {1, 2, 3}) wait(state, tid, 0x1000);
+  uint64_t value = 7;
+  CHECK(state.handle_futex(9, 0x1000, FUTEX_CMP_REQUEUE, 1, 1, 0x2000, 8, &value) == -EAGAIN);
+  CHECK(state.get_waiters(0x1000).size() == 3);
+  CHECK(state.futex_requeue(0x1000, 0x2000, -1, 1) == -EINVAL);
+  CHECK(state.futex_requeue(0x1000, 0x2001, 1, 1) == -EINVAL);
+  CHECK(state.futex_requeue(0x1000, 0x2000, 1, -1) == -EINVAL);
+  CHECK(state.get_waiters(0x1000).size() == 3);
+  CHECK(state.futex_requeue(0x1000, 0x1000, 1, 2) == 3);
+  CHECK((state.get_waiters(0x1000) == std::vector<pid_t>{2, 3}));
+  CHECK(state.get_wait_address(2) == 0x1000);
+  CHECK(state.handle_futex(9, 0x1000, FUTEX_CMP_REQUEUE, 0, 1, 0x2000, 7, &value) == 1);
+  CHECK(state.get_wait_address(2) == 0x2000);
+  CHECK(state.get_wait_address(3) == 0x1000);
+  value = 0xffffffff;
+  CHECK(state.handle_futex(4, 0x3000, FUTEX_WAIT, -1, 0, 0, 0, &value) == 0);
+  CHECK(state.handle_futex(5, 0x3001, FUTEX_WAIT, -1, 0, 0, 0, &value) == -EINVAL);
+}
+
 int main()
 {
+  futex_requeue_validation();
   fd_snapshot_and_copy();
   futex_wait_and_wake();
   futex_snapshot_and_copy();
   futex_requeue_and_range();
   futex_requeue_index_and_archive();
-  std::cout << "PASS: 5 state component cases (allocation, copy, archive, "
+  std::cout << "PASS: 6 state component cases (allocation, copy, archive, "
                "wait/wake/requeue/range)\n";
 }

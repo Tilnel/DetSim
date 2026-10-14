@@ -10,7 +10,7 @@ NP ?= 2
 endif
 
 # Integration fixtures use one node unless explicitly overridden.
-ifneq ($(filter check-integration check-dwarf check-elf check-scenarios check-xstate check-exec check-state-io check-mappings,$(MAKECMDGOALS)),)
+ifneq ($(filter check-integration check-dwarf check-elf check-scenarios check-xstate check-exec check-state-io check-mappings check-futex-snapshot check-futex,$(MAKECMDGOALS)),)
 NP ?= 1
 endif
 
@@ -113,7 +113,7 @@ check-build-contracts:
 check: test check-build-contracts
 
 # Optional fragments are absent in the disposable build-contract fixtures.
--include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk
+-include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk tests/futex_snapshot.mk tests/futex.mk
 check-integration: check-dwarf check-elf
 
 # This gate executes native programs via ptrace; keep it separate from make check.
@@ -132,6 +132,8 @@ help:
 	@echo 'make check-scenarios        Build NP=1 tracer and run isolated ptrace scenarios'
 	@echo 'make check-accept           NP=2 remote-memory accept regression'
 	@echo 'make check-xstate           FP/SIMD capture, restore and archive regression'
+	@echo 'make check-futex-snapshot   Futex branch capture/copy/archive/restore regression'
+	@echo 'make check-futex            Futex syscall wait/wake/requeue regression'
 	@echo 'make check-exec             Syscall input and automatic-step boundary regression'
 	@echo 'make check-state-io         Snapshot format and exact I/O failure regression'
 	@echo 'make check-mappings         Private mapping contents and protections regression'

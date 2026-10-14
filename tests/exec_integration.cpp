@@ -53,7 +53,9 @@ static void run_case(int mode) {
     ptmc_state.cursor = 0;
     ptmc_state.pids[0] = child;
     ptmc_state.current_thread_idx[0] = 0;
-    ptmc_state.running_state.child[0].add_thread(child, 0, 0, 0, true);
+    if (mode == 5)
+        ptmc_state.running_state.child[0].add_thread(0, 0, 0, 0, true);
+    ptmc_state.running_state.child[0].add_thread(child, 0, 0, 0, mode != 5);
     thread::init_all(ptmc_state);
     ExecutionEngine engine;
     syscall_info info{};
@@ -78,6 +80,10 @@ static void run_case(int mode) {
                     "each retry or sleep must return a scheduling checkpoint");
             require(info.nr == (mode == 1 ? SYS_recvfrom : mode == 2 ? SYS_nanosleep : mode == 3 ? SYS_clock_nanosleep : SYS_getpid),
                     "unexpected syscall boundary");
+            if (mode == 5) {
+                require(ptmc_state.current_thread_idx[0] == 1, "automatic actor selection not published to syscall handlers");
+                require(ptmc_state.running_state.child[0].current_thread_idx == 1, "automatic actor selection not recorded for capture");
+            }
             if (mode == 1) require(static_cast<long>(info.rval) == -EAGAIN, "empty receive must return EAGAIN");
         }
     }
@@ -87,9 +93,9 @@ static void run_case(int mode) {
 
 int main() {
     const char *names[] = {"current syscall entry args", "receive retry yields",
-                           "nanosleep yields", "clock_nanosleep yields", "getpid busy loop yields"};
+                           "nanosleep yields", "clock_nanosleep yields", "getpid busy loop yields", "automatic actor selection"};
     int failures = 0;
-    for (int mode = 0; mode < 5; ++mode) {
+    for (int mode = 0; mode < 6; ++mode) {
         fflush(nullptr);
         pid_t test = fork();
         if (test == 0) {

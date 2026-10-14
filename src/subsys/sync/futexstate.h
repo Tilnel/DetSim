@@ -87,7 +87,7 @@ public:
     // Returns: number of threads woken
     int futex_wake(uint64_t uaddr, int nr_wake, uint32_t bitset = ~0);
 
-    // Requeue waiters from one address to another
+    // Requeue waiters from one address to another; return woken + moved.
     int futex_requeue(uint64_t uaddr1, uint64_t uaddr2, int nr_wake, int nr_requeue);
 
     // Wake all waiters whose address falls within [start, end) range

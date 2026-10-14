@@ -18,6 +18,8 @@
 #include <sys/wait.h>
 #include <sys/ptrace.h>
 #include <fcntl.h>
+#include <sys/uio.h>
+#include <stdexcept>
 
 /* ======================================================================
  * Network Handlers
@@ -291,43 +293,10 @@ int handle_munmap(pid_t pid, syscall_info &info) {
 }
 
 int handle_madvise(pid_t pid, syscall_info &info) {
-    void *addr = (void *)info.args[0];
-    size_t length = info.args[1];
-    int advice = (int)info.args[2];
-
-    // For MADV_DONTNEED, we need to wake any futex waiters on this memory range
-    // because the kernel would unmap these pages, causing futex waits to return
-    if (advice == MADV_DONTNEED) {
-        int tracee_idx = ptmc_state.cursor;
-        auto& child_state = ptmc_state.running_state.child[tracee_idx];
-
-        if (child_state.futex_state) {
-            uint64_t start = (uint64_t)addr;
-            uint64_t end = start + length;
-            int woken = child_state.futex_state->wake_waiters_in_range(start, end);
-            if (woken > 0) {
-                LOG_INFO("madvise(MADV_DONTNEED): woke %d futex waiters in range [%p, %p)",
-                         woken, addr, (void*)end);
-
-                // Mark the woken threads as unblocked in ptmc_state
-                for (int i = 0; i < MAX_THREADS_PER_PROCESS; i++) {
-                    if (ptmc_state.thread_blocked[tracee_idx][i]) {
-                        // Check if this thread is still waiting on a futex
-                        int virtual_tid = i + 1;
-                        if (!child_state.futex_state->is_thread_waiting(virtual_tid)) {
-                            ptmc_state.thread_blocked[tracee_idx][i] = false;
-                            LOG_DEBUG("Thread %d unblocked after madvise", i);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Pass through to kernel
-    long ret = syscall(SYS_madvise, addr, length, advice);
-    tracee_set_rax(pid, ret);
-    info.rval = ret;
+    (void)pid;
+    (void)info;
+    // madvise has already run in the tracee. Discarding private pages does
+    // not wake futex waiters, and guest addresses must not touch tracer VMAs.
     return CKPT_NO;
 }
 
@@ -473,69 +442,48 @@ namespace handlers {
 namespace futex {
 
 int handle(pid_t pid, syscall_info &info) {
-    int tracee_idx = ptmc_state.cursor;
-    auto& child_state = ptmc_state.running_state.child[tracee_idx];
+    const int tracee_idx = ptmc_state.cursor;
+    auto &child = ptmc_state.running_state.child[tracee_idx];
+    if (!child.futex_state) child.futex_state.emplace();
+    auto &futex = *child.futex_state;
+    const uint64_t uaddr = info.args[0];
+    const int futex_op = static_cast<int>(info.args[1]);
+    const int op = futex_op & FUTEX_CMD_MASK;
+    const int thread_idx = ptmc_state.current_thread_idx[tracee_idx];
+    const pid_t virtual_tid = child.threads.at(thread_idx).tid;
+    const auto previous_waiters = futex.get_waiters(uaddr);
 
-    // Initialize FutexState if needed
-    if (!child_state.futex_state) {
-        child_state.futex_state = new FutexState();
-    }
-
-    uint64_t uaddr = info.args[0];
-    int futex_op = (int)info.args[1];
-    int val = (int)info.args[2];
-    uint64_t timeout = info.args[3];
-    uint64_t uaddr2 = info.args[4];
-    int val3 = (int)info.args[5];
-
-    // For FUTEX_WAIT, we need to read the current value at uaddr
-    uint64_t stackval = 0;
-    if ((futex_op & 0x7F) == FUTEX_WAIT || (futex_op & 0x7F) == FUTEX_WAIT_BITSET) {
-        tracee_read_mem(pid, (void*)uaddr, &stackval, sizeof(int));
-    }
-
-    // Use virtual TID (thread index + 1) instead of physical PID
-    int thread_idx = ptmc_state.current_thread_idx[tracee_idx];
-    int virtual_tid = thread_idx + 1;
-
-    int result = child_state.futex_state->handle_futex(
-        virtual_tid, uaddr, futex_op, val, timeout, uaddr2, val3,
-        (futex_op & 0x7F) == FUTEX_WAIT || (futex_op & 0x7F) == FUTEX_WAIT_BITSET ? &stackval : nullptr);
-
-    // Check if current thread is now waiting on futex (must check BEFORE setting result)
-    int op_type = futex_op & 0x7F;
-    if (op_type == FUTEX_WAIT || op_type == FUTEX_WAIT_BITSET) {
-        if (child_state.futex_state->is_thread_waiting(virtual_tid)) {
-            LOG_INFO("Thread %d (vTID %d) is now waiting on futex - DISCARDING", pid, virtual_tid);
-            ptmc_state.thread_blocked[tracee_idx][thread_idx] = true;
-            // Return -EAGAIN so the tracee knows the wait didn't complete
-            tracee_set_rax(pid, (uint64_t)-EAGAIN);
-            info.rval = (uint64_t)-EAGAIN;
-            return CKPT_DISCARD;
+    // A futex word is exactly 32 bits. Never synthesize zero after a failed
+    // guest read: that can turn EFAULT into a successful blocking wait.
+    uint64_t value = 0;
+    uint64_t *current_value = nullptr;
+    if (op == FUTEX_WAIT || op == FUTEX_WAIT_BITSET || op == FUTEX_CMP_REQUEUE) {
+        uint32_t word = 0;
+        iovec local{&word, sizeof(word)};
+        iovec remote{reinterpret_cast<void *>(uaddr), sizeof(word)};
+        if (process_vm_readv(pid, &local, 1, &remote, 1, 0) == sizeof(word)) {
+            value = word;
+            current_value = &value;
         }
     }
+    const int result = futex.handle_futex(virtual_tid, uaddr, futex_op,
+        static_cast<int>(info.args[2]), info.args[3], info.args[4],
+        static_cast<int>(info.args[5]), current_value);
+    tracee_set_rax(pid, static_cast<uint64_t>(result));
+    info.rval = static_cast<uint64_t>(result);
+    if ((op == FUTEX_WAIT || op == FUTEX_WAIT_BITSET) && result == 0)
+        ptmc_state.thread_blocked[tracee_idx][thread_idx] = true;
 
-    if (result < 0) {
-        tracee_set_rax(pid, (uint64_t)result);
-        info.rval = (uint64_t)result;
-    } else {
-        tracee_set_rax(pid, result);
-        info.rval = result;
+    // Requeued waiters remain blocked. Only waiters removed by this wake
+    // become runnable; the surviving queue is not the set that was woken.
+    for (pid_t tid : previous_waiters) {
+        if (futex.is_thread_waiting(tid)) continue;
+        for (size_t i = 0; i < child.threads.size(); ++i)
+            if (child.threads[i].tid == tid)
+                ptmc_state.thread_blocked[tracee_idx][i] = false;
     }
-
-    if (op_type == FUTEX_WAKE || op_type == FUTEX_WAKE_BITSET) {
-        if (result > 0) {
-            LOG_DEBUG("FUTEX_WAKE waked %d threads, unblocking them", result);
-            auto waiters = child_state.futex_state->get_waiters(uaddr);
-            for (pid_t waiter_vtid : waiters) {
-                int waiter_idx = waiter_vtid - 1;
-                if (waiter_idx >= 0 && waiter_idx < 64) {
-                    ptmc_state.thread_blocked[tracee_idx][waiter_idx] = false;
-                }
-            }
-        }
-    }
-
+    // A successful wait is a suspended successor at syscall exit. The saved
+    // return value becomes visible only after another transition wakes it.
     return CKPT_YES;
 }
 

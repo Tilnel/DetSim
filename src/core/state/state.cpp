@@ -45,8 +45,8 @@ static void validate_state_header(const std::vector<uint8_t>& data)
     throw std::runtime_error("Truncated state snapshot header");
   StateDataHeader header;
   memcpy(&header, data.data(), sizeof(header));
-  if (header.magic != 0x4453544D || header.version != 4)
-    throw std::runtime_error("Incompatible state snapshot: requires format version 4 (XSTATE)");
+  if (header.magic != 0x4453544D || header.version != 5)
+    throw std::runtime_error("Incompatible state snapshot: requires format version 5 (thread/futex state)");
   auto in_bounds = [&](uint64_t offset, uint64_t size) {
     return offset <= data.size() && size <= data.size() - offset;
   };
@@ -289,7 +289,7 @@ int sys_state::save_metadata() const
 
 /* Load tracee_state from integrated StateStore data */
 tracee_state::tracee_state(hash_type hash)
-  : threads(), thread_create_records(), main_tid(0), current_thread_idx(0), futex_state(nullptr)
+  : threads(), thread_create_records(), main_tid(0), current_thread_idx(0), futex_state()
 {
   // Handle invalid hash (0 means uninitialized/invalid)
   if (hash == 0)
@@ -692,113 +692,6 @@ void tracee_state::recover_mem_reg_snapshot(std::vector<maps_item> &maps,
 }
 
 /* Main entry: recover running state for a process */
-/* Helper: Terminate threads that shouldn't exist during recovery */
-void tracee_state::terminate_extra_threads(pid_t main_pid, int threads_to_terminate) const
-{
-  auto current_threads = get_thread_list(main_pid);
-
-  for (pid_t current_tid : current_threads) {
-    if (threads_to_terminate <= 0) break;
-
-    // Don't terminate the main thread
-    if (current_tid == main_pid) {
-      continue;
-    }
-
-    // Check if this physical TID is in the saved state as a live thread
-    bool should_exist = false;
-    for (const auto& ts : threads) {
-      if (ts.physical_tid == current_tid) {
-        should_exist = true;
-        break;
-      }
-    }
-
-    if (should_exist) {
-      continue;  // This thread should exist, skip
-    }
-
-    LOG_INFO("Terminating thread %d", current_tid);
-
-    // Use tracee_do_syscall to make the thread call exit
-    int status;
-    pid_t result = waitpid(current_tid, &status, WNOHANG);
-    if (result == 0) {
-      // Thread is running, we need to stop it first
-      LOG_WARN("Thread %d is running, cannot terminate cleanly", current_tid);
-    } else if (result == current_tid) {
-      // Thread has stopped or exited
-      if (WIFSTOPPED(status)) {
-        // Thread is stopped, we can make it exit
-        tracee_do_syscall(current_tid, SYS_exit, 0, 0, 0, 0, 0, 0);
-        LOG_INFO("Terminated thread %d via exit syscall", current_tid);
-        threads_to_terminate--;
-      }
-    }
-  }
-}
-
-/* Helper: Create threads that don't exist during recovery */
-void tracee_state::create_missing_threads(pid_t main_pid) const
-{
-  auto current_threads = get_thread_list(main_pid);
-  std::set<pid_t> current_tids(current_threads.begin(), current_threads.end());
-
-  for (const auto& target_ts : threads) {
-    // Skip exited threads (physical_tid == 0)
-    if (target_ts.physical_tid == 0) {
-      LOG_INFO("Skipping exited thread with virtual TID %d", target_ts.tid);
-      continue;
-    }
-
-    // Skip main thread (virtual TID 1)
-    if (target_ts.tid == 1) continue;
-
-    // Check if this saved thread already exists in current threads
-    if (current_tids.count(target_ts.physical_tid) > 0) {
-      LOG_DEBUG("Thread with virtual TID %d already exists (physical=%d)",
-                target_ts.tid, target_ts.physical_tid);
-      continue;
-    }
-
-    LOG_INFO("Creating thread with virtual TID %d (clone_flags=0x%lx)",
-             target_ts.tid, target_ts.clone_flags);
-
-    // Only create if we have clone flags
-    if (target_ts.clone_flags != 0) {
-      // Prepare clone parameters
-      uint64_t flags = target_ts.clone_flags | SIGCHLD | CLONE_PTRACE;
-
-      // Execute clone in the main thread
-      pid_t new_tid = (pid_t)tracee_do_syscall((int)main_pid, SYS_clone,
-                                                flags,
-                                                target_ts.stack_addr,
-                                                (uint64_t)target_ts.ptid,
-                                                0, 0, 0);
-
-      if (new_tid > 0) {
-        LOG_INFO("Created new thread %d (requested virtual TID %d)", new_tid, target_ts.tid);
-
-        // Wait for the new thread to stop
-        int wstatus;
-        pid_t waited = waitpid(new_tid, &wstatus, 0);
-        if (waited == new_tid && WIFSTOPPED(wstatus)) {
-          // Restore registers for the new thread
-          struct user_regs_struct new_regs = target_ts.regs;
-          // RAX contains return value from clone (0 for child)
-          new_regs.rax = 0;
-          ptrace(PTRACE_SETREGS, new_tid, NULL, &new_regs);
-          LOG_INFO("Restored registers for new thread %d", new_tid);
-        }
-      } else {
-        LOG_ERROR("Failed to create thread: %ld", (long)new_tid);
-      }
-    } else {
-      LOG_WARN("No clone flags for thread %d, cannot recreate", target_ts.tid);
-    }
-  }
-}
-
 /* Helper: Restore registers for all threads during recovery */
 void tracee_state::restore_thread_registers(pid_t main_pid) const
 {
@@ -821,15 +714,6 @@ void tracee_state::restore_thread_registers(pid_t main_pid) const
       }
     }
 
-    // If exact match not found, use position-based fallback
-    // This handles the case where threads were recreated
-    if (physical_tid == -1) {
-      int virtual_idx = target_ts.tid - 1;  // Convert to 0-based index
-      if (virtual_idx >= 0 && virtual_idx < (int)current_threads.size()) {
-        physical_tid = current_threads[virtual_idx];
-      }
-    }
-
     if (physical_tid > 0) {
       // Restore registers for this thread
       if (ptrace(PTRACE_SETREGS, physical_tid, NULL, (void*)&target_ts.regs) == 0) {
@@ -848,6 +732,15 @@ void tracee_state::restore_thread_registers(pid_t main_pid) const
 void tracee_state::recover_running_state(int index, hash_type ts_hash) const
 {
   pid_t main_pid = ptmc_state.pids[index];
+  // Lifecycle restoration needs a real virtual-to-physical remapping contract.
+  // Refuse changed thread sets before touching memory instead of guessing by position.
+  const auto current_threads = get_thread_list(main_pid);
+  std::set<pid_t> live(current_threads.begin(), current_threads.end());
+  std::set<pid_t> saved;
+  for (const auto& thread : threads)
+    if (thread.physical_tid) saved.insert(thread.physical_tid);
+  if (live != saved)
+    throw std::runtime_error("Unsupported snapshot restore across thread creation or exit");
   /* Restore the kernel heap extent before reconciling VMAs. */
   if (tracee_do_syscall(main_pid, SYS_brk, brk, 0, 0, 0, 0, 0) != brk)
     throw std::runtime_error("Cannot restore snapshot brk");
@@ -855,36 +748,27 @@ void tracee_state::recover_running_state(int index, hash_type ts_hash) const
   restore_memory_mappings(ts_hash, main_pid, maps);
   recover_mem_reg_snapshot(maps, ts_hash, main_pid);
 
-  /* ======================================================================
-   * Multi-threading support: restore thread state
-   * ====================================================================== */
-
-  // Count non-exited threads in saved state
-  size_t saved_live_thread_count = 0;
-  for (const auto& ts : threads) {
-    if (ts.physical_tid != 0) {
-      saved_live_thread_count++;
-    }
-  }
-
-  // Get current thread list
-  auto current_threads = get_thread_list(main_pid);
-
-  LOG_INFO("Recovering threads for process %d: current=%zu, saved_live=%zu, saved_total=%zu",
-           index, current_threads.size(), saved_live_thread_count, threads.size());
-
-  // Step 1: Terminate threads that shouldn't exist
-  if (current_threads.size() > saved_live_thread_count) {
-    int threads_to_terminate = current_threads.size() - saved_live_thread_count;
-    LOG_INFO("Need to terminate %d threads", threads_to_terminate);
-    terminate_extra_threads(main_pid, threads_to_terminate);
-  }
-
-  // Step 2: Create threads that don't exist
-  create_missing_threads(main_pid);
-
-  // Step 3: Restore registers for all threads
   restore_thread_registers(main_pid);
+
+  restore_runtime_state(index);
+}
+
+void tracee_state::restore_runtime_state(int index) const
+{
+  auto& runtime = ptmc_state.running_state.child[index];
+  runtime.threads = threads;
+  runtime.thread_create_records = thread_create_records;
+  runtime.main_tid = main_tid;
+  runtime.current_thread_idx = current_thread_idx;
+  memmove(runtime.si, si, sizeof(si));
+  runtime.futex_state = futex_state;
+  for (int t = 0; t < MAX_THREADS_PER_PROCESS; ++t) {
+    ptmc_state.thread_blocked[index][t] =
+        t < static_cast<int>(threads.size()) && threads[t].physical_tid &&
+        futex_state && futex_state->is_thread_waiting(threads[t].tid);
+    ptmc_state.thread_exited[index][t] =
+        t < static_cast<int>(threads.size()) && !threads[t].physical_tid;
+  }
 
   // Restore current thread index
   ptmc_state.current_thread_idx[index] = current_thread_idx;
@@ -1015,65 +899,35 @@ hash_type tracee_state::save_full_state_to_state_store(int pid)
   }
   std::vector<uint8_t> maps_data(maps_text.begin(), maps_text.end());
 
-  // ========================================================================
-  // Multi-threading support: save all thread registers
-  // Use virtual TIDs (thread indices + 1) for consistency across save/restore
-  // ========================================================================
-  threads.clear();
-  auto thread_list = get_thread_list(pid);
+  // Keep virtual slots stable, including exited slots: futex queues refer to them.
+  const auto thread_list = get_thread_list(pid);
   if (thread_list.empty())
     throw std::runtime_error("Cannot capture an empty thread register set");
-
-  int virtual_tid = 1;
-  for (pid_t physical_tid : thread_list) {
-    struct user_regs_struct thread_regs;
-    if (ptrace(PTRACE_GETREGS, physical_tid, NULL, &thread_regs) == 0) {
-      thread_state ts;
-      ts.tid = virtual_tid;  // Use virtual TID (index + 1)
-      ts.regs = thread_regs;
-      ts.xstate = capture_xstate(physical_tid);
-
-      // Store physical TID for stable mapping
-      ts.physical_tid = physical_tid;
-
-      // Find clone flags from creation records by virtual TID
-      ts.clone_flags = 0;
-      for (const auto& record : thread_create_records) {
-        if ((int)record.virtual_tid == ts.tid) {
-          ts.clone_flags = record.clone_flags;
-          ts.stack_addr = record.stack_addr;
-          ts.ptid = record.ptid;
-          break;
-        }
-      }
-
-      ts.is_main = (physical_tid == pid);
-      threads.push_back(ts);
-
-      LOG_TRACE("Saved thread physical=%d virtual=%d (main=%d) registers",
-                physical_tid, ts.tid, ts.is_main);
-    } else {
-      throw std::runtime_error("Cannot capture registers for thread " + std::to_string(physical_tid));
-    }
-    virtual_tid++;
+  if (threads.empty()) {
+    for (pid_t physical_tid : thread_list)
+      add_thread(physical_tid, 0, 0, 0, physical_tid == pid);
   }
-
-  if (!threads.empty()) {
-    main_tid = 1;  // Main thread is always virtual TID 1
-    // Use the currently selected thread index from ptmc_state
-    int tracee_idx = -1;
-    for (int i = 0; i < NP; i++) {
-      if (ptmc_state.pids[i] == pid) {
-        tracee_idx = i;
-        break;
-      }
-    }
-    if (tracee_idx >= 0) {
-      current_thread_idx = ptmc_state.current_thread_idx[tracee_idx];
-    } else {
-      current_thread_idx = 0;
-    }
+  if (threads.size() > MAX_THREADS_PER_PROCESS)
+    throw std::runtime_error("Snapshot exceeds supported thread count");
+  std::set<pid_t> expected;
+  for (size_t i = 0; i < threads.size(); ++i) {
+    auto& thread = threads[i];
+    if (thread.tid != static_cast<pid_t>(i + 1))
+      throw std::runtime_error("Invalid virtual thread slot in snapshot");
+    if (!thread.physical_tid) continue;
+    if (!expected.insert(thread.physical_tid).second)
+      throw std::runtime_error("Duplicate physical thread in snapshot");
   }
+  if (expected != std::set<pid_t>(thread_list.begin(), thread_list.end()))
+    throw std::runtime_error("Cannot capture untracked thread creation or exit");
+  for (auto& thread : threads) {
+    if (!thread.physical_tid) continue;
+    if (ptrace(PTRACE_GETREGS, thread.physical_tid, nullptr, &thread.regs) == -1)
+      throw std::runtime_error("Cannot capture thread registers");
+    thread.xstate = capture_xstate(thread.physical_tid);
+  }
+  if (current_thread_idx < 0 || current_thread_idx >= static_cast<int>(threads.size()))
+    throw std::runtime_error("Invalid selected thread in snapshot");
 
   LOG_INFO("Saved state for %zu threads in process %d", threads.size(), pid);
 
@@ -1107,7 +961,7 @@ hash_type tracee_state::save_full_state_to_state_store(int pid)
 
   StateDataHeader *header = (StateDataHeader *)all_data;
   header->magic = 0x4453544D;
-  header->version = 4;
+  header->version = 5;
   header->num_regions = regions.size();
   header->tstate_offset = header_size + regions_size;
   header->tstate_size = tstate_size;
@@ -1190,8 +1044,15 @@ hash_type tracee_state::save_full_state_to_state_store(int pid)
 
 /* Create tracee_state from running process (capture) */
 tracee_state::tracee_state(int which, const struct syscall_info info[])
-  : threads(), thread_create_records(), main_tid(0), current_thread_idx(0), futex_state(nullptr)
+  : threads(), thread_create_records(), main_tid(0), current_thread_idx(0), futex_state()
 {
+  const auto& runtime = ptmc_state.running_state.child[which];
+  threads = runtime.threads;
+  thread_create_records = runtime.thread_create_records;
+  main_tid = runtime.main_tid;
+  current_thread_idx = ptmc_state.current_thread_idx[which];
+  futex_state = runtime.futex_state;
+
   /* Save syscall info */
   memcpy(si, info, sizeof(syscall_info) * MAX_THREADS_PER_PROCESS);
 
@@ -1419,26 +1280,12 @@ void sys_state::recover_running_state() const
   ptmc_state.error_bound = error_bound;
   for (int i = 0; i < NP; i++)
   {
-    if (ts_hash[i] == ptmc_state.running_state.ts_hash[i])
-    {
-      LOG_DEBUG("tracee %d already in running state, skipping recovery", i);
-      continue;
-    }
-
-    // Update ptmc_state.status from saved state
-    // This ensures loaded states have correct process status
     ptmc_state.status[i] = status[i];
-
-    // Also reset thread_exited array based on saved thread state
-    // This is important for multi-threading: when loading a state,
-    // we need to restore which threads were marked as exited
-    const auto& saved_threads = child[i].threads;
-    for (int t = 0; t < 64; t++) {
-      if (t < (int)saved_threads.size()) {
-        ptmc_state.thread_exited[i][t] = (saved_threads[t].physical_tid == 0);
-      } else {
-        ptmc_state.thread_exited[i][t] = false;
-      }
+    if (ts_hash[i] == ptmc_state.running_state.ts_hash[i]) {
+      // The register/memory image is unchanged, but runtime runnability and
+      // selection can have changed independently of its stored hash.
+      child[i].restore_runtime_state(i);
+      continue;
     }
 
     if (DISALIVE(status[i]))
