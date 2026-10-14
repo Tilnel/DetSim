@@ -209,10 +209,9 @@ void ensure_directory_for_file(const std::string &path)
 // Detect if binary is a Go program by checking for Go-specific ELF sections
 int is_go_program(const char *filename)
 {
-  // Force output to stderr for debugging
-  fprintf(stderr, "*** is_go_program called with: %s", filename);
   LOG_INFO("is_go_program: checking %s", filename);
-  elf_version(EV_CURRENT);
+  if (elf_version(EV_CURRENT) == EV_NONE)
+    return 0;
   int fd = open(filename, O_RDONLY);
   if (fd < 0) {
     LOG_INFO("is_go_program: open failed: %s", strerror(errno));
@@ -230,11 +229,16 @@ int is_go_program(const char *filename)
   // Check for Go-specific sections
   Elf_Scn *scn = NULL;
   size_t shstrndx;
+  if (elf_getshdrstrndx(e, &shstrndx) != 0) {
+    elf_end(e);
+    close(fd);
+    return 0;
+  }
   int is_go = 0;
   while ((scn = elf_nextscn(e, scn)) != NULL) {
     GElf_Shdr shdr;
     if (gelf_getshdr(scn, &shdr) != NULL) {
-      const char *name = elf_strptr(e, elf_getshdrstrndx(e, &shstrndx), shdr.sh_name);
+      const char *name = elf_strptr(e, shstrndx, shdr.sh_name);
       if (name && (strcmp(name, ".go.buildinfo") == 0 ||
                      strcmp(name, ".gopclntab") == 0 ||
                      strncmp(name, ".go.", 4) == 0)) {

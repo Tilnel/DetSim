@@ -1,77 +1,44 @@
-# Makefile for DWARF parser unit tests
-# Run from project root: make -f tests/Makefile
-
+# Run from the project root: make -f tests/Makefile test
+# Existing cereal headers are required; no ptrace, tracees, or NP setting.
+ifeq ($(origin CXX),default)
 CXX = g++
-CC = gcc
-CXXFLAGS = -std=c++20 -I. -Isrc -Isrc/core -Isrc/utils -Isrc/subsys -Isrc/ui -O0 -g -DDWARF_TEST_MODE
-LDFLAGS = -ldwarf -lfmt -lelf -lunwind -lunwind-x86_64 -lunwind-ptrace
+endif
+CXXFLAGS ?= -O0 -g
+BUILD_DIR ?= build/tests
+TEST_CPPFLAGS = -Isrc -Isrc/core -Isrc/utils -Isrc/ui -Ithird_party/cereal/include
+TEST_CXXFLAGS = -std=c++20 -Wall -Wextra
+SOURCES = tests/state_components_test.cpp tests/component_log_stubs.cpp \
+          src/subsys/fs/fd_manager.cpp src/subsys/sync/futexstate.cpp
+OBJECTS = $(addprefix $(BUILD_DIR)/,$(SOURCES:.cpp=.o))
+TEST_BIN = $(BUILD_DIR)/state_components_test
 
-BUILD_DIR = tests
-
-# Test data binary
-TEST_DATA_SRC = tests/test_dwarf_data.c
-TEST_DATA_BIN = $(BUILD_DIR)/test_dwarf_data
-
-# Test objects
-DWARF_OBJ = $(BUILD_DIR)/dwarf.o
-TEST_OBJ = $(BUILD_DIR)/dwarf_test.o
-STUBS_OBJ = $(BUILD_DIR)/dwarf_test_stubs.o
-TYPEDEF_TEST_OBJ = $(BUILD_DIR)/raft_typedef_test.o
-
-# Test executables
-TEST_BIN = $(BUILD_DIR)/dwarf_test
-TYPEDEF_TEST_BIN = $(BUILD_DIR)/raft_typedef_test
-
-# Default target
+.DEFAULT_GOAL := test
+.DELETE_ON_ERROR:
+.PHONY: all test clean legacy-dwarf test-typedef debug FORCE
 all: test
 
-# Compile test data binary with DWARF4 debug info
-$(TEST_DATA_BIN): $(TEST_DATA_SRC)
-	$(CC) -gdwarf-4 -g -O0 -o $@ $<
+test: $(TEST_BIN)
+	./$(TEST_BIN)
 
-# Compile dwarf.cpp
-$(DWARF_OBJ): src/core/dwarf.cpp src/core/dwarf_info.h
-	@mkdir -p $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+# Track compiler and flag changes; preserve timestamp when unchanged.
+$(BUILD_DIR)/config: FORCE
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(CXX) $(CPPFLAGS) $(TEST_CPPFLAGS) $(CXXFLAGS) $(TEST_CXXFLAGS) $(LDFLAGS) $(LDLIBS)' > $@.tmp
+	@cmp -s $@ $@.tmp && rm -f $@.tmp || mv -f $@.tmp $@
 
-# Compile test
-$(TEST_OBJ): tests/dwarf_test.cpp src/core/dwarf_info.h
-	@mkdir -p $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+$(BUILD_DIR)/%.o: %.cpp $(BUILD_DIR)/config
+	@mkdir -p $(@D)
+	$(CXX) $(CPPFLAGS) $(TEST_CPPFLAGS) $(CXXFLAGS) $(TEST_CXXFLAGS) -MMD -MP -c $< -o $@
 
-# Compile stubs
-$(STUBS_OBJ): tests/dwarf_test_stubs.cpp
-	@mkdir -p $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+$(TEST_BIN): $(OBJECTS)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
-# Compile typedef test
-$(TYPEDEF_TEST_OBJ): tests/raft_typedef_test.cpp src/core/dwarf_info.h
-	@mkdir -p $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+# Local experiments retain their source, but are not a correctness check.
+legacy-dwarf test-typedef debug:
+	@echo "Legacy DWARF tests are unsupported: repair the fake monitor-state layout and stale interfaces first." >&2
+	@exit 2
 
-# Link test executable
-$(TEST_BIN): $(TEST_OBJ) $(STUBS_OBJ) $(DWARF_OBJ)
-	$(CXX) $^ $(LDFLAGS) -o $@
-
-# Link typedef test executable
-$(TYPEDEF_TEST_BIN): $(TYPEDEF_TEST_OBJ) $(STUBS_OBJ) $(DWARF_OBJ)
-	$(CXX) $^ $(LDFLAGS) -o $@
-
-# Run tests
-test: $(TEST_BIN) $(TEST_DATA_BIN)
-	@echo "Running DWARF parser unit tests..."
-	./$(TEST_BIN) $(TEST_DATA_BIN)
-
-test-typedef: $(TYPEDEF_TEST_BIN)
-	@echo "Running raft_node_t typedef test..."
-	./$(TYPEDEF_TEST_BIN) examples/redisraft/raft/raft
-
-# Debug with gdb
-debug: $(TEST_BIN) $(TEST_DATA_BIN)
-	gdb --args ./$(TEST_BIN) $(TEST_DATA_BIN)
-
-# Clean
 clean:
-	rm -f $(TEST_BIN) $(TYPEDEF_TEST_BIN) $(BUILD_DIR)/*.o $(TEST_DATA_BIN)
+	rm -f $(OBJECTS) $(OBJECTS:.o=.d) $(TEST_BIN) $(BUILD_DIR)/config $(BUILD_DIR)/config.tmp
 
-.PHONY: all test test-typedef debug clean
+-include $(OBJECTS:.o=.d)

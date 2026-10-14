@@ -731,6 +731,7 @@ int exec_bfs()
       int check_result = check_state();
       if (check_result != 0)
       {
+        stop_status_monitor();
         detsim::ui::ui_printf("Stopped for illegal state. Searched for %zu "
                               "sys_states (new: %zu)\n",
                               states_searched_this_run, states_new_this_run);
@@ -739,7 +740,7 @@ int exec_bfs()
         detsim::ui::ui_printf("Time elapsed: %lfs, speed = %lf states/s\n",
                               time_used, states_searched_this_run / time_used);
         StateStore::instance().print_stats();
-        state_fetched.reset();
+        return 1;
       }
 
       if (result.code != CKPT_DISCARD &&

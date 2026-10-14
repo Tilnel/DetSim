@@ -116,7 +116,8 @@ void cleanup_readline() {
  * ====================================================================== */
 
 int execute_command_line(char *cmd_line) {
-    char *cmd = strtok(cmd_line, " ");
+    char *str_end = cmd_line + strlen(cmd_line);
+    char *cmd = strtok(cmd_line, " \t\r\n");
     if (cmd == NULL) {
         return 0;
     }
@@ -127,9 +128,13 @@ int execute_command_line(char *cmd_line) {
         return 0;
     }
 
-    char *args = cmd + strlen(cmd);
-    while (*args && isspace(*args)) args++;
-    if (*args == '\0') args = nullptr;
+    char *args = cmd + strlen(cmd) + 1;
+    if (args >= str_end) {
+        args = nullptr;
+    } else {
+        while (*args && isspace(static_cast<unsigned char>(*args))) args++;
+        if (*args == '\0') args = nullptr;
+    }
 
     return entry->handler(args);
 }

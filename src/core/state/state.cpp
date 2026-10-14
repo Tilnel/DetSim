@@ -429,7 +429,6 @@ void tracee_state::restore_memory_mappings(
 /*
  * Optimized memory recovery with:
  * 1. Aggregated IO: Use process_vm_writev with multiple iovecs
- * 6. madvise: Use MADV_SEQUENTIAL hint before bulk memory operations
  */
 void tracee_state::recover_mem_reg_snapshot(std::vector<maps_item> &maps,
                                             hash_type ts_hash, int pid) const
@@ -464,38 +463,6 @@ void tracee_state::recover_mem_reg_snapshot(std::vector<maps_item> &maps,
   /* Read current rseq structure to preserve it */
   void *rseq = malloc(rseq_len[pid]);
   tracee_read_mem(pid, rseq_struct[pid], rseq, rseq_len[pid]);
-
-  // ========================================================================
-  // Optimization 6: madvise - Hint kernel about memory access pattern
-  // Use MADV_SEQUENTIAL to optimize for sequential access
-  // This helps the kernel prefetch pages and optimize page cache
-  // ========================================================================
-  for (uint32_t i = 0; i < header->num_regions; i++)
-  {
-    uint64_t start = regions[i].start;
-    uint64_t end = regions[i].end;
-    ssize_t size = end - start;
-
-    if (size <= 0)
-      continue;
-
-    // Validate region
-    bool valid = false;
-    for (auto &item : maps)
-    {
-      if (item.start <= start && end <= item.end && item.flags[1] == 'w')
-      {
-        valid = true;
-        break;
-      }
-    }
-    if (!valid)
-      continue;
-
-    // Hint kernel: we will access this region sequentially
-    // This triggers prefetching and optimizes page fault handling
-    madvise((void *)start, size, MADV_SEQUENTIAL);
-  }
 
   // ========================================================================
   // Optimization 1: Aggregated IO - Batch multiple regions in single syscall
@@ -939,14 +906,6 @@ hash_type tracee_state::save_full_state_to_state_store(int pid)
   }
 
   // ========================================================================
-  // Optimization 6: madvise - Hint kernel about sequential read
-  // ========================================================================
-  for (auto &region : regions_to_capture)
-  {
-    madvise((void *)region.start, region.size, MADV_SEQUENTIAL);
-  }
-
-  // ========================================================================
   std::vector<RegionInfo> regions;
   regions.reserve(regions_to_capture.size());
 
@@ -1116,8 +1075,8 @@ hash_type tracee_state::save_full_state_to_state_store(int pid)
     {
       size_t idx = batch_start + i;
       auto &src = regions_to_capture[idx];
-      region_infos[idx].start = src.start;
-      region_infos[idx].end = src.end;
+      // Include protection and flags too: every byte enters the state hash.
+      region_infos[idx] = regions[idx];
       region_infos[idx].offset = region_data_offset + regions[idx].offset;
 
       uint8_t *dest = all_data + region_infos[idx].offset;

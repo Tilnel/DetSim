@@ -1,22 +1,41 @@
-.PHONY: all debug release wc clean clear benchmark pgo-generate pgo-use pgo-clean
+# GNU Make; NP is a compile-time part of the state layout.
+.DEFAULT_GOAL := all
+.DELETE_ON_ERROR:
+.PHONY: all debug release tracer test check check-build-contracts help FORCE \
+        wc clean clear benchmark tools pgo-generate pgo-use pgo-clean \
+        check-integration check-scenarios check-redis
 
-CC = ccache gcc
-CXX = ccache g++
-LD = ccache g++ -L/usr/local/lib
+ifneq ($(filter check-accept check-redis,$(MAKECMDGOALS)),)
+NP ?= 2
+endif
 
-# Build directory
-BUILD_DIR = build
+# Integration fixtures use one node unless explicitly overridden.
+ifneq ($(filter check-integration check-dwarf check-elf check-scenarios,$(MAKECMDGOALS)),)
+NP ?= 1
+endif
 
-# Include paths (updated for new directory structure)
-INCLUDES = -I. -Isrc -Isrc/core -Isrc/core/engine -Isrc/core/syscall -Isrc/core/scheduler -Isrc/core/state -Isrc/subsys -Isrc/subsys/fs -Isrc/subsys/net -Isrc/subsys/sync -Isrc/subsys/time -Isrc/utils -Isrc/ui -Isrc/ui/cli -Ithird_party -Iexamples/redisraft/plugins -Isrc/subsys
+# Honor standard CC/CXX overrides. ccache is optional (CXX="ccache g++").
+ifeq ($(origin CC),default)
+CC = gcc
+endif
+ifeq ($(origin CXX),default)
+CXX = g++
+endif
+LD = $(CXX)
+MODE := $(if $(filter debug,$(MAKECMDGOALS)),debug,release)
+ifneq ($(words $(filter debug release,$(MAKECMDGOALS))),0)
+ifneq ($(words $(filter debug release,$(MAKECMDGOALS))),1)
+$(error Select debug or release in separate make invocations)
+endif
+endif
+BUILD_DIR = build/$(MODE)/np$(NP)
+INCLUDES = -I. -Isrc -Isrc/core -Isrc/core/engine -Isrc/core/syscall -Isrc/core/scheduler -Isrc/core/state -Isrc/subsys -Isrc/subsys/fs -Isrc/subsys/net -Isrc/subsys/sync -Isrc/utils -Isrc/ui -Isrc/ui/cli -Ithird_party -Ithird_party/cereal/include -Iexamples/redisraft/plugins
+PROJECT_CPPFLAGS = $(INCLUDES) -DNP=$(NP)
+CXXFLAGS ?= -std=gnu++20 -fno-stack-protector -O3 -msse4.2 -mavx2 -mbmi -mbmi2 $(if $(filter debug,$(MODE)),-g,)
+CFLAGS ?= -O3 -g
+LDFLAGS ?= -g -rdynamic -fno-omit-frame-pointer
+LDLIBS = -ldwarf -lreadline -ldw -lzstd -lxxhash -lunwind-ptrace -lunwind-x86_64 -lunwind -lelf -lfmt -lncurses -lpthread
 
-CXXFLAGS ?= $(INCLUDES) -MMD -MP -std=gnu++2a -fno-stack-protector -O3 -g -msse4.2 -D_FORTIFY_SOURCE=0 -fno-omit-frame-pointer \
-						-mavx2 -mbmi -mbmi2
-LDFLAGS = -g -ldwarf -lreadline -ldw -lzstd -lxxhash -rdynamic \
-				-lunwind-ptrace -lunwind-x86_64 -lunwind -lelf -lfmt \
-				-lncurses -lpthread -fno-omit-frame-pointer
-
-# Source files with new directory structure
 SRCS = src/main.cpp\
        src/core/scheduler.cpp src/core/guest.cpp src/core/monitor.cpp src/core/config.cpp src/core/syscall_fmt.cpp src/core/resolve.cpp \
        src/core/scheduler/exploration.cpp \
@@ -33,210 +52,130 @@ SRCS = src/main.cpp\
        examples/redisraft/plugins/raft_msg_parser.cpp \
        src/ui/ncurses_ui.cpp src/ui/log_wrapper.cpp src/ui/cli/commands.cpp
 
-# Object files in build directory
 OBJS = $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SRCS))
-DEPS = $(patsubst %.cpp,$(BUILD_DIR)/%.d,$(SRCS))
-
-# Lex/Yacc generated files
 LEX_SRC = src/utils/expr_lexer.cpp
 YACC_SRC = src/utils/expr_parser.cpp
 YACC_HDR = src/utils/expr_parser.hpp
 
-all: release
+all release debug: tracer
 
-release: CXXFLAGS = $(INCLUDES) -MMD -MP -std=gnu++2a -fno-stack-protector -O3 -msse4.2 -mavx2 -mbmi -mbmi2
-release: tracer
-
-debug: CXXFLAGS = $(INCLUDES) -MMD -MP -std=gnu++2a -fno-stack-protector -O3 -g -msse4.2 -mavx2 -mbmi -mbmi2
-debug: LDFLAGS += 
-debug: tracer
-
+# Relink the selected configuration even when returning to older cached objects.
 tracer: $(OBJS) $(BUILD_DIR)/nr2call.o
-	$(LD) $^ $(LDFLAGS) -o tracer
-	-mkdir memory sstate
+	$(LD) $^ $(LDFLAGS) $(LDLIBS) -o $@
 
-$(BUILD_DIR)/nr2call.o: nr2call.c | $(BUILD_DIR)
-	gcc -c $< -O3 -g -o $@
+# A content stamp invalidates objects when compiler or flags change. FORCE runs
+# the comparison each time; unchanged content preserves the timestamp.
+FORCE:
+
+$(BUILD_DIR)/.config: FORCE
+	@case '$(NP)' in ''|*[!0-9]*|0*) echo 'NP must be a positive integer (e.g. make NP=1)' >&2; exit 1;; esac
+	@mkdir -p $(dir $@)
+	@printf '%s\n' 'CC=$(CC)' 'CXX=$(CXX)' 'CPPFLAGS=$(CPPFLAGS)' 'PROJECT_CPPFLAGS=$(PROJECT_CPPFLAGS)' 'CFLAGS=$(CFLAGS)' 'CXXFLAGS=$(CXXFLAGS)' > $@.tmp
+	@cmp -s $@.tmp $@ && rm $@.tmp || mv $@.tmp $@
+
+$(BUILD_DIR)/%.o: %.cpp $(BUILD_DIR)/.config
+	@mkdir -p $(dir $@)
+	$(CXX) $(PROJECT_CPPFLAGS) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD_DIR)/nr2call.o: nr2call.c $(BUILD_DIR)/.config
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(LEX_SRC): src/utils/expr_lexer.l $(YACC_HDR)
 	flex -o $@ $<
 
-$(YACC_SRC) $(YACC_HDR): src/utils/expr_parser.y
+# Grouped outputs prevent concurrent bison invocations under make -j.
+$(YACC_SRC) $(YACC_HDR) &: src/utils/expr_parser.y
 	bison -d -o $(YACC_SRC) $<
 
-# Compile C++ files to build directory
-$(BUILD_DIR)/%.o: %.cpp | $(BUILD_DIR)
-	@if [ -z "$(NP)" ]; then \
-		echo "NP not set"; exit 1; \
-	fi
-	@mkdir -p $(dir $@)
-	@echo "Compiling $<"
-	@start=$$(date +%s.%N); \
-	$(CXX) $< $(CXXFLAGS) -c -o $@ -DNP=$(NP); \
-	end=$$(date +%s.%N); \
-	dur=$$(echo "$$end - $$start" | bc); \
-	echo "Compiled $< in $$dur seconds"
+-include $(OBJS:.o=.d) $(BUILD_DIR)/nr2call.d
 
-# Create build directory
-$(BUILD_DIR):
-	mkdir -p $(BUILD_DIR)/src/core $(BUILD_DIR)/src/core/engine $(BUILD_DIR)/src/core/syscall $(BUILD_DIR)/src/core/scheduler $(BUILD_DIR)/src/core/state
-	mkdir -p $(BUILD_DIR)/src/subsys $(BUILD_DIR)/src/subsys/fs $(BUILD_DIR)/src/subsys/net $(BUILD_DIR)/src/subsys/sync $(BUILD_DIR)/src/subsys/time
-	mkdir -p $(BUILD_DIR)/src/utils $(BUILD_DIR)/src/ui $(BUILD_DIR)/src/ui/cli
-	mkdir -p $(BUILD_DIR)/examples/redisraft/plugins
+TRACER_OBJS_NO_MAIN = $(filter-out $(BUILD_DIR)/src/main.o,$(OBJS))
+benchmark: ss_bench sys_bench xxh_bench
+.PHONY: ss_bench sys_bench xxh_bench tools/sstate_query tools/verify_sstate
+ss_bench: $(BUILD_DIR)/perf/state_store_benchmark.o $(TRACER_OBJS_NO_MAIN) $(BUILD_DIR)/nr2call.o
+	$(LD) $^ $(LDFLAGS) $(LDLIBS) -o $@
+sys_bench: $(BUILD_DIR)/perf/sysstate_store_benchmark.o $(TRACER_OBJS_NO_MAIN) $(BUILD_DIR)/nr2call.o
+	$(LD) $^ $(LDFLAGS) $(LDLIBS) -o $@
+xxh_bench: $(BUILD_DIR)/perf/xxhash_benchmark.o $(BUILD_DIR)/nr2call.o
+	$(LD) $^ $(LDFLAGS) -o $@
+tools: tools/sstate_query tools/verify_sstate
+tools/sstate_query: $(BUILD_DIR)/tools/sstate_query.o $(TRACER_OBJS_NO_MAIN) $(BUILD_DIR)/nr2call.o
+	$(LD) $^ $(LDFLAGS) $(LDLIBS) -o $@
+tools/verify_sstate: $(BUILD_DIR)/tools/verify_sstate.o $(TRACER_OBJS_NO_MAIN) $(BUILD_DIR)/nr2call.o
+	$(LD) $^ $(LDFLAGS) $(LDLIBS) -o $@
+-include $(wildcard $(BUILD_DIR)/perf/*.d $(BUILD_DIR)/tools/*.d)
 
--include $(DEPS)
+test:
+	$(MAKE) -f tests/Makefile test CC="$(CC)" CXX="$(CXX)"
+check-build-contracts:
+	python3 tests/build_contract_test.py
+# Component/build checks only; does not assert ptrace/exploration correctness.
+check: test check-build-contracts
+
+# Optional fragments are absent in the disposable build-contract fixtures.
+-include tests/dwarf.mk tests/elf.mk tests/accept.mk
+check-integration: check-dwarf check-elf
+
+# This gate executes native programs via ptrace; keep it separate from make check.
+check-scenarios: tracer
+	@test "$(NP)" = 1 || { echo 'check-scenarios requires NP=1' >&2; exit 1; }
+	CC="$(CC)" DETSIM_TRACER="$(abspath tracer)" python3 tests/tracer_scenarios.py
+
+check-redis: tracer
+	@test "$(NP)" = 2 || { echo 'check-redis requires NP=2' >&2; exit 1; }
+	CC="$(CC)" python3 tests/redis_scenario.py --tracer "$(abspath tracer)"
+
+help:
+	@echo 'make NP=N [release|debug]   Build tracer for N processes'
+	@echo 'make check                  Component tests + build regression tests (no ptrace)'
+	@echo 'make check-integration      Production DWARF/ELF fixtures (default NP=1; no ptrace)'
+	@echo 'make check-scenarios        Build NP=1 tracer and run isolated ptrace scenarios'
+	@echo 'make check-accept           NP=2 remote-memory accept regression'
+	@echo 'make check-redis            NP=2 Redis SET/GET (requires existing Redis binary and ptrace)'
+	@echo 'make NP=N benchmark|tools   Build optional utilities'
+	@echo 'make NP=N pgo-generate     Instrument; run workload; then make NP=N pgo-use'
+	@echo 'Compiler overrides: CC=/usr/bin/gcc CXX=/usr/bin/g++'
 
 wc:
-	@find src -name "*.[ch]" -o -name "*.cpp" | xargs wc
+	@find src -name '*.[ch]' -o -name '*.cpp' | xargs wc -l
 
+# Only explicit clear removes user runtime snapshots.
 clear:
-	-/bin/rm -rf memory sstate
-	-mkdir memory sstate
+	rm -rf memory sstate
+	mkdir -p memory sstate
 
 clean:
-	-/bin/rm -rf $(BUILD_DIR) tracer *.so
-	-/bin/rm -f $(LEX_SRC) $(YACC_SRC) $(YACC_HDR) src/utils/expr_parser.output
+	rm -rf build
+	rm -f tracer ss_bench sys_bench xxh_bench tools/sstate_query tools/verify_sstate
 
-# --- Benchmark Targets ---
-# Exclude the main tracer entry point from the object list for linking the benchmark
-TRACER_OBJS_NO_MAIN = $(filter-out $(BUILD_DIR)/src/main.o, $(OBJS))
-
-# StateStore benchmark
-BENCH1_SRC = perf/state_store_benchmark.cpp
-BENCH1_OBJ = $(BUILD_DIR)/perf/state_store_benchmark.o
-BENCH1_EXE = ss_bench
-
-# SysStateStore benchmark  
-BENCH2_SRC = perf/sysstate_store_benchmark.cpp
-BENCH2_OBJ = $(BUILD_DIR)/perf/sysstate_store_benchmark.o
-BENCH2_EXE = sys_bench
-
-# XXHash benchmark
-BENCH3_SRC = perf/xxhash_benchmark.cpp
-BENCH3_OBJ = $(BUILD_DIR)/perf/xxhash_benchmark.o
-BENCH3_EXE = xxh_bench
-
-benchmark: $(BENCH1_EXE) $(BENCH2_EXE) $(BENCH3_EXE)
-
-$(BENCH1_EXE): $(BENCH1_OBJ) $(TRACER_OBJS_NO_MAIN) $(BUILD_DIR)/nr2call.o
-	@echo "==> Linking Benchmark: $(BENCH1_EXE)"
-	$(LD) $^ $(LDFLAGS) -o $@
-
-$(BENCH2_EXE): $(BENCH2_OBJ) $(TRACER_OBJS_NO_MAIN) $(BUILD_DIR)/nr2call.o
-	@echo "==> Linking Benchmark: $(BENCH2_EXE)"
-	$(LD) $^ $(LDFLAGS) -o $@
-
-$(BENCH3_EXE): $(BENCH3_OBJ) $(BUILD_DIR)/nr2call.o
-	@echo "==> Linking Benchmark: $(BENCH3_EXE)"
-	$(CXX) $^ -O3 -o $@
-
-# Compile benchmark files to build directory
-$(BUILD_DIR)/perf/%.o: perf/%.cpp | $(BUILD_DIR)
-	@if [ -z "$(NP)" ]; then \
-		echo "NP not set"; exit 1; \
-	fi
-	@mkdir -p $(dir $@)
-	@echo "Compiling benchmark $<"
-	@start=$$(date +%s.%N); \
-	$(CXX) $< $(CXXFLAGS) -c -o $@ -DNP=$(NP); \
-	end=$$(date +%s.%N); \
-	dur=$$(echo "$$end - $$start" | bc); \
-	echo "Compiled $< in $$dur seconds"
-
-# --- Tool Targets ---
-TOOLS_DIR = tools
-
-# Tool executables
-SSTATE_QUERY_SRC = $(TOOLS_DIR)/sstate_query.cpp
-SSTATE_QUERY_OBJ = $(BUILD_DIR)/$(TOOLS_DIR)/sstate_query.o
-SSTATE_QUERY_EXE = $(TOOLS_DIR)/sstate_query
-
-VERIFY_SSTATE_SRC = $(TOOLS_DIR)/verify_sstate.cpp
-VERIFY_SSTATE_OBJ = $(BUILD_DIR)/$(TOOLS_DIR)/verify_sstate.o
-VERIFY_SSTATE_EXE = $(TOOLS_DIR)/verify_sstate
-
-# Tool dependencies - need UI objects too
-TOOL_DEPS = $(TRACER_OBJS_NO_MAIN) $(BUILD_DIR)/nr2call.o \
-            $(BUILD_DIR)/src/ui/ncurses_ui.o $(BUILD_DIR)/src/ui/log_wrapper.o
-
-tools: $(SSTATE_QUERY_EXE) $(VERIFY_SSTATE_EXE)
-
-$(SSTATE_QUERY_EXE): $(SSTATE_QUERY_OBJ) $(TOOL_DEPS)
-	@echo "==> Linking Tool: $(SSTATE_QUERY_EXE)"
-	$(LD) $^ $(LDFLAGS) -o $@
-
-$(VERIFY_SSTATE_EXE): $(VERIFY_SSTATE_OBJ) $(TOOL_DEPS)
-	@echo "==> Linking Tool: $(VERIFY_SSTATE_EXE)"
-	$(LD) $^ $(LDFLAGS) -o $@
-
-# Compile tool files to build directory
-$(BUILD_DIR)/$(TOOLS_DIR)/%.o: $(TOOLS_DIR)/%.cpp | $(BUILD_DIR)
-	@if [ -z "$(NP)" ]; then \
-		echo "NP not set"; exit 1; \
-	fi
-	@mkdir -p $(dir $@)
-	@echo "Compiling tool $<"
-	@start=$$(date +%s.%N); \
-	$(CXX) $< $(CXXFLAGS) -c -o $@ -DNP=$(NP)
-
-# ==============================================================================
-# Profile-Guided Optimization (PGO) Targets - Simplified Design
-# ==============================================================================
-# Usage:
-#   1. make pgo-generate NP=3     # Build instrumented binary
-#   2. ./tracer-pgo <workload>    # Run to generate .gcda files
-#   3. make pgo-use NP=3          # Recompile with profile data
-#   4. ./tracer-pgo               # Run optimized binary
-# ==============================================================================
-
-PGO_BUILD_DIR = build-pgo
-PGO_PROF_DIR = pgo-profiles
-
-# PGO object files
+# Both PGO phases use the same paths for GCC profile lookup. A phase stamp
+# rebuilds objects in sequence; no parallel clean prerequisite can race them.
+PGO_BUILD_DIR = build-pgo/np$(NP)
+PGO_PROF_DIR = $(abspath pgo-profiles/np$(NP))
 PGO_OBJS = $(patsubst %.cpp,$(PGO_BUILD_DIR)/%.o,$(SRCS))
 PGO_NRCALL = $(PGO_BUILD_DIR)/nr2call.o
+ifneq ($(words $(filter pgo-generate pgo-use,$(MAKECMDGOALS))),0)
+ifneq ($(words $(filter pgo-generate pgo-use,$(MAKECMDGOALS))),1)
+$(error Run pgo-generate and pgo-use in separate invocations)
+endif
+endif
+PGO_FLAGS = $(if $(filter pgo-use,$(MAKECMDGOALS)),-fprofile-use -fprofile-correction,-fprofile-generate) -fprofile-dir=$(PGO_PROF_DIR)
+pgo-generate pgo-use: $(PGO_OBJS) $(PGO_NRCALL)
+	$(LD) $^ $(LDFLAGS) $(PGO_FLAGS) $(LDLIBS) -o tracer-pgo
 
-# Step 1: Generate profile (instrumented build)
-.PHONY: pgo-generate
-pgo-generate: PGO_CXXFLAGS = $(CXXFLAGS) -fprofile-generate -fprofile-dir=$(PGO_PROF_DIR) -ffile-prefix-map=$(CURDIR)=.
-pgo-generate: PGO_LDFLAGS = $(LDFLAGS) -fprofile-generate -fprofile-dir=$(PGO_PROF_DIR)
-pgo-generate: $(PGO_BUILD_DIR) $(PGO_OBJS) $(PGO_NRCALL)
-	$(LD) $(PGO_OBJS) $(PGO_NRCALL) $(PGO_LDFLAGS) -o tracer-pgo
-	@echo "==> PGO instrumented binary: ./tracer-pgo"
-	@echo "==> Run it to generate profile data, then: make pgo-use NP=$(NP)"
+$(PGO_BUILD_DIR)/.config: FORCE
+	@case '$(NP)' in ''|*[!0-9]*|0*) echo 'NP must be a positive integer' >&2; exit 1;; esac
+	@mkdir -p $(dir $@) $(PGO_PROF_DIR)
+	@printf '%s\n' 'CC=$(CC)' 'CXX=$(CXX)' 'CPPFLAGS=$(CPPFLAGS)' 'PROJECT_CPPFLAGS=$(PROJECT_CPPFLAGS)' 'CXXFLAGS=$(CXXFLAGS)' 'CFLAGS=$(CFLAGS)' 'PGO_FLAGS=$(PGO_FLAGS)' > $@.tmp
+	@cmp -s $@.tmp $@ && rm $@.tmp || mv $@.tmp $@
 
-# Step 2: Use profile (optimized build)  
-.PHONY: pgo-use
-pgo-use: PGO_CXXFLAGS = $(CXXFLAGS) -fprofile-use -fprofile-dir=$(PGO_PROF_DIR) -fprofile-correction -ffile-prefix-map=$(CURDIR)=.
-pgo-use: PGO_LDFLAGS = $(LDFLAGS)
-pgo-use: pgo-clean-objs $(PGO_OBJS) $(PGO_NRCALL)
-	$(LD) $(PGO_OBJS) $(PGO_NRCALL) $(PGO_LDFLAGS) -o tracer-pgo
-	@echo "==> PGO optimized binary: ./tracer-pgo"
-
-# Clean only object files (keep .gcda profile data)
-.PHONY: pgo-clean-objs
-pgo-clean-objs:
-	@rm -f $(PGO_OBJS) $(PGO_NRCALL)
-
-# Clean everything including profile data
-.PHONY: pgo-clean
-pgo-clean:
-	@rm -rf $(PGO_BUILD_DIR) $(PGO_PROF_DIR)
-	@rm -f tracer-pgo
-	@echo "==> PGO files cleaned"
-
-# Build directory
-$(PGO_BUILD_DIR):
-	@mkdir -p $(PGO_BUILD_DIR)/src/core $(PGO_BUILD_DIR)/src/subsys \
-		$(PGO_BUILD_DIR)/src/utils $(PGO_BUILD_DIR)/src/ui \
-		$(PGO_BUILD_DIR)/examples/redisraft/plugins
-	@mkdir -p $(PGO_PROF_DIR)
-
-# Generic rule for PGO object files (flags determined by target)
-$(PGO_BUILD_DIR)/%.o: %.cpp | $(PGO_BUILD_DIR)
-	@if [ -z "$(NP)" ]; then echo "NP not set"; exit 1; fi
+$(PGO_BUILD_DIR)/%.o: %.cpp $(PGO_BUILD_DIR)/.config
 	@mkdir -p $(dir $@)
-	$(CXX) $< $(PGO_CXXFLAGS) -c -o $@ -DNP=$(NP)
+	$(CXX) $(PROJECT_CPPFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(PGO_FLAGS) -MMD -MP -c $< -o $@
+$(PGO_BUILD_DIR)/nr2call.o: nr2call.c $(PGO_BUILD_DIR)/.config
+	$(CC) $(CFLAGS) $(PGO_FLAGS) -MMD -MP -c $< -o $@
+-include $(PGO_OBJS:.o=.d) $(PGO_NRCALL:.o=.d)
 
-$(PGO_BUILD_DIR)/nr2call.o: nr2call.c | $(PGO_BUILD_DIR)
-	$(CC) -c $< -O3 -g $(PGO_CFLAGS) -o $@
+pgo-clean:
+	rm -rf build-pgo pgo-profiles
+	rm -f tracer-pgo

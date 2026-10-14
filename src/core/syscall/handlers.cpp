@@ -6,6 +6,7 @@
 #include "guest.h"
 #include "log_wrapper.h"
 #include "monitor.h"
+#include "proc_status.h"
 #include "state/state.h"
 #include "thread_manager.h"
 #include "sync/futexstate.h"
@@ -457,7 +458,7 @@ int handle_exit(pid_t pid, syscall_info &info) {
 
 int handle_exit_group(pid_t pid, syscall_info &info) {
     // Mark process as exited
-    ptmc_state.status[ptmc_state.cursor] = (info.args[0] << 8);
+    ptmc_state.status[ptmc_state.cursor] = dstatus_exit(info.args[0]);
     return CKPT_EXIT;
 }
 

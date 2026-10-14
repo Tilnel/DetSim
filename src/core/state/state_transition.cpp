@@ -188,20 +188,46 @@ TransitionResult state_transition(const sys_state &source_state,
   return result;
 }
 
-static void exit_all(int _)
+static pid_t tracer_owner = 0;
+
+// Only the tracer owns these children. Never signal its whole process group:
+// that group may also contain a shell, test driver, or unrelated workload.
+static void terminate_tracees()
 {
-  /* Shutdown StateStore to flush pending writes */
-  StateStore::instance().shutdown();
-  kill(0, SIGTERM);
-  exit(EXIT_SUCCESS);
+  if (getpid() != tracer_owner)
+    return;
+  for (int i = 0; i < NP; ++i)
+  {
+    pid_t child = pids[i];
+    if (child <= 0)
+      continue;
+    int status = 0;
+    pid_t result;
+    do {
+      result = waitpid(child, &status, WNOHANG);
+    } while (result < 0 && errno == EINTR);
+    // An exited/reaped tracee PID may have been reused: only kill an owned child.
+    if (result >= 0 && !(result == child && (WIFEXITED(status) || WIFSIGNALED(status))))
+    {
+      kill(child, SIGKILL);
+      while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {}
+    }
+    pids[i] = 0;
+  }
+}
+
+static void exit_all(int sig)
+{
+  // No locks, logging, allocation, or store shutdown from a signal handler.
+  terminate_tracees();
+  _exit(128 + sig);
 }
 
 static void exit_all(void)
 {
   /* Shutdown StateStore to flush pending writes */
   StateStore::instance().shutdown();
-  kill(0, SIGTERM);
-  exit(EXIT_SUCCESS);
+  terminate_tracees();
 }
 
 extern std::unordered_map<int, void *> rseq_struct;
@@ -393,11 +419,6 @@ static void init_tracee_state(int index)
   LOG_INFO("Checking if %s (abs: %s) is a Go program", ptmc_state.tracee[index].executable, abs_path);
   int go_check = is_go_program(abs_path);
   LOG_INFO("is_go_program result: %d", go_check);
-  // Hardcoded detection for Go programs (workaround for is_go_program issues)
-  if (!go_check && strstr(ptmc_state.tracee[index].executable, "test") || strstr(ptmc_state.tracee[index].executable, "detsim") != NULL) {
-    LOG_INFO("Hardcoded: treating as Go program due to 'test' in name");
-    go_check = 1;
-  }
   if (go_check) {
     // Go programs: stop at first mmap after initialization
     LOG_INFO("Detected Go program, using SYS_mmap as stop_nr");
@@ -461,6 +482,7 @@ int state_initialization()
   /* initialization for multiple process */
   // setpgid(0, pgid);
   setbuf(stdout, NULL);
+  tracer_owner = getpid();
   atexit(exit_all);
   signal(SIGTERM, exit_all);
   // signal(SIGINT, exit_all);

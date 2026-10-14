@@ -234,6 +234,7 @@ int FutexState::futex_requeue(uint64_t uaddr1, uint64_t uaddr2, int nr_wake, int
             // Requeue to uaddr2
             waiter.uaddr = uaddr2;
             waiters_[uaddr2].push_back(waiter);
+            waiter_map_[waiter.tid] = uaddr2;
             requeued++;
         } else {
             remaining.push_back(waiter);

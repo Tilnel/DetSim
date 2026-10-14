@@ -23,6 +23,7 @@
 
 # Source directories
 !src/
+!src/*.hpp
 !src/core/
 !src/core/*
 !src/subsys/
@@ -59,6 +60,11 @@ tracer
 
 # Runtime directories
 build/
+build-pgo/
+pgo-profiles/
+memory_packed/
+__pycache__/
+*.pyc
 mappings/
 memory/
 filesystem/

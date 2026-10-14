@@ -15,6 +15,8 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fmt/format.h>
+#include <climits>
+#include <sys/uio.h>
 
 /* ==============================================================================
  * Utility Functions
@@ -304,22 +306,42 @@ int SockState::do_accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
 
   // Get the first pending connection
   int client_fd = listener->pending_connections.front();
-  listener->pending_connections.pop_front();
 
+  // FDs are process-local. Match the established endpoint as well as the fd.
   // Find the client socket to get its address
   const Socket *client_sock = nullptr;
   int client_pid = -1;
   for (int pid = 0; pid < NP; pid++)
   {
-    client_sock = ptmc_state.sock_states[pid].get_socket(client_fd);
+    const Socket *candidate = ptmc_state.sock_states[pid].get_socket(client_fd);
+    if (!candidate || !candidate->connected || candidate->listening ||
+        candidate->peer_addr.sin_port != listener->local_addr.sin_port)
+      continue;
+    in_addr server_addr{};
+    inet_pton(AF_INET, ptmc_state.addrs[ptmc_state.cursor].c_str(), &server_addr);
+    if (candidate->peer_addr.sin_addr.s_addr != server_addr.s_addr &&
+        candidate->peer_addr.sin_addr.s_addr != listener->local_addr.sin_addr.s_addr)
+      continue;
+    uint64_t key = (uint64_t(candidate->local_addr.sin_addr.s_addr) << 32) |
+                   candidate->local_addr.sin_port;
+    if (listener->established_connections.find(key) ==
+        listener->established_connections.end())
+      continue;
+    // The legacy queue stores only fds, so multiple matching peers cannot be
+    // ordered faithfully. Refuse the ambiguity instead of accepting a random one.
     if (client_sock)
     {
-      client_pid = pid;
-      break;
+      LOG_ERROR("accept: ambiguous pending client fd %d", client_fd);
+      return -EOPNOTSUPP;
     }
+    client_sock = candidate;
+    client_pid = pid;
   }
   if (!client_sock)
   {
+    // Unlike a copyout failure, this head cannot become acceptable on retry.
+    // Drop it so a disconnected client cannot block later live connections.
+    listener->pending_connections.pop_front();
     return -ECONNRESET; // Client closed connection
   }
 
@@ -332,19 +354,14 @@ int SockState::do_accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
   auto established_it = listener->established_connections.find(client_key);
   if (established_it == listener->established_connections.end())
   {
+    listener->pending_connections.pop_front();
     return -ECONNRESET; // No established connection found
-  }
-
-  // Allocate new fd for accepted socket
-  int new_fd = allocate_fd(FdType::SOCKET);
-  if (new_fd < 0)
-  {
-    return -EMFILE;
   }
 
   // Create new socket for accepted connection
   Socket new_sock;
-  new_sock.fd = new_fd;
+  new_sock.local_addr = {};
+  new_sock.peer_addr = {};
   new_sock.domain = listener->domain;
   new_sock.type = SOCK_STREAM;
   new_sock.protocol = 0;
@@ -363,27 +380,52 @@ int SockState::do_accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
             &new_sock.peer_addr.sin_addr);
   new_sock.peer_addr.sin_port = client_sock->local_addr.sin_port;
 
+  // addr and addrlen belong to the tracee. Checked copies are required here:
+  // the general guest helpers cannot report a failed/short transfer to callers.
+  if (addr)
+  {
+    int guest_pid = ptmc_state.pids[ptmc_state.cursor];
+    socklen_t capacity = 0;
+    iovec local{&capacity, sizeof(capacity)};
+    iovec remote{addrlen, sizeof(capacity)};
+    if (process_vm_readv(guest_pid, &local, 1, &remote, 1, 0) !=
+        static_cast<ssize_t>(sizeof(capacity)))
+      return -EFAULT;
+    if (capacity > INT_MAX)
+      return -EINVAL;
+    size_t copied = std::min<size_t>(capacity, sizeof(new_sock.peer_addr));
+    if (copied)
+    {
+      local = {&new_sock.peer_addr, copied};
+      remote = {addr, copied};
+      if (process_vm_writev(guest_pid, &local, 1, &remote, 1, 0) !=
+          static_cast<ssize_t>(copied))
+        return -EFAULT;
+    }
+    socklen_t actual = sizeof(new_sock.peer_addr);
+    local = {&actual, sizeof(actual)};
+    remote = {addrlen, sizeof(actual)};
+    if (process_vm_writev(guest_pid, &local, 1, &remote, 1, 0) !=
+        static_cast<ssize_t>(sizeof(actual)))
+      return -EFAULT;
+  }
+
+  // Commit virtual socket state only after successful copyout.
+  int new_fd = allocate_fd(FdType::SOCKET);
+  if (new_fd < 0)
+    return -EMFILE;
+  new_sock.fd = new_fd;
+  listener->pending_connections.pop_front();
   sockets_[new_fd] = new_sock;
 
   // Adopt the existing TcpConnection with its buffered data
   TcpConnection conn = std::move(established_it->second);
   conn.local_fd = new_fd;
   conn.local_addr = new_sock.local_addr;
-  // peer_addr is already set correctly from connect()
+  conn.peer_addr = new_sock.peer_addr;
   tcp_connections_[new_fd] = std::move(conn);
 
   listener->established_connections.erase(established_it);
-
-  // Return peer address to caller
-  if (addr && addrlen)
-  {
-    socklen_t len = *addrlen;
-    if (len > sizeof(struct sockaddr_in))
-    {
-      len = sizeof(struct sockaddr_in);
-    }
-    memcpy_host2guest(addr, &new_sock.peer_addr, len);
-  }
 
   LOG_TRACE("accept(fd=%d) = %d (client fd=%d)", fd, new_fd, client_fd);
   return new_fd;
