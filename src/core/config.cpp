@@ -337,15 +337,10 @@ static void parse_statestore_config(const json &cfg)
   {
     ss_config.compression_level = ss["compression_level"].get<int>();
   }
-  if (ss.contains("enable_malloc_trim"))
-  {
-    ss_config.enable_malloc_trim = ss["enable_malloc_trim"].get<bool>();
-  }
-  if (ss.contains("malloc_trim_threshold_mb"))
-  {
-    ss_config.malloc_trim_threshold =
-        ss["malloc_trim_threshold_mb"].get<size_t>() * 1024 * 1024;
-  }
+  if (ss.contains("enable_malloc_trim") || ss.contains("malloc_trim_threshold_mb"))
+    LOG_WARN("StateStore malloc-trim options are obsolete and ignored");
+  if (ss.contains("max_pending_bytes"))
+    ss_config.max_pending_bytes = ss["max_pending_bytes"].get<size_t>();
   if (ss.contains("packed_storage_path"))
   {
     ss_config.packed_storage_path =
@@ -354,10 +349,10 @@ static void parse_statestore_config(const json &cfg)
 
   StateStore::instance().init(ss_config);
   LOG_INFO(
-      "StateStore configured: hot=%zuMB, warm=%zuMB, prefetch=%zu, trim=%s",
+      "StateStore configured: hot=%zuMB, warm=%zuMB, prefetch=%zu, pending_limit=%zu bytes",
       ss_config.hot_cache_size / (1024 * 1024),
       ss_config.warm_cache_size / (1024 * 1024), ss_config.prefetch_window,
-      ss_config.enable_malloc_trim ? "on" : "off");
+      ss_config.max_pending_bytes);
 }
 
 void read_config(const char *cfg_file)

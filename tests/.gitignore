@@ -37,3 +37,10 @@
 !futex_snapshot_integration.cpp
 !futex.mk
 !futex_integration.cpp
+
+!storage_benchmark.cpp
+!storage.mk
+!store_cache*
+!store_packed*
+!store_metadata*
+!storage_benchmark.py

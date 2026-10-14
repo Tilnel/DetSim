@@ -1,5 +1,8 @@
 # Developing DetSim
 
+For storage APIs, persistence boundaries and memory limits, see the
+[current storage contract](state_store_full_guide.md).
+
 For the project's actual model-checking requirements, start with the
 [state and atom contract assessment](model-checking-contract.md). It includes a
 reproduced SIMD restore failure and distinguishes state closure from schedule
@@ -12,6 +15,7 @@ From the repository root, with GNU Make 4.3+, Python 3 and a C++20 compiler:
 ```sh
 make help
 make check
+make check-storage       # storage faults/concurrency/reopen + read-only tools; NP=1
 make check-integration   # production DWARF/ELF fixtures; default NP=1
 make check-scenarios     # build NP=1 tracer and run isolated native ptrace scenarios
 make check-futex check-futex-snapshot # NP=1 wait/wake/requeue and branch restore

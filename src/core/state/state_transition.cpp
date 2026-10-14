@@ -8,6 +8,7 @@
 #include "ncurses_ui.h"
 #include "proc_status.h"
 #include "state_store.h"
+#include "sysstate_store.h"
 #include "utils.h"
 #include "../engine/exec_engine.h"
 #include "../engine/thread_manager.h"
@@ -194,6 +195,8 @@ TransitionResult state_transition(const sys_state &source_state,
 }
 
 static pid_t tracer_owner = 0;
+static SysStateStore *metadata_store = nullptr;
+static StateStore *snapshot_store = nullptr;
 
 // Only the tracer owns these children. Never signal its whole process group:
 // that group may also contain a shell, test driver, or unrelated workload.
@@ -230,9 +233,22 @@ static void exit_all(int sig)
 
 static void exit_all(void)
 {
-  /* Shutdown StateStore to flush pending writes */
-  StateStore::instance().shutdown();
+  if (getpid() != tracer_owner) return;
+  // Persistence failures must not turn into a throwing atexit handler or a
+  // successful checker exit. Always reap owned tracees, even after I/O failure.
+  bool failed = false;
+  try { if (snapshot_store) snapshot_store->shutdown(); }
+  catch (const std::exception &error) {
+    fprintf(stderr, "Snapshot shutdown failed: %s\n", error.what());
+    failed = true;
+  }
+  try { if (metadata_store) metadata_store->shutdown(); }
+  catch (const std::exception &error) {
+    fprintf(stderr, "Metadata shutdown failed: %s\n", error.what());
+    failed = true;
+  }
   terminate_tracees();
+  if (failed) _Exit(EXIT_FAILURE);
 }
 
 extern std::unordered_map<int, void *> rseq_struct;
@@ -488,6 +504,9 @@ int state_initialization()
   // setpgid(0, pgid);
   setbuf(stdout, NULL);
   tracer_owner = getpid();
+  // Construct before registering cleanup, so the singleton outlives this callback.
+  snapshot_store = &StateStore::instance();
+  metadata_store = &SysStateStore::instance();
   atexit(exit_all);
   signal(SIGTERM, exit_all);
   // signal(SIGINT, exit_all);

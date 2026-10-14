@@ -1,123 +1,79 @@
-/*
- * sysstate_store.h - Packed storage for sys_state to avoid filesystem overhead
- *
- * Problem: Each sys_state file is only ~20 bytes, but filesystem uses 4KB
- * blocks Solution: Pack multiple sys_states into a single file with index
- */
-
 #ifndef __SYSSTATE_STORE_H
 #define __SYSSTATE_STORE_H
 
 #include "types.h"
-#include <chrono>
-#include <cstdint>
+#include <functional>
+#include <list>
 #include <mutex>
-#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-/* Entry in the index */
-/* Packed to avoid alignment padding */
 struct __attribute__((packed)) SysStateEntry
 {
-  uint64_t offset;   // Offset in data file
-  uint32_t size;     // Size of serialized data
-  uint32_t checksum; // Simple checksum for validation
+  uint64_t offset;
+  uint32_t size;
+  uint32_t checksum;
 };
-static_assert(sizeof(SysStateEntry) == 16,
-              "SysStateEntry size must be 16 bytes");
+static_assert(sizeof(SysStateEntry) == 16);
 
+// The checksummed append log is authoritative. Historical packed.idx/packed.inc
+// files are no longer used: they could lose records between journal truncation
+// and checkpoint replacement. Metadata payloads use a bounded, lazy LRU cache.
 class SysStateStore
 {
-  public:
+public:
   static SysStateStore &instance();
-
-  /* Initialize/load existing index */
   void init();
-
-  /* Save sys_state data, returns true if successful */
+  // Read-only tools share record validation without creating a store or indexes.
+  static void inspect(const std::string &directory,
+      const std::function<void(hash_type, const SysStateEntry &, const std::vector<uint8_t> &)> &visitor);
   bool save(hash_type hash, const std::vector<uint8_t> &data);
-
-  /* Load sys_state data, returns true if found */
   bool load(hash_type hash, std::vector<uint8_t> &data);
-
-  /* Check if hash exists */
   bool exists(hash_type hash);
-
-  /* Find all hashes matching a prefix (for cmd_load auto-completion) */
   std::vector<hash_type> find_by_prefix(const std::string &prefix);
 
-  /* Flush index to disk */
+  // Completion/durability barrier for every successful save before this call.
   void flush_index();
-
-  /* Internal: flush without locking (assumes mutex held) */
-  void flush_index_unlocked();
-
-  /* Get statistics */
-  size_t get_entry_count() const { return index_.size(); }
-  size_t get_incremental_count() const { return incremental_index_.size(); }
-  size_t get_data_file_size() const { return data_file_size_; }
-
-  /* Compact data file (rewrite to remove holes from duplicate saves) */
+  size_t get_entry_count() const;
+  size_t get_data_file_size() const;
+  size_t get_incremental_count() const { return 0; }
+  // No records are deleted or overwritten, so compact only validates the log.
   void compact();
-
-  /* Rebuild index from data file (recovery mode) */
   void rebuild_index();
-
-  /* Shutdown and cleanup */
   void shutdown();
 
-  /* Incremental index operations */
-  void load_incremental_index();
-  void append_to_incremental_index(hash_type hash, const SysStateEntry &entry);
-  void merge_incremental_index();
-  bool should_flush_index();
-
-  private:
+private:
   SysStateStore() = default;
   ~SysStateStore();
-
-  /* Prevent copies */
   SysStateStore(const SysStateStore &) = delete;
   SysStateStore &operator=(const SysStateStore &) = delete;
+  void init_unlocked();
+  void check_ready() const;
+  void flush_unlocked();
+  void scan_unlocked();
+  void cache_data(hash_type hash, const std::vector<uint8_t> &data);
+  void clear_cache();
+  const std::vector<uint8_t> *cached_data(hash_type hash);
+  std::vector<uint8_t> read_entry(hash_type hash, const SysStateEntry &entry) const;
+  static uint32_t compute_checksum(const std::vector<uint8_t> &data);
 
-  /* Load index from disk */
-  void load_index();
-
-  /* Compute simple checksum */
-  uint32_t compute_checksum(const std::vector<uint8_t> &data);
-
-  void preload_all_data();
-
-  /* File paths */
   static constexpr const char *DATA_FILE = "sstate/packed.dat";
-  static constexpr const char *INDEX_FILE = "sstate/packed.idx";
-  static constexpr const char *INCREMENTAL_INDEX_FILE = "sstate/packed.inc";
-
-  /* In-memory index: hash -> entry */
   std::unordered_map<hash_type, SysStateEntry> index_;
-
-  /* Incremental index: entries not yet merged to main index */
-  std::unordered_map<hash_type, SysStateEntry> incremental_index_;
-
-  std::unordered_map<hash_type, std::vector<uint8_t>> data_cache_;
-
-  /* Current data file size (for append) */
+  struct CachedData {
+    std::vector<uint8_t> data;
+    std::list<hash_type>::iterator position;
+  };
+  static constexpr size_t CACHE_MAX_ENTRIES = 16384;
+  static constexpr size_t CACHE_MAX_BYTES = 1024 * 1024;
+  std::unordered_map<hash_type, CachedData> cache_;
+  std::list<hash_type> cache_lru_;
+  size_t cache_bytes_ = 0;
   uint64_t data_file_size_ = 0;
-
-  /* Mutex for thread safety (recursive to avoid deadlocks from nested calls) */
-  mutable std::recursive_mutex mutex_;
-
-  /* Whether initialized */
+  mutable std::mutex mutex_;
+  int fd_ = -1;
+  int directory_fd_ = -1;
   bool initialized_ = false;
-
-  /* Statistics */
-  size_t saved_count_ = 0;
-  size_t loaded_count_ = 0;
-
-  /* Last full index flush time */
-  std::chrono::steady_clock::time_point last_flush_time_;
+  bool failed_ = false;
 };
-
-#endif /* __SYSSTATE_STORE_H */
+#endif

@@ -41,7 +41,8 @@ class TracerScenarios(unittest.TestCase):
         )
 
     def run_tracer(self, commands, *, name="probe", batch=False, sibling=False,
-                   terminate=False, assertions=(), verify_failure_cleanup=False):
+                   terminate=False, assertions=(), verify_failure_cleanup=False,
+                   fail_storage_sync=False, extra_env=None):
         work = self.root / (name + ("-batch" if batch else "-interactive"))
         work.mkdir()
         binary = work / name
@@ -110,7 +111,7 @@ finally:
         with (work / "output").open("wb") as output:
             proc = subprocess.Popen(args, cwd=work, start_new_session=True,
                                     stdin=subprocess.PIPE, stdout=output,
-                                    stderr=subprocess.STDOUT)
+                                    stderr=subprocess.STDOUT, env=os.environ | (extra_env or {}))
             try:
                 if callable(commands):
                     offset = 0
@@ -145,6 +146,8 @@ finally:
                             time.sleep(0.001)
                         children = Path(f"/proc/{proc.pid}/task/{proc.pid}/children").read_text().split()
                         self.assertTrue(children, "No tracees to verify cleanup")
+                    if fail_storage_sync:
+                        (work / "inject-sync-error").touch()
                     proc.communicate(None if batch else commands.encode(), timeout=20)
                     if verify_failure_cleanup:
                         self.assertFalse(any(Path("/proc", child).exists() for child in children),
@@ -256,6 +259,26 @@ finally:
                 self.assertNotIn("terminate called", output)
                 self.assertNotIn("Complete explore all", output)
                 self.assertEqual(code, 1, output)
+
+    def test_storage_flush_failure_is_nonzero_and_reaps_tracees(self):
+        source = self.root / "fail_sync.c"
+        source.write_text(
+            '#include <errno.h>\n#include <unistd.h>\n#include <sys/syscall.h>\n'
+            'int fsync(int fd) { if (!access("inject-sync-error", F_OK)) { errno=EIO; return -1; }'
+            ' return syscall(SYS_fsync, fd); }\n'
+            'int fdatasync(int fd) { if (!access("inject-sync-error", F_OK)) { errno=EIO; return -1; }'
+            ' return syscall(SYS_fdatasync, fd); }\n'
+        )
+        library = self.root / "fail_sync.so"
+        subprocess.run(shlex.split(os.environ.get("CC", "/usr/bin/gcc")) +
+                       ["-shared", "-fPIC", str(source), "-o", str(library)], check=True)
+        code, output = self.run_tracer(
+            "q\n", verify_failure_cleanup=True, fail_storage_sync=True,
+            extra_env={"LD_PRELOAD": str(library)},
+        )
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("terminate called", output)
+        self.assertRegex(output, r"shutdown failed|state/execution error")
 
     def test_simd_registers_restore_with_memory(self):
         subprocess.run([

@@ -279,3 +279,75 @@ Independent review additionally checked Linux wake/requeue behavior experimental
 Touched units compile; warning checks retain existing unused parameters, so no
 whole-project lint-clean claim is made. Disk test uses shutdown/join as durability
 barrier; a discovered wait_for_completion race remains C26, not silently waived.
+
+## Storage subsystem repair
+
+Scope: StateStore cache/worker layer, StateStorePacked snapshot log/index, and
+SysStateStore metadata. Required invariant: successful save followed by completion
+barrier permits exact fresh-process reload; every load path returns identical
+immutable bytes; eviction/prefetch/dedup cannot change identity or drop pending
+writes. Short I/O, corruption and asynchronous errors must fail explicitly.
+
+Plan: regression tests before each defect repair; remove duplicate mutable cache
+state and unsafe maintenance paths, retain existing public callers and compatible
+validated records where possible. Account queued and executing writes atomically;
+publish data before indexes and flush before reporting persistence. Bound cache
+payload, keep returned buffers owned independently, and test shutdown/reinit.
+Measure the same 128 x128KiB mixed-compressibility dataset with hot and constrained
+caches before/after; byte-for-byte checks are mandatory in every benchmark pass.
+Do not infer throughput gains from a weaker pre-fix completion barrier.
+
+Storage implementation results: removed mutable cross-thread cache entries and
+eviction worker, duplicated cache read paths, unsafe packed compaction, and
+metadata idx/inc publication. Returned buffers own immutable bytes. Pending writes
+are bounded and retained through active work; errors poison further operations.
+Persistent descriptors and append logs eliminate repeated opens and full-index
+rewrites. Metadata has a bounded lazy cache, shared read-only scanning, and updated
+query/verification tools. Index recovery publishes recovered keys before append.
+
+Baseline `576eb3e` was independently extracted and compiled with GCC14 release
+flags and the same benchmark source; no new headers/objects were mixed in.
+Byte-checked benchmark medians on this host (5 runs each; old pressure3):
+
+| Workload / measure | Before | After | Interpretation |
+| --- | ---: | ---: | --- |
+| Hot cache, 128x128KiB save+barrier | 177.240 ms | 60.621 ms | 2.92x faster; new barrier provides stronger completion semantics |
+| Hot cache,4 complete read passes | 9.033 ms | 5.238 ms | 1.72x faster |
+| Hot cache duplicate saves | 3.116 ms | 2.631 ms | byte comparison retained |
+| Hot process peak RSS | 48,092 KiB | 56,080 KiB | increased; no general RSS reduction claim |
+| Metadata10,000x32B save+flush | 119.943 ms | 15.098 ms | 7.94x faster |
+| Metadata4 read passes | 1.535 ms | 1.718 ms | modest slowdown |
+| Metadata peak RSS | 14,440 KiB | 14,500 KiB | bounded cache bookkeeping has overhead |
+| Constrained cache | 1/3 valid runs | 5/5 valid runs | old2 wrong-byte failures followed by SIGABRT; no valid speedup comparison |
+
+New constrained-cache median save/barrier55.073ms, read41.043ms, dedup11.233ms,
+RSS30,200KiB. Its disk duplicate checks intentionally read/compare full bytes.
+Old one successful constrained run is not a reliable performance baseline.
+Packed syscall regression:1000 saves issue0 fsync; explicit barrier issues4.
+These are microbenchmarks, not search-throughput guarantees or hard RSS bounds.
+All runs use separate disposable stores; raw logs/results in ignored
+`build/storage-benchmark`, reproducible harness in tests/storage_benchmark.*.
+
+Verification (explicit `CC=/usr/bin/gcc CXX=/usr/bin/g++`, all successful):
+
+- NP1 `check-storage`:10 cache groups, packed raw/compressed/fault/recovery/rotation
+  gate, metadata concurrency/collision/cache/fault gate, read-only tool scenarios.
+- NP1 `check`:6 components and10 build contracts; `check-scenarios`:12 actual
+  tracer scenarios including fsync failure exit1 and tracee cleanup.
+- NP1 `check-futex-snapshot check-state-io check-mappings check-xstate`.
+- NP2 production build and `check-identity check-port check-accept check-redis`;
+  Redis exact SET/GET and normal exits pass (final run9.14s).
+- Strict compiler warnings on storage units; packed real GCC analyzer passes;
+  metadata ASan/UBSan/LSan passes. Cache/metadata full analyzer reports allocator/
+  standard-template diagnostics; no whole-project static-analysis-clean claim.
+- Cross-layer review found and fixed recovered-index publication and atexit
+  singleton lifetime. `git diff --check` and Python syntax validation pass.
+
+Remaining limits: no cross-store transaction, no arbitrary power-cut recovery
+proof, partial/corrupt files are rejected instead of automatically repaired,
+indexes still grow with state count and metadata startup scans the log. Shared
+buffers held by callers and one oversized pending state can exceed cache budgets.
+
+Verified benchmark result files: `before-verified-results.json` and
+`after-verified-results.json` under `build/storage-benchmark/`. RSS includes the
+benchmark's generated payloads and runtime, not only store-owned memory.

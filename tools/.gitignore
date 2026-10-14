@@ -1,0 +1,11 @@
+*
+*.*
+
+!FlameGraph/
+
+!*.cpp
+!*.py
+
+
+!sstate_reader.h
+!.gitignore

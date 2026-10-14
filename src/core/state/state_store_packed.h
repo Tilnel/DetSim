@@ -14,21 +14,11 @@
 
 #include "types.h"
 #include <atomic>
-#include <chrono>
 #include <cstdint>
-#include <memory>
 #include <mutex>
-#include <shared_mutex>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
-
-// Forward declare ZSTD types
-struct ZSTD_CCtx_s;
-struct ZSTD_DCtx_s;
-typedef struct ZSTD_CCtx_s ZSTD_CCtx;
-typedef struct ZSTD_DCtx_s ZSTD_DCtx;
 
 /* Entry in the global index */
 /* Packed to avoid alignment padding */
@@ -80,12 +70,9 @@ class StateStorePacked
     // Compression settings
     int compression_level = 1;
 
-    // Index flush settings
-    size_t index_flush_interval_entries = 10000;
-    size_t index_flush_interval_seconds = 30;
-
     // Storage path
     std::string storage_path = "memory";
+    bool read_only = false;
   };
 
   /* Initialize/load existing index */
@@ -96,7 +83,10 @@ class StateStorePacked
    * NOTE: data can be either raw or compressed. If compressed, set
    * is_compressed=true. hash must be precomputed from the RAW data (by caller).
    * original_size is required if is_compressed=true (size of uncompressed
-   * data).
+   * data). Successful save is process-visible, not power-loss durable until
+   * flush_index/wait_persisted/shutdown. I/O failures throw and poison writes
+   * until shutdown/reopen. One writer owns a process lock; read_only readers
+   * may reopen after a barrier while the writer is quiescent.
    */
   hash_type save(const void *data, size_t len, hash_type hash,
                  bool is_compressed = false, size_t original_size = 0);
@@ -117,10 +107,11 @@ class StateStorePacked
   /* Wait for persistence (compatibility with StateStore) */
   bool wait_persisted(hash_type hash, uint64_t timeout_ms = 0);
 
-  /* Flush index to disk */
+  /* Durability barrier: data, append journal and directory entries are synced.
+   * Does not rewrite the full index; shutdown checkpoints it once. */
   void flush_index();
 
-  /* Compact data files (rewrite to remove holes) */
+  /* Compatibility barrier: immutable records have no deletions to compact. */
   void compact();
 
   /* Rebuild index from data files (recovery mode) */
@@ -129,8 +120,8 @@ class StateStorePacked
   /* Shutdown and cleanup */
   void shutdown();
 
-  size_t get_entry_count() const { return index_.size(); }
-  size_t get_segment_count() const { return segments_.size(); }
+  size_t get_entry_count() const;
+  size_t get_segment_count() const;
   size_t get_total_data_size() const;
   bool verify_and_repair();
   void dump_debug_info();
@@ -138,7 +129,8 @@ class StateStorePacked
   /* Find hashes by prefix (for auto-completion) */
   std::vector<hash_type> find_by_prefix(const std::string &prefix);
 
-  /* Save segment info (for shutdown) */
+  /* Compatibility alias for the durability barrier. Segment files are
+   * authoritative. */
   void save_segments_info();
 
   /* Compression - shared with StateStore */
@@ -156,10 +148,8 @@ class StateStorePacked
 
   /* File paths */
   std::string get_segment_data_path(uint32_t segment_id);
-  std::string get_segment_index_path(uint32_t segment_id);
   std::string get_global_index_path();
   std::string get_incremental_index_path();
-  std::string get_segments_info_path();
 
   /* Load/save index */
   void load_index();
@@ -167,8 +157,6 @@ class StateStorePacked
   void flush_index_unlocked();
   void append_to_incremental_index(hash_type hash,
                                    const PackedIndexEntry &entry);
-  void merge_incremental_index();
-  bool should_flush_index();
 
   /* Segment management */
   void ensure_active_segment();
@@ -180,48 +168,22 @@ class StateStorePacked
 
   /* Data members */
   Config config_;
+  std::atomic<int> compression_level_{1};
   std::atomic<bool> initialized_{false};
-  std::atomic<bool> shutdown_{false};
 
   /* Global index: hash -> entry */
   std::unordered_map<hash_type, PackedIndexEntry> index_;
 
-  /* Incremental index: entries not yet merged to main index */
-  std::unordered_map<hash_type, PackedIndexEntry> incremental_index_;
-
   /* Segment management */
   std::vector<SegmentInfo> segments_;
   uint32_t active_segment_id_ = 0;
+  int journal_fd_ = -1;
+  int lock_fd_ = -1;
+  bool failed_ = false;
   int active_segment_fd_ = -1; // File descriptor for active segment (O_APPEND)
-
-  /* Statistics */
-  std::atomic<size_t> saved_count_{0};
-  std::atomic<size_t> loaded_count_{0};
-
-  /* Last flush time */
-  std::chrono::steady_clock::time_point last_flush_time_;
 
   /* Mutex for thread safety */
   mutable std::recursive_mutex mutex_;
-
-  /* ZSTD contexts (per-thread caching like StateStore) */
-  struct ZSTDContextCache
-  {
-    ZSTD_CCtx *cctx = nullptr;
-    ZSTD_DCtx *dctx = nullptr;
-    std::mutex mutex;
-
-    ~ZSTDContextCache() { reset(); }
-    void reset();
-    ZSTD_CCtx *getCCtx();
-    ZSTD_DCtx *getDCtx();
-  };
-
-  mutable std::mutex ctx_cache_mutex_;
-  std::unordered_map<std::thread::id, std::unique_ptr<ZSTDContextCache>>
-      ctx_caches_;
-
-  ZSTDContextCache *get_thread_ctx_cache();
 };
 
 /* C-style interface for compatibility */
