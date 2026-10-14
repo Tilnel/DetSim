@@ -3,6 +3,7 @@
 #include "ncurses_ui.h"
 #include "state_store.h"
 #include "guest.h"
+#include "page_restore_stats.h"
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -50,6 +51,11 @@ int main()
                                                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
         require(page != MAP_FAILED, "mmap");
         page[0] = 11; page[4096] = 12;
+        constexpr size_t sparse_size = 1024 * 1024;
+        auto* sparse = static_cast<unsigned char*>(mmap(nullptr, sparse_size, PROT_READ | PROT_WRITE,
+                                                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        require(sparse != MAP_FAILED, "sparse mapping");
+        memset(sparse, 37, sparse_size);
         FILE* file = fopen("backing", "w+");
         require(file && ftruncate(fileno(file), 4096) == 0, "backing file");
         void* backed = mmap(nullptr, 4096, PROT_READ, MAP_PRIVATE, fileno(file), 0);
@@ -91,6 +97,27 @@ int main()
                     protection(child, reinterpret_cast<uintptr_t>(page) + 4096) == PROT_READ,
                     "saved read-only permissions were not restored");
         };
+        // Two remote changes in a large region must restore only changed pages,
+        // including the final byte; unchanged pages retain the exact baseline.
+        unsigned char changed = 91;
+        iovec sparse_local[2]{{&changed, 1}, {&changed, 1}};
+        iovec sparse_remote[2]{{sparse, 1}, {sparse + sparse_size - 1, 1}};
+        require(process_vm_writev(child, sparse_local, 2, sparse_remote, 2, 0) == 2,
+                "sparse mutations");
+        std::vector<maps_item> sparse_maps;
+        saved.restore_memory_mappings(hash, child, sparse_maps);
+        detsim::page_restore::reset();
+        saved.recover_mem_reg_snapshot(sparse_maps, hash, child);
+        auto sparse_stats = detsim::page_restore::stats();
+        require(sparse_stats.pages_written >= 2 && sparse_stats.write_bytes < sparse_size &&
+                sparse_stats.read_bytes >= sparse_size, "restore did not restrict writes to changed pages");
+        std::vector<unsigned char> sparse_copy(sparse_size);
+        iovec sparse_read_local{sparse_copy.data(), sparse_size}, sparse_read_remote{sparse, sparse_size};
+        require(process_vm_readv(child, &sparse_read_local, 1, &sparse_read_remote, 1, 0) == ssize_t(sparse_size),
+                "sparse restored read");
+        for (auto byte : sparse_copy) require(byte == 37, "sparse region restore omitted bytes");
+        printf("Sparse restore: read=%lu write=%lu compared=%lu written=%lu\n",
+               sparse_stats.read_bytes, sparse_stats.write_bytes, sparse_stats.pages_compared, sparse_stats.pages_written);
         mutate(); restore(); mutate(); restore();
         require(tracee_do_syscall(child, SYS_mprotect, reinterpret_cast<uintptr_t>(page), 8192,
                                  PROT_READ | PROT_WRITE, 0, 0, 0) == 0, "writable saved permission");
@@ -149,7 +176,7 @@ int main()
         require(shared_failed, "shared mapping accepted as isolated snapshot memory");
         kill(child, SIGKILL); waitpid(child, nullptr, 0); child = -1;
         StateStore::instance().shutdown();
-        munmap(page, 8192); munmap(backed, 4096); fclose(file);
+        munmap(page, 8192); munmap(sparse, sparse_size); munmap(backed, 4096); fclose(file);
         std::filesystem::current_path(cwd); std::filesystem::remove_all(directory);
         puts("PASS mappings: RO data/literal capture, repeated restore, split/merge permissions, anonymous recreation, file-backed rejection");
         return 0;

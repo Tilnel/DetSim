@@ -12,7 +12,10 @@
 | `SysStateStore` | 系统状态元数据的追加日志、索引与有界缓存 | `sysstate_store.{h,cpp}` |
 
 源文件均在 `src/core/state/`。`state.cpp` 负责捕获、恢复和语义身份，
-存储层负责保留给定字节。当前程序快照格式是 v5；旧快照明确拒绝。
+存储层负责保留给定字节。默认程序快照格式是v5；本分支另支持显式选择的v6页
+manifest，两者通过SnapshotView读取。v6页和manifest都用同一个StateStore保存，
+完整图的持久化以completion barrier为界；v5/v6的root hash不同。更旧格式拒绝。
+详见[页快照契约与测量](page-snapshots.md)。
 
 ## 保存、完成与失败
 
@@ -58,8 +61,9 @@ worker 压缩一次，生成磁盘记录并复用压缩结果填充 L2。
 
 `load_shared` 返回真正拥有缓冲区的 `shared_ptr<const vector<uint8_t>>`。
 淘汰、重载和关闭只移除缓存的所有权，不会清空调用者手上的数据。
-因此缓存预算不等于总 RSS：调用者持有的缓冲区、pending、索引、压缩上下文
-和分配器开销另计。L1/L2 预算为零时仍可保存和读取。
+因此缓存预算不等于总RSS：调用者缓冲区、pending、索引、压缩上下文、分配器，
+以及页后端的工作图像、上次页owner和4MiB/256项解析缓存另计。
+L1/L2预算为零时仍可保存和读取。
 
 未完成写入默认最多 50 个、64 MiB；队列和正在执行的任务都计入。
 允许单个超过字节预算的快照，在其他 pending 排空后执行，避免永久等待。

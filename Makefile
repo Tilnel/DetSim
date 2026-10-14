@@ -14,7 +14,7 @@ NP ?= 2
 endif
 
 # Integration fixtures use one node unless explicitly overridden.
-ifneq ($(filter check-integration check-dwarf check-elf check-scenarios check-xstate check-exec check-state-io check-mappings check-futex-snapshot check-futex check-storage check-store-cache check-store-packed check-store-metadata check-store-tools benchmark-storage check-soft-dirty,$(MAKECMDGOALS)),)
+ifneq ($(filter check-integration check-dwarf check-elf check-scenarios check-xstate check-exec check-state-io check-mappings check-futex-snapshot check-futex check-storage check-store-cache check-store-packed check-store-metadata check-store-tools benchmark-storage check-soft-dirty check-page-snapshot,$(MAKECMDGOALS)),)
 NP ?= 1
 endif
 
@@ -44,7 +44,7 @@ SRCS = src/main.cpp\
        src/core/scheduler.cpp src/core/guest.cpp src/core/monitor.cpp src/core/config.cpp src/core/syscall_fmt.cpp src/core/resolve.cpp \
        src/core/scheduler/exploration.cpp \
        src/core/dwarf.cpp \
-       src/core/state/state.cpp src/core/state/xstate.cpp src/core/state/state_store.cpp src/core/state/state_store_packed.cpp src/core/state/sysstate_store.cpp src/core/state/state_transition.cpp src/core/state/serialize.cpp \
+       src/core/state/state.cpp src/core/state/page_snapshot.cpp src/core/state/page_capture.cpp src/core/state/xstate.cpp src/core/state/state_store.cpp src/core/state/state_store_packed.cpp src/core/state/sysstate_store.cpp src/core/state/state_transition.cpp src/core/state/serialize.cpp \
        src/core/engine/thread_manager.cpp src/core/engine/signal_handler.cpp src/core/engine/exec_engine.cpp \
        src/core/syscall/dispatcher.cpp src/core/syscall/handlers.cpp \
        src/subsys/net/sockstate.cpp src/subsys/net/emu.cpp \
@@ -117,7 +117,7 @@ check-build-contracts:
 check: test check-build-contracts
 
 # Optional fragments are absent in the disposable build-contract fixtures.
--include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk tests/futex_snapshot.mk tests/futex.mk tests/storage.mk tests/store_cache.mk tests/store_packed.mk tests/redisraft.mk tests/capture.mk tests/soft_dirty.mk
+-include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk tests/futex_snapshot.mk tests/futex.mk tests/storage.mk tests/store_cache.mk tests/store_packed.mk tests/redisraft.mk tests/capture.mk tests/soft_dirty.mk tests/page_snapshot.mk
 check-integration: check-dwarf check-elf
 
 # This gate executes native programs via ptrace; keep it separate from make check.
@@ -145,6 +145,7 @@ help:
 	@echo 'make check-mappings         Private mapping contents and protections regression'
 	@echo 'make check-capture         NP=2 full-versus-optimized snapshot equivalence'
 	@echo 'make check-soft-dirty      Experimental kernel soft-dirty byte oracle'
+	@echo 'make check-page-snapshot   v5/v6 page storage, reads, corruption and reopen'
 	@echo 'make check-identity         NP=2 ordered metadata identity regression'
 	@echo 'make check-port             NP=2 deterministic virtual TCP ports regression'
 	@echo 'make benchmark-redisraft    NP=3 bounded Raft replication and DFS benchmark'

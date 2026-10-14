@@ -88,6 +88,10 @@ class StateStore
   void shutdown();
 
   static StateStore &instance();
+  // Identifies the store lifetime; external parsed views must not cross reopen.
+  uint64_t generation() const { return generation_.load(); }
+  // Validates readiness before admitting a parsed snapshot cache hit.
+  uint64_t snapshot_generation();
 
   // ==================================================================
   // Queue Management (with transparent prefetch)
@@ -177,6 +181,7 @@ class StateStore
   };
   using Cache = std::unordered_map<hash_type, CacheEntry>;
   Config config_;
+  std::atomic<uint64_t> generation_{0};
   // API calls may overlap; init/shutdown exclude all calls and join workers.
   mutable std::shared_mutex lifecycle_mutex_;
   mutable std::mutex mutex_;

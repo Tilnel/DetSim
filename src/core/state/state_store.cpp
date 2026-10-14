@@ -56,17 +56,28 @@ void StateStore::init(const Config &config) {
     throw;
   }
   { std::lock_guard lock(mutex_); initialized_ = true; }
+  ++generation_;
   ever_initialized_ = true;
 }
 void StateStore::ensure_initialized() {
   if (!ever_initialized_.load()) init();
+}
+uint64_t StateStore::snapshot_generation() {
+  ensure_initialized();
+  std::shared_lock lifecycle(lifecycle_mutex_);
+  std::lock_guard lock(mutex_);
+  check_ready();
+  return generation_.load();
 }
 void StateStore::check_ready() const {
   if (failure_) std::rethrow_exception(failure_);
   if (!initialized_ || stopping_) throw std::runtime_error("StateStore is not running");
 }
 void StateStore::record_failure(std::exception_ptr failure) {
-  if (!failure_) failure_ = failure;
+  if (!failure_) {
+    failure_ = failure;
+    ++generation_;
+  }
   // Every waiter observes the same failure; no dropped write reports success.
   completion_cv_.notify_all(); space_cv_.notify_all(); work_cv_.notify_all();
   prefetch_cv_.notify_all();
@@ -74,6 +85,7 @@ void StateStore::record_failure(std::exception_ptr failure) {
 void StateStore::shutdown() {
   std::unique_lock lifecycle(lifecycle_mutex_);
   if (!initialized_) return;
+  ++generation_;
   { std::lock_guard lock(mutex_); stopping_ = true; }
   work_cv_.notify_all(); prefetch_cv_.notify_all();
   for (auto &thread : io_threads_) thread.join();

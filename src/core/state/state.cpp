@@ -5,6 +5,8 @@
 #include "state.h"
 #include "xstate.h"
 #include "soft_dirty_experiment.h"
+#include "page_capture.h"
+#include "page_restore_stats.h"
 #include <stdexcept>
 #include <climits>
 #include "cereal/archives/binary.hpp"
@@ -38,52 +40,6 @@
 #include <sys/uio.h>
 #include <sys/user.h>
 #include <sys/wait.h>
-
-// Check before interpreting an archive: v3 thread records lack XSTATE.
-static void validate_state_header(const std::vector<uint8_t>& data)
-{
-  if (data.size() < sizeof(StateDataHeader))
-    throw std::runtime_error("Truncated state snapshot header");
-  StateDataHeader header;
-  memcpy(&header, data.data(), sizeof(header));
-  if (header.magic != 0x4453544D || header.version != 5)
-    throw std::runtime_error("Incompatible state snapshot: requires format version 5 (thread/futex state)");
-  auto in_bounds = [&](uint64_t offset, uint64_t size) {
-    return offset <= data.size() && size <= data.size() - offset;
-  };
-  if (header.num_regions > (data.size() - sizeof(header)) / sizeof(RegionInfo) ||
-      !header.tstate_size || !in_bounds(header.tstate_offset, header.tstate_size) ||
-      !in_bounds(header.maps_offset, header.maps_size) ||
-      !in_bounds(header.regs_offset, sizeof(user_regs_struct)))
-    throw std::runtime_error("Invalid state snapshot section bounds");
-  const uint64_t table_end = sizeof(header) + uint64_t(header.num_regions) * sizeof(RegionInfo);
-  if (header.tstate_offset != table_end ||
-      header.maps_offset != header.tstate_offset + header.tstate_size ||
-      header.regs_offset < header.maps_offset + header.maps_size ||
-      header.regs_offset + sizeof(user_regs_struct) != data.size())
-    throw std::runtime_error("Invalid state snapshot section ordering");
-  uint64_t next_data = header.maps_offset + header.maps_size;
-  uint64_t previous_end = 0;
-  for (uint32_t i = 0; i < header.num_regions; ++i) {
-    RegionInfo region;
-    memcpy(&region, data.data() + sizeof(header) + i * sizeof(region), sizeof(region));
-    const uint32_t prot = (region.flags[0] == 'r' ? PROT_READ : 0) |
-                          (region.flags[1] == 'w' ? PROT_WRITE : 0) |
-                          (region.flags[2] == 'x' ? PROT_EXEC : 0);
-    if (region.flags[0] != 'r' || (region.flags[1] != 'w' && region.flags[1] != '-') ||
-        (region.flags[2] != 'x' && region.flags[2] != '-') || region.flags[3] != 'p' ||
-        region.flags[4] != 0 || region.prot != prot)
-      throw std::runtime_error("Invalid snapshot memory region protection");
-    if (region.end <= region.start || region.start < previous_end ||
-        region.offset != next_data || region.offset > header.regs_offset ||
-        region.end - region.start > header.regs_offset - region.offset)
-      throw std::runtime_error("Invalid state snapshot memory region");
-    previous_end = region.end;
-    next_data += region.end - region.start;
-  }
-  if (next_data != header.regs_offset)
-    throw std::runtime_error("Invalid state snapshot memory extent");
-}
 
 static void checked_memory_io(bool write, pid_t pid, const iovec* local,
                               const iovec* remote, size_t count)
@@ -252,60 +208,17 @@ int sys_state::save_metadata() const
 tracee_state::tracee_state(hash_type hash)
   : threads(), thread_create_records(), main_tid(0), current_thread_idx(0), futex_state()
 {
-  // Handle invalid hash (0 means uninitialized/invalid)
-  if (hash == 0)
-  {
-    return;
-  }
-
-  // Load integrated data from StateStore
-  LOG_DEBUG("tracee_state: loading hash %016lx", hash);
-  auto data_shared_ptr = StateStore::instance().load_shared(hash);
-
-  if (!data_shared_ptr)
-  {
-    throw std::runtime_error("Cannot load tracee_state snapshot");
-  }
-
-  const std::vector<uint8_t> &data = *data_shared_ptr;
-  validate_state_header(data);
-
-  // Parse header
-  if (data.size() < sizeof(StateDataHeader))
-  {
-    LOG_CRIT("Invalid state data for hash %016lx: too small", hash);
-    return;
-  }
-
-  StateDataHeader *header = (StateDataHeader *)data.data();
-  if (header->magic != 0x4453544D)
-  {
-    LOG_CRIT("Invalid state data for hash %016lx: bad magic", hash);
-    return;
-  }
-
-  // Deserialize tracee_state from integrated data
-  if (header->version >= 2 && header->tstate_size > 0)
-  {
-    if (header->tstate_offset + header->tstate_size <= data.size())
-    {
-      std::istringstream iss(std::string(
-          (char *)data.data() + header->tstate_offset, header->tstate_size));
-      try
-      {
-        cereal::BinaryInputArchive ar(iss);
-        ar(*this);
-      }
-      catch (...)
-      {
-        throw std::runtime_error("Failed to deserialize tracee_state snapshot");
-      }
-    }
-  }
-  else
-  {
-    LOG_WARN("StateStore data for hash %016lx has no embedded tracee_state",
-             hash);
+  if (!hash) return;
+  const auto snapshot = SnapshotView::open(hash);
+  const auto metadata = snapshot->metadata();
+  std::istringstream encoded(std::string(reinterpret_cast<const char*>(metadata.data()), metadata.size()));
+  try {
+    cereal::BinaryInputArchive archive(encoded);
+    archive(*this);
+    if (encoded.peek() != std::char_traits<char>::eof())
+      throw std::runtime_error("Trailing tracee metadata bytes");
+  } catch (...) {
+    throw std::runtime_error("Failed to deserialize tracee_state snapshot");
   }
 }
 
@@ -371,49 +284,17 @@ static bool same_backing(const maps_item& saved, const maps_item& live, uint64_t
 void tracee_state::restore_memory_mappings(
     hash_type ts_hash, int pid, std::vector<maps_item> &maps_out) const
 {
-  /* Load saved mappings from StateStore */
+  const auto snapshot = SnapshotView::open(ts_hash);
   std::vector<maps_item> maps_saved;
-  {
-    std::shared_ptr<const std::vector<uint8_t>> data_shared_ptr =
-        StateStore::instance().load_shared(ts_hash);
-    if (data_shared_ptr == nullptr)
-    {
-      throw std::runtime_error("Cannot load snapshot mappings");
-    }
-
-    const std::vector<uint8_t> &data = *data_shared_ptr;
-    validate_state_header(data);
-
-    if (data.size() >= sizeof(StateDataHeader))
-    {
-      StateDataHeader *header = (StateDataHeader *)data.data();
-      /* Try to read from integrated maps text (version 3+) */
-      if (header->magic == 0x4453544D && header->version >= 3 &&
-          header->maps_size > 0)
-      {
-        if (header->maps_offset + header->maps_size <= data.size())
-        {
-          const char *maps_text =
-              (const char *)data.data() + header->maps_offset;
-          std::istringstream iss(std::string(maps_text, header->maps_size));
-          std::string line;
-          while (std::getline(iss, line))
-          {
-            maps_item item = {};
-            if (sscanf(line.c_str(), "%lx-%lx %4s %lx %x:%x %lu %511s",
-                       &item.start, &item.end, item.flags, &item.offset, &item.a, &item.b,
-                       &item.inode, item.name) >= 7)
-            {
-              if (item.end <= item.start)
-                throw std::runtime_error("Invalid saved memory mapping extent");
-              maps_saved.push_back(item);
-            }
-            else
-              throw std::runtime_error("Invalid saved memory mapping text");
-          }
-        }
-      }
-    }
+  std::istringstream encoded(std::string(snapshot->maps_text()));
+  std::string line;
+  while (std::getline(encoded, line)) {
+    maps_item item{};
+    if (sscanf(line.c_str(), "%lx-%lx %4s %lx %x:%x %lu %511s",
+               &item.start, &item.end, item.flags, &item.offset, &item.a, &item.b,
+               &item.inode, item.name) < 7 || item.end <= item.start)
+      throw std::runtime_error("Invalid saved memory mapping text");
+    maps_saved.push_back(item);
   }
 
   if (maps_saved.empty())
@@ -484,172 +365,105 @@ void tracee_state::restore_memory_mappings(
 void tracee_state::recover_mem_reg_snapshot(std::vector<maps_item> &maps,
                                             hash_type ts_hash, int pid) const
 {
-  // Load integrated data from StateStore
-  std::shared_ptr<const std::vector<uint8_t>> data_shared_ptr =
-      StateStore::instance().load_shared(ts_hash);
+  const auto snapshot = SnapshotView::open(ts_hash);
+  const auto& regions = snapshot->regions();
 
-  if (!data_shared_ptr)
-  {
-    throw std::runtime_error("Cannot load snapshot memory");
-  }
-
-  const std::vector<uint8_t> &data = *data_shared_ptr;
-  validate_state_header(data);
-  // Parse header
-  if (data.size() < sizeof(StateDataHeader))
-  {
-    LOG_CRIT("Invalid state data for hash %016lx: too small", ts_hash);
-    return;
-  }
-
-  StateDataHeader *header = (StateDataHeader *)data.data();
-  if (header->magic != 0x4453544D)
-  {
-    LOG_CRIT("Invalid state data format for hash %016lx", ts_hash);
-    return;
-  }
-
-  RegionInfo *regions = (RegionInfo *)(data.data() + sizeof(StateDataHeader));
-
-  /* Read current rseq structure to preserve it */
-  if (rseq_len[pid] < 0)
-    throw std::runtime_error("Invalid rseq size");
+  // Kernel-maintained rseq fields belong to the live process, not the branch.
+  if (rseq_len[pid] < 0) throw std::runtime_error("Invalid rseq size");
   std::vector<uint8_t> rseq(rseq_len[pid]);
-  iovec rseq_local{rseq.data(), rseq.size()};
-  iovec rseq_remote{rseq_struct[pid], rseq.size()};
+  iovec rseq_local{rseq.data(), rseq.size()}, rseq_remote{rseq_struct[pid], rseq.size()};
   checked_memory_io(false, pid, &rseq_local, &rseq_remote, 1);
+  detsim::page_restore::read_bytes.fetch_add(rseq.size(), std::memory_order_relaxed);
 
-  // ========================================================================
-  // Optimization 1: Aggregated IO - Batch multiple regions in single syscall
-  // process_vm_writev supports up to IOV_MAX (1024) iovecs
-  // This reduces syscall overhead from N syscalls to ceil(N/IOV_MAX)
-  // ========================================================================
+  constexpr size_t MAX_IOV_BATCH = 256;
+  iovec local_iov[MAX_IOV_BATCH], remote_iov[MAX_IOV_BATCH];
+  size_t iov_count = 0, queued_bytes = 0;
+  // Loading another page can evict a previous page from the store's cache.
+  // Own every queued buffer until the corresponding write completes.
+  std::vector<std::shared_ptr<const std::vector<uint8_t>>> owners;
+  owners.reserve(MAX_IOV_BATCH);
+  auto flush = [&] {
+    if (!iov_count) return;
+    checked_memory_io(true, pid, local_iov, remote_iov, iov_count);
+    detsim::page_restore::write_bytes.fetch_add(queued_bytes, std::memory_order_relaxed);
+    detsim::page_restore::pages_written.fetch_add(iov_count, std::memory_order_relaxed);
+    iov_count = queued_bytes = 0;
+    owners.clear();
+  };
 
-  // Maximum iovecs per syscall (conservative to avoid stack overflow)
-  constexpr int MAX_IOV_BATCH = 256;
-
-  struct iovec local_iov[MAX_IOV_BATCH];
-  struct iovec remote_iov[MAX_IOV_BATCH];
-  int iov_count = 0;
   std::vector<maps_item> current_maps;
   auto current_maps_file = fileutils::open_cfile(fmt::format("/proc/{}/maps", pid), "r");
   if (!current_maps_file) throw std::runtime_error("Cannot inspect restore memory permissions");
   get_maps_item(current_maps, current_maps_file.get());
-  std::vector<uint32_t> protected_regions;
+  std::vector<size_t> protected_regions;
   std::vector<uint8_t> comparison;
 
-  for (uint32_t i = 0; i < header->num_regions; i++)
-  {
-    uint64_t start = regions[i].start;
-    uint64_t end = regions[i].end;
-    uint64_t offset = regions[i].offset;
-    ssize_t size = end - start;
-
-    if (size <= 0)
-      continue;
-
-    // Check if this region is still valid in current maps
+  for (size_t i = 0; i < regions.size(); ++i) {
+    const auto& region = regions[i];
+    const uint64_t start = region.start, end = region.end;
+    const size_t size = end - start;
     bool valid = false;
-    for (auto &item : maps)
-    {
-      if (item.start <= start && end <= item.end && item.flags[3] == 'p')
-      {
+    for (const auto& item : maps) {
+      if (item.start <= start && end <= item.end && item.flags[3] == 'p') {
         valid = true;
         break;
       }
     }
-    if (!valid)
-    {
-      throw std::runtime_error("Snapshot private region missing during restore");
-    }
-
-    // Check data bounds
-    if (offset + size > data.size())
-    {
-      LOG_WARN("Region %lx-%lx data out of bounds", start, end);
-      continue;
-    }
+    if (!valid) throw std::runtime_error("Snapshot private region missing during restore");
 
     uint64_t readable_end = start;
     bool original_permissions = true;
     for (const auto& live : current_maps) {
       if (live.end <= readable_end || live.start >= end) continue;
       if (live.start > readable_end || live.flags[0] != 'r') break;
-      original_permissions &= mapping_protection(live.flags) == int(regions[i].prot);
+      original_permissions &= mapping_protection(live.flags) == int(region.prot);
       readable_end = std::min(end, live.end);
       if (readable_end == end) break;
     }
-    if (readable_end == end) {
+    const bool comparable = readable_end == end;
+    if (comparable) {
       comparison.resize(size);
-      iovec local{comparison.data(), size_t(size)}, remote{reinterpret_cast<void*>(start), size_t(size)};
+      iovec local{comparison.data(), size}, remote{reinterpret_cast<void*>(start), size};
       checked_memory_io(false, pid, &local, &remote, 1);
-      if (!memcmp(comparison.data(), data.data() + offset, size)) {
-        if (!original_permissions) restore_protection(pid, start, end, regions[i].prot);
+      detsim::page_restore::read_bytes.fetch_add(size, std::memory_order_relaxed);
+    }
+
+    bool made_writable = false;
+    for (size_t page_index = 0; page_index < snapshot->page_count(i); ++page_index) {
+      const auto page = snapshot->page(i, page_index);
+      if (comparable && !memcmp(comparison.data() + (page.address - start), page.data, page.length))
         continue;
+      if (!made_writable) {
+        // Applying the saved writable protection also repairs a split RO branch.
+        if (!original_permissions || !comparable || !(region.prot & PROT_WRITE)) {
+          restore_protection(pid, start, end, region.prot | PROT_WRITE);
+          protected_regions.push_back(i);
+        }
+        made_writable = true;
       }
+      local_iov[iov_count] = {const_cast<uint8_t*>(page.data), page.length};
+      remote_iov[iov_count] = {reinterpret_cast<void*>(page.address), page.length};
+      owners.push_back(page.owner);
+      ++iov_count;
+      queued_bytes += page.length;
+      if (iov_count == MAX_IOV_BATCH) flush();
     }
-
-    uint64_t cursor = start;
-    bool already_writable = (regions[i].prot & PROT_WRITE) != 0;
-    for (const auto& live : current_maps) {
-      if (live.end <= cursor || live.start >= end) continue;
-      if (live.start > cursor || mapping_protection(live.flags) != int(regions[i].prot)) {
-        already_writable = false;
-        break;
-      }
-      cursor = std::min(end, live.end);
-      if (cursor == end) break;
-    }
-    if (!already_writable || cursor != end) {
-      restore_protection(pid, start, end, regions[i].prot | PROT_WRITE);
-      protected_regions.push_back(i);
-    }
-
-    // Fill iovec for this region
-    local_iov[iov_count].iov_base = (bytes *)data.data() + offset;
-    local_iov[iov_count].iov_len = size;
-    remote_iov[iov_count].iov_base = (void *)start;
-    remote_iov[iov_count].iov_len = size;
-    iov_count++;
-
-    LOG_TRACE("Queue restore mem %p-%p (batch %d/%d)", (void *)start,
-              (void *)end, iov_count, MAX_IOV_BATCH);
-
-    // Flush batch when full
-    if (iov_count >= MAX_IOV_BATCH)
-    {
-      checked_memory_io(true, pid, local_iov, remote_iov, iov_count);
-      iov_count = 0;
-    }
+    if (comparable)
+      detsim::page_restore::pages_compared.fetch_add(snapshot->page_count(i), std::memory_order_relaxed);
+    // Contents may be unchanged while the discarded branch changed mprotect.
+    if (!made_writable && !original_permissions)
+      restore_protection(pid, start, end, region.prot);
   }
+  flush();
 
-  // Flush remaining regions
-  if (iov_count > 0)
-  {
-    checked_memory_io(true, pid, local_iov, remote_iov, iov_count);
-  }
-
-  /* Restore the preserved rseq structure */
   checked_memory_io(true, pid, &rseq_local, &rseq_remote, 1);
-
-  // Restore every saved permission, including pages that were writable in S
-  // but read-only in the branch being discarded.
-  for (uint32_t i : protected_regions)
+  detsim::page_restore::write_bytes.fetch_add(rseq.size(), std::memory_order_relaxed);
+  for (size_t i : protected_regions)
     restore_protection(pid, regions[i].start, regions[i].end, regions[i].prot);
 
-  // Read registers from data
-  if (header->regs_offset + sizeof(struct user_regs_struct) <= data.size())
-  {
-    struct user_regs_struct regs;
-    memcpy(&regs, data.data() + header->regs_offset, sizeof(regs));
-    if (ptrace(PTRACE_SETREGS, pid, NULL, &regs) == -1)
-      throw std::runtime_error("Cannot restore main thread registers");
-    LOG_TRACE("Restored registers for hash %016lx", ts_hash);
-  }
-  else
-  {
-    LOG_ERROR("Invalid register offset in state data for hash %016lx", ts_hash);
-  }
+  auto regs = snapshot->main_regs();
+  if (ptrace(PTRACE_SETREGS, pid, NULL, &regs) == -1)
+    throw std::runtime_error("Cannot restore main thread registers");
 }
 
 /* Main entry: recover running state for a process */
@@ -908,6 +722,11 @@ hash_type tracee_state::save_full_state_to_state_store(int pid, hash_type compar
     std::string str = oss.str();
     tstate_data.assign(str.begin(), str.end());
   }
+
+  if (page_capture_enabled())
+    return save_paged_snapshot(pid, regions, tstate_data, maps_text, regs,
+                              reinterpret_cast<uintptr_t>(rseq_struct[pid]), rseq_len[pid],
+                              comparison_hash);
 
   // Allocate final buffer
   size_t header_size = sizeof(StateDataHeader);
@@ -1177,25 +996,10 @@ void *read_mem(int /*pid*/, hash_type ts_hash, uint64_t addr, long size)
 {
   if (size < 0 || uint64_t(size) > UINT64_MAX - addr)
     throw std::runtime_error("Invalid snapshot memory read range");
-  auto saved = StateStore::instance().load_shared(ts_hash);
-  if (!saved)
-    throw std::runtime_error("Cannot read unavailable snapshot");
-  validate_state_header(*saved);
-  const auto* header = reinterpret_cast<const StateDataHeader*>(saved->data());
-  const auto* regions = reinterpret_cast<const RegionInfo*>(saved->data() + sizeof(StateDataHeader));
-  auto result = std::unique_ptr<bytes, decltype(&free)>(static_cast<bytes*>(malloc(size_t(size) + 1)), &free);
+  auto result = std::unique_ptr<bytes, decltype(&free)>(
+      static_cast<bytes*>(malloc(size_t(size) + 1)), &free);
   if (!result) throw std::bad_alloc();
-  size_t copied = 0;
-  for (uint32_t i = 0; i < header->num_regions && copied < size_t(size); ++i) {
-    const uint64_t current = addr + copied;
-    if (regions[i].start <= current && current < regions[i].end) {
-      const size_t length = std::min(uint64_t(size - copied), regions[i].end - current);
-      memcpy(result.get() + copied, saved->data() + regions[i].offset + current - regions[i].start, length);
-      copied += length;
-    }
-  }
-  if (copied != size_t(size))
-    throw std::runtime_error("Requested memory range is absent from snapshot");
+  SnapshotView::open(ts_hash)->read_into(addr, result.get(), size_t(size));
   result.get()[size] = 0;
   return result.release();
 }

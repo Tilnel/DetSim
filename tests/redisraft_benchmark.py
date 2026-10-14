@@ -171,6 +171,9 @@ try:
             (work/'dfs-report.txt').write_text(reply)
             experiment=re.search(r'SOFT_DIRTY (\{[^\n]+\})', reply)
             if experiment: result['soft_dirty']=json.loads(experiment[1])
+            for prefix, key in [('PAGE_CAPTURE', 'page_capture'), ('PAGE_RESTORE', 'page_restore')]:
+                match=re.search(prefix+r' (\{[^\n]+\})', reply)
+                if match: result[key]=json.loads(match[1])
             result['dfs_report_tail']=reply[reply.rfind('Time elapsed:'):]
             m=re.search(r'Complete explore all (\d+) sys_states \(new: (\d+)\)',reply)
             if not m: raise RuntimeError('DFS did not report normal bounded completion: '+reply[-2000:])

@@ -5,6 +5,7 @@
 #include "sysstate_store.h"
 #include "guest.h"
 #include "proc_status.h"
+#include "page_snapshot.h"
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -70,15 +71,35 @@ int main(int argc, char**)
                 "unchanged resident inactive snapshot did not bypass hashing");
         require(reused.ss_hash == source.ss_hash, "unchanged capture identity drift");
         auto compare_full = [&](const sys_state& optimized) {
+            const char* backend = getenv("DETSIM_SNAPSHOT_BACKEND");
+            const std::string selected = backend ? backend : "full";
+            setenv("DETSIM_SNAPSHOT_BACKEND", "full", 1);
             setenv("DETSIM_CAPTURE_MODE", "full", 1);
             sys_state full(info, &source);
             unsetenv("DETSIM_CAPTURE_MODE");
-            require(full.ss_hash == optimized.ss_hash, "full capture system identity differs");
+            if (backend) setenv("DETSIM_SNAPSHOT_BACKEND", selected.c_str(), 1);
+            else unsetenv("DETSIM_SNAPSHOT_BACKEND");
+            if (selected == "full")
+                require(full.ss_hash == optimized.ss_hash, "full capture system identity differs");
             for (int i = 0; i < NP; ++i) {
-                std::vector<uint8_t> expected, actual;
-                require(StateStore::instance().load(full.ts_hash[i], expected) > 0 &&
-                        StateStore::instance().load(optimized.ts_hash[i], actual) > 0 && expected == actual,
-                        "optimized snapshot bytes differ");
+                const auto expected = SnapshotView::open(full.ts_hash[i]);
+                const auto actual = SnapshotView::open(optimized.ts_hash[i]);
+                require(expected->maps_text() == actual->maps_text() &&
+                    expected->metadata().size() == actual->metadata().size() &&
+                    !memcmp(expected->metadata().data(), actual->metadata().data(), expected->metadata().size()) &&
+                    !memcmp(&expected->main_regs(), &actual->main_regs(), sizeof(user_regs_struct)),
+                    "decoded snapshot metadata differs");
+                require(expected->regions().size() == actual->regions().size(), "region count differs");
+                for (size_t region = 0; region < expected->regions().size(); ++region) {
+                    const auto& e = expected->regions()[region];
+                    const auto& a = actual->regions()[region];
+                    require(e.start == a.start && e.end == a.end && e.prot == a.prot &&
+                        !memcmp(e.flags, a.flags, sizeof(e.flags)), "decoded regions differ");
+                    std::vector<uint8_t> ebytes(e.end-e.start), abytes(ebytes.size());
+                    expected->read_into(e.start, ebytes.data(), ebytes.size());
+                    actual->read_into(a.start, abytes.data(), abytes.size());
+                    require(ebytes == abytes, "decoded snapshot memory differs");
+                }
             }
         };
         compare_full(reused);

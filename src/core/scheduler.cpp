@@ -15,6 +15,8 @@
 #include "state/sysstate_store.h"
 #include "utils.h"
 #include "state/soft_dirty_experiment.h"
+#include "state/page_capture.h"
+#include "state/page_restore_stats.h"
 
 /* NCursesUI integration */
 #include "ui/log_wrapper.h"
@@ -1219,6 +1221,8 @@ int do_dfs_iterative(hash_type initial_ss_hash, int initial_depth)
 
 int exec_dfs(int depth)
 {
+  reset_page_capture_stats();
+  detsim::page_restore::reset();
   if (auto* experiment = detsim::experiment::configured_capture())
     experiment->reset_stats();
   srand(time(NULL));
@@ -1261,6 +1265,8 @@ int exec_dfs(int depth)
 
   if (auto* experiment = detsim::experiment::configured_capture())
     experiment->report();
+  if (page_capture_enabled()) report_page_capture_stats();
+  detsim::page_restore::report();
 
   return 0;
 }

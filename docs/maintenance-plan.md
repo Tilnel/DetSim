@@ -1,5 +1,22 @@
 # Maintenance baseline
 
+## Page snapshot branch plan (2026-10-15)
+
+Branch: `experiment/page-snapshots`, based on `08ed190`.
+Introduce an opt-in v6 manifest referencing independently content-addressed pages,
+using the existing StateStore and barrier. Keep v5 capture as the default oracle.
+Full capture reads all supported regions; previous page buffers are only exact
+byte-equality hints. Both formats use one validated SnapshotView and restore
+only differing pages after comparing live bytes. No atom/search changes.
+
+Acceptance: version-local identity and exact decoded v5/v6 equivalence, cold/tiny
+cache and reopen, missing/corrupt page rejection, store failure invalidating warmed
+views, RO/remap/rseq and sparse restoration, unchanged Raft checkpoint/counts.
+Measure full-chain wall/CPU/RSS/bytes for the original binary, v5 on this branch,
+v6 full reads, and separately explicit soft-dirty delta. Do not compare generic
+store save/new counters as if pages were complete child snapshots. Unsupported
+tracking remains opt-in; no asynchronous-writer proof is inferred from fixtures.
+
 ## Soft-dirty experiment plan (2026-10-15)
 
 This is an opt-in experiment, not a supported incremental snapshot backend.

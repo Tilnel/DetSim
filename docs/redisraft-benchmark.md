@@ -1,5 +1,8 @@
 # Redis Raft 示例效率实测
 
+后续 `experiment/page-snapshots` 分支的页格式、页级恢复及完整探索对照见
+[页快照实现与测量](page-snapshots.md)，没有将下面的soft-dirty实验启为默认。
+
 2026-10-14，生产代码基于 `b6cd591`；本次只新增测量驱动，不修改生产执行逻辑。
 
 ## 测量对象与方法

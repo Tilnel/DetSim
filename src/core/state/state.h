@@ -24,7 +24,7 @@
 struct __attribute__((packed)) StateDataHeader
 {
   uint32_t magic;         // 'DSTM' = 0x4453544D
-  uint32_t version;       // 5 (owned futex queues and stable thread slots)
+  uint32_t version;       // 5: flat snapshot; 6: page manifest prefix
   uint32_t num_regions;   // number of memory regions
   uint64_t tstate_offset; // offset to serialized tracee_state
   uint64_t tstate_size;   // size of serialized tracee_state
@@ -39,7 +39,7 @@ struct __attribute__((packed)) RegionInfo
 {
   uint64_t start;
   uint64_t end;
-  uint64_t offset; // offset in data buffer
+  uint64_t offset; // v5: byte offset in blob; v6: first PageRef index
   uint32_t prot;   // protection flags (PROT_READ/WRITE/EXEC)
   char flags[5];   // original flags string from /proc/pid/maps (e.g., "rwxp")
 };

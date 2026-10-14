@@ -50,6 +50,9 @@
 !soft_dirty_integration.cpp
 !soft_dirty.mk
 !soft_dirty_benchmark.py
+!page_snapshot.mk
+!page_snapshot_integration.cpp
+!page_snapshot_benchmark.py
 !redisraft.mk
 
 !capture.mk

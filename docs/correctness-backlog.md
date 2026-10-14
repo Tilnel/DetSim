@@ -38,6 +38,14 @@ relationship to the native-binary model-checking goal.
 
 ## Next development slice
 
+Page snapshot branch (2026-10-15): opt-in v6 manifests and page objects use the
+existing barrier; v5 stays default. Exact decoded v5/v6 ptrace oracles, cold/tiny
+reads, fresh-process inspection, missing/corrupt pages and warmed-cache poisoning
+have regressions. Both formats compare live bytes and restore only differing pages.
+This strengthens C08 evidence without closing general canonicalization, complete
+exploration equivalence or asynchronous dirty tracking. See [page snapshot scope
+and whole-chain timings](page-snapshots.md).
+
 Soft-dirty experiment (2026-10-15): opt-in verify reconstructed all11,127 Raft
 captures without observed omitted pages; native fixtures also reject a deliberately
 lost dirty epoch. This does not close C08 or certify asynchronous/pinned writes:

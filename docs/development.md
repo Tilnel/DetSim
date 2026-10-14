@@ -23,6 +23,7 @@ make check-xstate check-exec check-state-io check-mappings # NP=1 state/atom gat
 make check-identity check-port # NP=2 identity and deterministic network state
 make check-capture       # NP=2 full/hinted snapshot byte-equivalence oracle
 make check-soft-dirty    # opt-in experiment: real kernel dirty tracking + byte oracle
+make check-page-snapshot # v5/v6 readers, missing/corrupt pages, reopen and poison gates
 make check-accept        # NP=2 cross-process accept address/length regressions
 make check-redis         # NP=2 fixed-schedule SET/GET with existing Redis debug binary
 make benchmark-redisraft # NP=3 bounded Raft-library replication and DFS benchmark
@@ -118,7 +119,10 @@ rejects standard-stream writes (C15). Loader CPU-feature normalization also logs
 an unresolved symbol (C17). Passing counter/replay tests does not close either gap,
 nor does it prove multithread, cross-process-run or eviction correctness.
 
-Snapshot format is now version 5; old snapshots are rejected without migration.
+Default snapshot format is version 5; older formats are rejected without migration.
+This branch additionally reads opt-in version 6 page manifests, selected with
+`DETSIM_SNAPSHOT_BACKEND=pages`; `verify-pages` adds a full memory oracle.
+See [page snapshots and whole-exploration measurements](page-snapshots.md).
 Private readable mappings are captured; shared/unreadable mappings, overlaps with
 the reserved scratch page and missing file-backed restore mappings fail explicitly.
 Thread slots and futex queues survive restore for unchanged live physical thread

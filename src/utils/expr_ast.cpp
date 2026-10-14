@@ -3,6 +3,7 @@
 #include "dwarf_info.h"
 #include "monitor.h"
 #include "state/state.h"
+#include "state/page_snapshot.h"
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -84,14 +85,10 @@ static long read_memory_long(int pid, uint64_t addr, bool &success)
   hash_type ts_hash = get_current_ts_hash(pid);
   if (ts_hash != 0)
   {
-    void *data = read_mem(pid, ts_hash, addr, sizeof(long));
-    if (data)
-    {
-      long result = *(long *)data;
-      free(data);
-      success = true;
-      return result;
-    }
+    long result;
+    SnapshotView::open(ts_hash)->read_into(addr, &result, sizeof(result));
+    success = true;
+    return result;
   }
 
   // Fallback to ptrace if snapshot read fails
