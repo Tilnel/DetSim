@@ -92,8 +92,56 @@ static void format_syscall_for_history(char *buf, int pid, hash_type ts_hash)
   buf[1023] = '\0'; /* Ensure null termination */
 }
 
+bool syscall_history_enabled = true;
+
+// Scalar metadata only: observation must not load snapshots or dereference guest pointers.
+void show_syscall_current()
+{
+  const auto& state = ptmc_state.running_state;
+  const auto edge = state_tree.find(state.ss_hash);
+  if (edge == state_tree.end()) {
+    detsim::ui::ui_printf("Current state " HASH_FORMAT " (no predecessor).\n", state.ss_hash);
+    return;
+  }
+  const auto [predecessor, which, choice, slot] = edge->second;
+  detsim::ui::ui_printf(HASH_FORMAT " => " HASH_FORMAT "\n Tracee %d", predecessor, state.ss_hash, which);
+  if (choice >= 0) detsim::ui::ui_printf(" (choose %d)", choice);
+  detsim::ui::ui_printf(": ");
+  const int status = state.status[which];
+  if (DISCRASHED(status) || DISSIGNALED(status)) {
+    detsim::ui::ui_printf("<fatal signal %d>\n", DSTOPSIG(status));
+    return;
+  }
+  const auto& child = state.child[which];
+  if (slot < 0 || slot >= MAX_THREADS_PER_PROCESS || slot >= int(child.threads.size())) {
+    detsim::ui::ui_printf("<no syscall metadata>\n");
+    return;
+  }
+  const auto& thread = child.threads[slot];
+  const auto& info = child.si[slot];
+  const auto* pending = thread.pending_syscall ? &*thread.pending_syscall : nullptr;
+  const int nr = pending ? pending->nr : info.nr;
+  extern const char* syscalls[450];
+  const char* name = nr >= 0 && nr < 450 && syscalls[nr] ? syscalls[nr] : "unknown";
+  if (child.threads.size() > 1) detsim::ui::ui_printf("[TID:%d] ", thread.tid);
+  detsim::ui::ui_printf("%s(", name);
+  for (int i = 0; i < 6; ++i)
+    detsim::ui::ui_printf("%s0x%lx", i ? ", " : "", (unsigned long)(pending ? pending->args[i] : info.args[i]));
+  detsim::ui::ui_printf(")");
+  if (pending) {
+    const char* phase = pending->phase == PendingPhase::Waiting ? "waiting" :
+                        pending->phase == PendingPhase::Retry ? "retry" : "ready";
+    detsim::ui::ui_printf(" <pending:%s>\n", phase);
+  } else if (nr == SYS_exit || nr == SYS_exit_group) {
+    detsim::ui::ui_printf(" <nonreturning>\n");
+  } else {
+    detsim::ui::ui_printf(" = %ld\n", (long)info.rval);
+  }
+}
+
 void show_syscall_history()
 {
+  if (!syscall_history_enabled) return;
   hash_type ss = ptmc_state.running_state.ss_hash;
   std::stack<std::string> print_stack;
   int cnt = 0;
@@ -831,7 +879,8 @@ void state_tree_add(const sys_state &s, sys_state &t, int which, int choose)
 {
   if (state_tree.count(t.ss_hash) == 0)
     state_tree[t.ss_hash] =
-        std::tuple<hash_type, int, int>(s.ss_hash, which, choose);
+        std::tuple<hash_type, int, int, int>(s.ss_hash, which, choose,
+                                           t.child[which].current_thread_idx);
 }
 
 /* ======================================================================

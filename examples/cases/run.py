@@ -50,7 +50,8 @@ class CaseFailure(RuntimeError):
 
 
 class Session:
-    def __init__(self, tracer, argv, plugin, directory, backend, timeout, choices=False, fsmap=()):
+    def __init__(self, tracer, argv, plugin, directory, backend, timeout, choices=False, fsmap=(),
+                 *, tracees=None, addresses=None, runtime_profile=None, choose_points=()):
         self.directory = directory
         directory.mkdir(parents=True)
         self.timeout = timeout
@@ -58,11 +59,17 @@ class Session:
         self.offset = 0
         self.commands = []
         self.log = directory / "transcript.log"
-        config = {"Nodes": 1, "Loglevel": 4, "Tracee": [argv], "Addr": ["127.0.0.1"],
-                  "RuntimeProfile": {"startup_syscall": 11}, "Plugins": [str(p) for p in plugin] if isinstance(plugin,(list,tuple)) else [str(plugin)],
+        targets = [argv] if tracees is None else list(tracees)
+        require(targets and all(target for target in targets), "case requires nonempty tracee arguments")
+        addresses = list(addresses) if addresses is not None else [f"127.0.0.{i+1}" for i in range(len(targets))]
+        require(len(addresses) == len(targets), "case address and tracee counts differ")
+        config = {"Nodes": len(targets), "Loglevel": 4, "Tracee": targets, "Addr": addresses,
+                  "RuntimeProfile": {"startup_syscall": 11} | (runtime_profile or {}),
+                  "Plugins": [str(p) for p in plugin] if isinstance(plugin,(list,tuple)) else [str(plugin)],
                   "FSMap": list(fsmap), "StateStore": {"hot_cache_mb": 32, "warm_cache_mb": 64}}
-        if choices:
-            config["ChoosePoint"] = [{"syscall": 96, "choose": 2}]
+        points = ([{"syscall": 96, "choose": 2}] if choices else []) + list(choose_points)
+        if points:
+            config["ChoosePoint"] = points
         (directory / "config.json").write_text(json.dumps(config, indent=2))
         self.output = self.log.open("wb")
         self.proc = subprocess.Popen([str(tracer), "-n", "-c", str(directory / "config.json")],
@@ -105,7 +112,7 @@ class Session:
         return self.proc.returncode
 
     def current_hash(self):
-        edges = re.findall(r"([0-9a-f]{16}) => ([0-9a-f]{16})", self.send("info"))
+        edges = re.findall(r"([0-9a-f]{16}) => ([0-9a-f]{16})", self.send("info current"))
         return edges[-1][1] if edges else None
 
 
@@ -186,14 +193,14 @@ def search(tracer, argv, plugin, directory, backend, timeout, *, bug=False, dept
         session.send(); row["startup"] = "admitted"
         session.send("sw 0")
         row["search"] = "started"
-        reply = session.send("bfs" if depth is None else f"dfs {depth}")
+        reply = session.send("bfs --quiet" if depth is None else f"dfs {depth} --quiet")
         numbers = re.search(r"(?:all |Searched for )(\d+) sys_states(?: \(new: (\d+)\))?", reply)
         if numbers:
             row["visited"] = int(numbers[1])
             if numbers[2]: row["new"] = int(numbers[2])
         if "Stopped for illegal state" in reply:
             require(bug and expected_diagnostic in session.log.read_text(), "unexpected property violation")
-            edges=re.findall(r"([0-9a-f]{16}) => ([0-9a-f]{16})",session.send("info"))
+            edges=re.findall(r"([0-9a-f]{16}) => ([0-9a-f]{16})",session.send("info current"))
             require(edges,"violation lacks predecessor edge")
             predecessor,witness=edges[-1]
             recipe=list(session.commands)
@@ -207,7 +214,7 @@ def search(tracer, argv, plugin, directory, backend, timeout, *, bug=False, dept
                 "successor":witness,"replay_action":"si 0","diagnostic":expected_diagnostic},indent=2))
         else:
             require("Complete explore all" in reply and not bug, "expected search result absent")
-            history = session.send("info")
+            history = session.send("info current")
             operations = re.findall(r"(?m)^ Tracee \d+: (.+)$", history)
             terminal_candidate = bool(operations and "exit_group(" in operations[-1])
             if depth is not None and not terminal_candidate:
@@ -345,6 +352,7 @@ def admission_controls(tracer, argv, plugin, directory, backend, timeout, fsmap)
 def runtime_files(language, tool, source, out):
     """Explicit workload inputs; never discover host files during exploration."""
     roots = [source]
+    dependencies = []
     if language == "py":
         probe = command(tool + ["-I", "-S", "-c",
             "import json,sysconfig; print(json.dumps(sorted(set(sysconfig.get_path(k) for k in ('stdlib','platstdlib')))))"], out)
@@ -353,6 +361,17 @@ def runtime_files(language, tool, source, out):
     elif language == "java":
         home = Path(tool[0]).resolve().parent.parent
         roots += [home / "lib", home / "conf", home / "release", out / "RuntimeProbe.class"]
+        # The launcher loads libjvm after the trusted loader boundary, so its
+        # ordinary ELF dependencies must exist in the captured input namespace.
+        for library in (home / "lib/server/libjvm.so", home / "lib/libjava.so"):
+            traced = command(["ldd", str(library)], out)
+            require(traced.returncode == 0, traced.stdout)
+            dependencies.append({"command": ["ldd", str(library)], "output": traced.stdout})
+            for resolved in re.findall(r"(?:=>\s*)?(/[\S]+)\s+\(0x[0-9a-fA-F]+\)", traced.stdout):
+                path = Path(resolved)
+                # Preserve the final symlink name, canonicalizing directory
+                # aliases such as /lib -> /usr/lib without importing all /usr/lib.
+                roots.append(path.parent.resolve() / path.name)
     # Retain external symlink referents as explicit mappings too; do not flatten
     # symlinks in the input namespace. Missing referents remain genuinely absent.
     entries = {}
@@ -380,12 +399,13 @@ def runtime_files(language, tool, source, out):
                 if (referent.exists() or referent.is_symlink()) and not referent.is_relative_to(root):
                     roots.append(referent)
             elif stat.S_ISREG(mode):
-                entry.update(size=path.stat().st_size, sha256=digest(path))
+                entry.update(size=path.stat().st_size, mtime_ns=path.stat().st_mtime_ns, sha256=digest(path))
             elif not stat.S_ISDIR(mode):
                 raise CaseFailure("unsupported runtime input type: " + str(path))
             entries[str(path)] = entry
     manifest = out / ("rootfs-" + language + ".json")
-    manifest.write_text(json.dumps({"mappings": mappings, "entries": sorted(entries.values(), key=lambda row: row["path"])}, indent=2))
+    manifest.write_text(json.dumps({"mappings": mappings, "dependency_discovery": dependencies,
+        "entries": sorted(entries.values(), key=lambda row: row["path"])}, indent=2))
     return mappings, manifest
 
 

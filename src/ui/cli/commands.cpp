@@ -44,15 +44,15 @@ extern char *log_file;
 
 static CommandEntry cmd_table[] = {
     {"help", "Display information about all supported commands", cmd_help},
-    {"bfs", "Perform breadth-first search from current state", cmd_bfs},
-    {"dfs", "Perform depth-first search from current state", cmd_dfs},
-    {"rand", "Perform random search from current state", cmd_rand},
+    {"bfs", "Perform breadth-first search [--quiet]", cmd_bfs},
+    {"dfs", "Perform depth-first search <depth> [--quiet]", cmd_dfs},
+    {"rand", "Perform random search <depth> [--quiet]", cmd_rand},
     {"q", "Exit ptraceMC", cmd_q},
     {"si", "Step from current state, on focused process", cmd_si},
     {"sw", "Switch control focus on the n-th process", cmd_sw},
     {"thread", "Switch to thread N in current process (thread to list)", cmd_thread},
     {"load", "Load state of given StateHash", cmd_load},
-    {"info", "Display current state history", cmd_info},
+    {"info", "Display state history (info current: scalar current edge only)", cmd_info},
     {"batch", "Read command list from file", cmd_batch},
     {"p", "Calculate expression", cmd_p},
     {"x", "Examine memory: x/[count][format][size] <addr>", cmd_x},
@@ -292,48 +292,65 @@ int cmd_load(char *args) {
  * Exploration Commands
  * ====================================================================== */
 
+namespace {
+// Display policy belongs to the command, including every scheduler early return.
+struct SearchDisplayScope {
+    int previous_auto = auto_mode;
+    bool previous_history = syscall_history_enabled;
+    explicit SearchDisplayScope(bool quiet) {
+        auto_mode = 1;
+        syscall_history_enabled = !quiet;
+    }
+    ~SearchDisplayScope() {
+        auto_mode = previous_auto;
+        syscall_history_enabled = previous_history;
+    }
+};
+
+bool parse_search_args(char* args, bool needs_depth, int& depth, bool& quiet) {
+    std::istringstream input(args ? args : "");
+    std::string token;
+    if (needs_depth) {
+        if (!(input >> depth) || depth <= 0) return false;
+    }
+    if (input >> token) {
+        if (token != "--quiet") return false;
+        quiet = true;
+        if (input >> token) return false;
+    }
+    return true;
+}
+}
+
 int cmd_bfs(char *args) {
-    (void)args;
-    auto_mode = 1;
+    int depth = 0; bool quiet = false;
+    if (!parse_search_args(args, false, depth, quiet)) {
+        detsim::ui::ui_printf("Usage: bfs [--quiet]\n");
+        return 1;
+    }
+    SearchDisplayScope display(quiet);
     exec_bfs();
-    auto_mode = 0;
     return 0;
 }
 
 int cmd_dfs(char *args) {
-    if (args == NULL) {
-        detsim::ui::ui_printf("Usage: dfs <depth>\n");
+    int depth = 0; bool quiet = false;
+    if (!parse_search_args(args, true, depth, quiet)) {
+        detsim::ui::ui_printf("Usage: dfs <depth> [--quiet]\n");
         return 1;
     }
-
-    int depth = atoi(args);
-    if (depth <= 0) {
-        detsim::ui::ui_printf("Invalid depth %d. Please specify a positive integer.\n", depth);
-        return 1;
-    }
-
-    auto_mode = 1;
-    int ret = exec_dfs(depth);
-    auto_mode = 0;
-    return ret;
+    SearchDisplayScope display(quiet);
+    return exec_dfs(depth);
 }
 
 int cmd_rand(char *args) {
-    if (args == NULL) {
-        detsim::ui::ui_printf("Usage: rand <depth>\n");
+    int depth = 0; bool quiet = false;
+    if (!parse_search_args(args, true, depth, quiet)) {
+        detsim::ui::ui_printf("Usage: rand <depth> [--quiet]\n");
         return 1;
     }
-
-    int depth = atoi(args);
-    if (depth <= 0) {
-        detsim::ui::ui_printf("Invalid depth %d. Please specify a positive integer.\n", depth);
-        return 1;
-    }
-
-    auto_mode = 1;
-    const int result = exec_rand(depth);
-    auto_mode = 0;
-    return result;
+    SearchDisplayScope display(quiet);
+    return exec_rand(depth);
 }
 
 /* ======================================================================
@@ -458,6 +475,10 @@ static std::string format_addr_short(const struct sockaddr_in &addr) {
 }
 
 int cmd_info(char *args) {
+    if (args && strcmp(args, "current") == 0) {
+        show_syscall_current();
+        return 0;
+    }
     if (args && (strcmp(args, "sock") == 0 || strcmp(args, "socket") == 0)) {
         detsim::ui::ui_printf("[Socket States]\n");
         for (int i = 0; i < NP; i++) {

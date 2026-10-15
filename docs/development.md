@@ -712,3 +712,30 @@ rewind enumerates the new saved directory. Directory SEEK_END rejects. Stable
 nonzero path-derived inode values are shared by stat/lstat/fstat/getdents, with
 namespace-wide collision rejection. Rename/hardlink semantics remain unsupported;
 imported host hardlinks are separate path objects. Kernelv15, layout27/28.
+
+
+## Captured modification times and inexpensive observation
+
+The VFS retains exact imported modification seconds/nanoseconds in both metadata
+modes, including files, directories, symlinks and executable inputs. These values
+participate in snapshot identity and archives; layouts29/30 and kernelv16 reject
+older execution contexts. Successful file creation, truncation and positive writes
+use modeled time; creation also updates the parent directory. Zero-length writes
+preserve mtime. Access/change times remain outside minimal metadata. Faulting
+writes still pre-copy guest data: unlike native buffered writes, EFAULT currently
+does not update mtime. Concurrent host modification during import remains a gap.
+
+`info current` prints only the current edge's scalar syscall metadata without
+loading snapshots or dereferencing guest pointers. The recorded actor remains
+correct after a UI thread selection. `bfs --quiet`, `dfs <depth> --quiet` and
+`rand <depth> --quiet` suppress automatic full history while retaining search,
+explicit history, current-state inspection and replay. Unqualified commands retain
+full history. Case runners use the inexpensive observation path.
+
+Verified: make check (9 component cases,10 build contracts); NP1 production build;
+24 native ptrace scenarios;12 healthy/mutant full/pages case rows;24 normal/quiet
+finite/violation/interrupt searches with equivalent transition multisets and3x
+replay; scalar observation and search-scope component gate; NP2 IO/getdents/VFS
+content gates; NP1 page-snapshot and state-I/O gates. Runtime recheck confirms
+Python no longer tries to regenerate valid bytecode caches; its next unsupported
+operation is FIOCLEX. This is progress, not successful Python admission.

@@ -131,6 +131,103 @@ static void check_symlink_walk(const std::filesystem::path& root)
   CHECK(std::string(content, sizeof(content)) == "target");
 }
 
+// Saved input timestamps are semantic input even in minimal metadata mode.
+static void check_modification_times(const std::filesystem::path& root)
+{
+  const auto base = root / "mtime";
+  std::filesystem::create_directories(base / "directory");
+  std::ofstream(base / "file") << "payload";
+  CHECK(symlink("file", (base / "link").c_str()) == 0);
+  const timespec known[2] = {{123456789, 123456789}, {1786363619, 987654321}};
+  for (const char* name : {"file", "directory", "link", ""})
+    CHECK(utimensat(AT_FDCWD, (base / name).c_str(), known, AT_SYMLINK_NOFOLLOW) == 0);
+  auto timestamp = [](FileSystemState& fs, const std::string& path) {
+    struct stat value{};
+    CHECK(fs.do_stat(path, &value, false) == 0);
+    return value.st_mtim;
+  };
+  auto same = [](timespec left, timespec right) {
+    return left.tv_sec == right.tv_sec && left.tv_nsec == right.tv_nsec;
+  };
+  auto manager = std::make_shared<FdManager>();
+  FileSystemState fs(manager);
+  fs.init_from_mappings({{base.string(), "/mtime"}});
+  for (const char* name : {"file", "directory", "link", ""}) {
+    struct stat native{};
+    CHECK(lstat((base / name).c_str(), &native) == 0);
+    CHECK(same(native.st_mtim, known[1]));
+    CHECK(same(timestamp(fs, std::string("/mtime/") + name), native.st_mtim));
+  }
+  const int fd = fs.do_open("/mtime/file", O_RDWR, 0);
+  struct stat opened{};
+  CHECK(fd >= 0 && fs.do_fstat(fd, &opened) == 0);
+  CHECK(same(opened.st_mtim, known[1]));
+  FileSystemState executable;
+  executable.capture_executable((base / "link").string());
+  CHECK(same(timestamp(executable, (base / "link").string()), known[1]));
+  CHECK(same(timestamp(executable, (base / "file").string()), known[1]));
+  CHECK(same(timestamp(executable, base.string()), known[1]));
+  std::ostringstream output;
+  { cereal::BinaryOutputArchive ar(output); ar(fs); }
+  std::filesystem::remove_all(base);
+  FileSystemState restored;
+  std::istringstream input(output.str());
+  { cereal::BinaryInputArchive ar(input); ar(restored); }
+  restored.set_fd_manager(std::make_shared<FdManager>(*manager));
+  for (const char* name : {"file", "directory", "link", ""})
+    CHECK(same(timestamp(restored, std::string("/mtime/") + name), known[1]));
+  CHECK(restored.do_fstat(fd, &opened) == 0 && same(opened.st_mtim, known[1]));
+  VFSNode default_node;
+  CHECK(default_node.metadata.st_mtim.tv_sec == 0 && default_node.metadata.st_mtim.tv_nsec == 0);
+  tracee_state original_state;
+  original_state.fs_state = restored;
+  tracee_state different_time = original_state;
+  ++different_time.fs_state.filesystem.at("/mtime/file").metadata.st_mtim.tv_nsec;
+  CHECK(!original_state.metadata_equal(different_time));
+  // Corrupt only the archived nanosecond value, bypassing output validation.
+  VFSNode valid_node;
+  valid_node.metadata.st_mtim = known[1];
+  std::ostringstream valid_output;
+  { cereal::BinaryOutputArchive ar(valid_output); ar(valid_node); }
+  const std::string valid = valid_output.str();
+  const std::string marker(reinterpret_cast<const char*>(&known[1].tv_nsec), sizeof(known[1].tv_nsec));
+  const size_t position = valid.find(marker);
+  CHECK(position != std::string::npos && valid.find(marker, position + 1) == std::string::npos);
+  for (long invalid : {-1L, 1000000000L}) {
+    std::string corrupt = valid;
+    memcpy(corrupt.data() + position, &invalid, sizeof(invalid));
+    std::istringstream malformed(corrupt);
+    bool rejected = false;
+    try { cereal::BinaryInputArchive ar(malformed); VFSNode node; ar(node); }
+    catch (const std::runtime_error&) { rejected = true; }
+    CHECK(rejected);
+  }
+  FileSystemState branch = restored;
+  branch.set_fd_manager(std::make_shared<FdManager>(*manager));
+  const int previous_cursor = ptmc_state.cursor;
+  const timeval previous_time = ptmc_state.time[0];
+  ptmc_state.cursor = 0;
+  ptmc_state.time[0] = {42, 123456};
+  const timespec modeled{42, 123456000};
+  CHECK(branch.do_write(fd, nullptr, 0) == 0);
+  CHECK(same(timestamp(branch, "/mtime/file"), known[1]));
+  CHECK(branch.do_write(fd, "X", 1) == 1);
+  CHECK(same(timestamp(branch, "/mtime/file"), modeled));
+  CHECK(same(timestamp(restored, "/mtime/file"), known[1]));
+  ptmc_state.time[0] = {43, 654321};
+  const timespec truncate_time{43, 654321000};
+  const int truncated = branch.do_open("/mtime/file", O_WRONLY | O_TRUNC, 0);
+  CHECK(truncated >= 0 && branch.do_fstat(truncated, &opened) == 0);
+  CHECK(opened.st_size == 0 && same(opened.st_mtim, truncate_time));
+  CHECK(same(timestamp(restored, "/mtime/file"), known[1]));
+  CHECK(branch.do_open("/mtime/new", O_CREAT | O_RDWR, 0600) >= 0);
+  CHECK(same(timestamp(branch, "/mtime/new"), truncate_time));
+  CHECK(same(timestamp(branch, "/mtime"), truncate_time));
+  CHECK(same(timestamp(restored, "/mtime"), known[1]));
+  ptmc_state.cursor = previous_cursor;
+  ptmc_state.time[0] = previous_time;
+}
+
 int main()
 {
   try
@@ -154,6 +251,7 @@ int main()
     } catch (const std::runtime_error&) { dotdot_rejected = true; }
     CHECK(dotdot_rejected);
     check_symlink_walk(root);
+    check_modification_times(root);
     // A mapping root is an object, not an implicitly manufactured directory.
     std::ofstream(root / ".hidden", std::ios::binary) << std::string("a\0b", 3);
     CHECK(chmod((root / "real").c_str(), 0711) == 0);

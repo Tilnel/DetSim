@@ -25,14 +25,14 @@ void clear_snapshot_thread_bindings();
  * State Data Format (shared with StateStore)
  * ====================================================================== */
 
-inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 27;
-inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 28;
+inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 29;
+inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 30;
 
 /* Packed to avoid alignment padding */
 struct __attribute__((packed)) StateDataHeader
 {
   uint32_t magic;         // 'DSTM' = 0x4453544D
-  uint32_t version;       // 27: flat; 28: pages (per-task alternate signal stack)
+  uint32_t version;       // 29: flat; 30: pages (precise VFS modification timestamps)
   uint32_t num_regions;   // number of memory regions
   uint64_t tstate_offset; // offset to serialized tracee_state
   uint64_t tstate_size;   // size of serialized tracee_state
@@ -370,8 +370,8 @@ typedef struct sys_state
  * State Collections
  * ====================================================================== */
 
-/* State tree: child -> (parent, which, choose) */
-typedef std::unordered_map<hash_type, std::tuple<hash_type, int, int>> TSS;
+/* Runtime observation/search bookkeeping: child -> (parent, process, choice, actor slot). */
+typedef std::unordered_map<hash_type, std::tuple<hash_type, int, int, int>> TSS;
 
 /* State queue (BFS exploration) */
 typedef std::deque<hash_type> LSS;
@@ -396,6 +396,8 @@ void state_tree_add(const sys_state &s, sys_state &t, int which, int choose);
  * History Display
  * ====================================================================== */
 
+extern bool syscall_history_enabled;
+void show_syscall_current();
 void show_syscall_history();
 void show_syscall(int pid, hash_type ts_hash);
 

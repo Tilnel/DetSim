@@ -29,13 +29,13 @@
 #include <sys/types.h>
 #include <time.h>
 
-#ifdef FSSTATE_DETAILED_METADATA
-static time_t modeled_fs_time()
+static timespec modeled_fs_time()
 {
-  const int node=ptmc_state.cursor;
-  return node>=0 && node<NP ? ptmc_state.time[node].tv_sec : 0;
+  const int node = ptmc_state.cursor;
+  return node >= 0 && node < NP
+      ? timespec{ptmc_state.time[node].tv_sec, ptmc_state.time[node].tv_usec * 1000}
+      : timespec{};
 }
-#endif
 
 namespace {
 thread_local bool external_file_content = false;
@@ -145,11 +145,15 @@ void VFSNode::serialize(Archive &ar)
      CEREAL_NVP(metadata.st_gid), CEREAL_NVP(metadata.st_rdev),
      CEREAL_NVP(metadata.st_size), CEREAL_NVP(metadata.st_blksize),
      CEREAL_NVP(metadata.st_blocks), CEREAL_NVP(metadata.st_atime),
-     CEREAL_NVP(metadata.st_mtime), CEREAL_NVP(metadata.st_ctime));
+     CEREAL_NVP(metadata.st_mtim.tv_sec), CEREAL_NVP(metadata.st_mtim.tv_nsec),
+     CEREAL_NVP(metadata.st_ctime));
 #else
   ar(CEREAL_NVP(content), CEREAL_NVP(metadata.st_size),
-     CEREAL_NVP(metadata.st_mode));
+     CEREAL_NVP(metadata.st_mode), CEREAL_NVP(metadata.st_mtim.tv_sec),
+     CEREAL_NVP(metadata.st_mtim.tv_nsec));
 #endif
+  if (metadata.st_mtim.tv_nsec < 0 || metadata.st_mtim.tv_nsec >= 1000000000)
+    throw std::runtime_error("Invalid virtual file modification nanoseconds");
 }
 
 template <class Archive>
@@ -325,9 +329,9 @@ void FileSystemState::init_from_mappings(
 #ifdef FSSTATE_DETAILED_METADATA
       if (S_ISREG(st.st_mode)) {
         node.metadata.st_nlink = 1;
-        node.metadata.st_mtime = st.st_mtime;
       }
 #endif
+      node.metadata.st_mtim = st.st_mtim;
       node.metadata.st_mode = st.st_mode;
       node.metadata.st_size = 0;
       if (S_ISLNK(st.st_mode)) {
@@ -580,12 +584,14 @@ int FileSystemState::do_openat(int dirfd, const std::string &input, int flags, m
       newNode.metadata.st_nlink = 1;
       newNode.metadata.st_uid = 0;
       newNode.metadata.st_gid = 0;
-      newNode.metadata.st_atime = newNode.metadata.st_mtime =
-          newNode.metadata.st_ctime = modeled_fs_time();
+      newNode.metadata.st_atime = newNode.metadata.st_ctime = modeled_fs_time().tv_sec;
 #endif
+      newNode.metadata.st_mtim = modeled_fs_time();
       newNode.metadata.st_mode = S_IFREG | ((mode & 07777) & ~creation_mask_);
       newNode.metadata.st_size = 0;
       filesystem[path] = newNode;
+      const size_t slash = path.find_last_of('/');
+      filesystem.at(slash == 0 ? "/" : path.substr(0, slash)).metadata.st_mtim = modeled_fs_time();
     }
     else
     {
@@ -612,6 +618,7 @@ int FileSystemState::do_openat(int dirfd, const std::string &input, int flags, m
   {
     filesystem.at(path).content.clear();
     filesystem.at(path).metadata.st_size = 0;
+    filesystem.at(path).metadata.st_mtim = modeled_fs_time();
   }
   OpenFileDescription ofd;
   ofd.path = path;
@@ -691,9 +698,7 @@ ssize_t FileSystemState::do_write(int fd, const void *buf, size_t count)
   node.content.write(static_cast<size_t>(write_offset), buf, count);
   ofd.offset = write_offset + count;
   node.metadata.st_size = node.content.size();
-#ifdef FSSTATE_DETAILED_METADATA
-  node.metadata.st_mtime = modeled_fs_time();
-#endif
+  node.metadata.st_mtim = modeled_fs_time();
 
   return count;
 }
@@ -770,10 +775,11 @@ static void copy_vfs_stat(const VFSNode& node, uint64_t inode, struct stat* stat
 #ifdef FSSTATE_DETAILED_METADATA
   memcpy(statbuf, &node.metadata, sizeof(struct stat));
 #else
-  // Minimal mode: only fill size and mode, zero out the rest
+  // Minimal mode retains size, mode and precise semantic modification time.
   memset(statbuf, 0, sizeof(struct stat));
   statbuf->st_size = node.metadata.st_size;
   statbuf->st_mode = node.metadata.st_mode;
+  statbuf->st_mtim = node.metadata.st_mtim;
 #endif
   statbuf->st_ino = inode;
 }
@@ -1309,6 +1315,7 @@ void FileSystemState::capture_executable(const std::string& executable)
       throw std::runtime_error("Cannot capture executable path: " + path);
     VFSNode node{};
     node.metadata.st_mode = metadata.st_mode;
+    node.metadata.st_mtim = metadata.st_mtim;
     if (S_ISLNK(metadata.st_mode)) {
       char target[4096];
       const ssize_t length = readlink(path.c_str(), target, sizeof(target));
@@ -1335,6 +1342,7 @@ void FileSystemState::capture_executable(const std::string& executable)
       if (lstat(name.c_str(), &ancestor)) throw std::runtime_error("Cannot capture executable ancestor: " + name);
       VFSNode directory{};
       directory.metadata.st_mode = ancestor.st_mode;
+      directory.metadata.st_mtim = ancestor.st_mtim;
       if (S_ISLNK(ancestor.st_mode)) {
         char target[4096];
         const ssize_t length = readlink(name.c_str(), target, sizeof(target));

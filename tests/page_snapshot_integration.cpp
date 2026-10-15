@@ -69,7 +69,7 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> metadata{1,2,3}; user_regs_struct regs{}; regs.rip = 42;
     auto manifest = encode_page_manifest(regions,metadata,"maps",regs,pages);
     auto key = save(manifest); store.wait_for_completion();
-    for (uint32_t unsupported : {5u,6u,7u,8u}) {
+    for (uint32_t unsupported : {5u,6u,7u,8u,FLAT_SNAPSHOT_VERSION-2,PAGE_SNAPSHOT_VERSION-2}) {
       auto older=manifest;
       reinterpret_cast<StateDataHeader*>(older.data())->version=unsupported;
       rejects([&]{SnapshotView::open(save(older));});

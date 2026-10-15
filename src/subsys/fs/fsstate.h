@@ -88,17 +88,18 @@ struct VFSNode
 
   // File metadata.
   // When FSSTATE_DETAILED_METADATA is defined, full struct stat is stored.
-  // Otherwise, only minimal metadata (size, mode) is kept to reduce state
-  // space.
+  // Otherwise, size, mode and semantic modification time are kept.
+  // Access/change times and credential semantics remain outside minimal mode.
 #ifdef FSSTATE_DETAILED_METADATA
-  struct stat metadata;
+  struct stat metadata{};
 #else
-  // Minimal metadata: only size and file type/mode
+  // Minimal metadata includes precise saved input modification time.
   struct
   {
     off_t st_size;
     mode_t st_mode;
-  } metadata;
+    struct timespec st_mtim;
+  } metadata{};
 #endif
 
   template <class Archive>

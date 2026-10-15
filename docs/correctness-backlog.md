@@ -478,3 +478,29 @@ was lost, so full checked-replay admission remains unproven. History rendering
 also rereads large snapshots after exploration and in info, a measured next
 control-chain cost. Java advances beyond libjvm identity to missing captured
 libstdc++ dependency, still non-green rather than JVM admission.
+
+
+### Captured mtime and observation cost
+
+Captured files/directories/symlinks/executables now retain precise mtime through
+copy/archive/identity/restore and stat/fstat, including successful mutation times.
+Native utimensat/lstat regression covers1786363619.987654321; archive rejection
+covers invalid nanoseconds. Layout29/30 and kernelv16. Independent review found
+no state-closure blocker within this scope. Remaining: native write(EFAULT) can
+update mtime while the pre-copy model does not (confirmed via ctypes/native
+write with pointer1); input capture does not detect concurrent same-size changes.
+These are explicit compatibility gaps, not closed by timestamp preservation.
+
+CLI scalar current-edge observation avoids StateStore reads; optional quiet
+search suppresses only automatic history and restores command scope on exceptions.
+24 actual full/pages BFS/DFS finite/violation/interrupt searches retain transition
+multisets and3x replay; rand has component-level scope verification only. Standard
+24 native scenarios and12 case rows remain green. Python advances beyond the
+mtime-induced rename to FIOCLEX; full gccgo checked admission is running with
+explicit4GiB budget. Neither is counted passed until endpoint replay succeeds.
+
+Java's captured ELF dependency closure advances loading to a genuine unsupported
+SIGBUS-backed file-mapping case. Supporting invalid-backed pages requires memory
+mapping, snapshot and guest-fault semantics, beyond a flag allowlist. Per user
+tradeoff Java remains a conditional, explicitly non-green research target; no
+claim of JVM admission or private-heap semantic extraction is made.
