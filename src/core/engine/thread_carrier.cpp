@@ -1,4 +1,5 @@
 #include "thread_carrier.h"
+#include "thread_control.h"
 #include "guest.h"
 
 #include <array>
@@ -67,6 +68,8 @@ pid_t create_thread_carrier(pid_t anchor)
     if (anchor <= 0) fail("invalid anchor thread");
     const auto deadline = Clock::now() + std::chrono::seconds(5);
     const auto original = registers(anchor);
+    require_no_pending_signals(anchor);
+    const auto original_mask = read_thread_signal_mask(anchor);
     if (original.cs != 0x33) fail("anchor is not native x86-64");
     __ptrace_syscall_info phase{};
     control(PTRACE_GET_SYSCALL_INFO, anchor, reinterpret_cast<void*>(sizeof phase), &phase);
@@ -91,6 +94,8 @@ pid_t create_thread_carrier(pid_t anchor)
     injected.rdi = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM;
     injected.rsi = stack;
     injected.rdx = injected.r10 = injected.r8 = injected.r9 = 0;
+    // The internal child must reach int3 even when the guest blocks SIGTRAP.
+    write_thread_signal_mask(anchor, 0);
     control(PTRACE_SETREGS, anchor, nullptr, &injected);
     syscall_stop(anchor, deadline);
     __ptrace_syscall_info entry{};
@@ -130,5 +135,7 @@ pid_t create_thread_carrier(pid_t anchor)
     const auto restored = registers(anchor);
     if (std::memcmp(&original, &restored, sizeof original) != 0)
         fail("anchor register restoration mismatch");
+    write_thread_signal_mask(anchor, original_mask);
+    write_thread_signal_mask(child, 0);
     return child;
 }

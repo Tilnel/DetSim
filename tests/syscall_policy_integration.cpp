@@ -135,7 +135,8 @@ int main() {
         check(dispatcher.get_route(SYS_clone).action==SyscallAction::EMULATE &&
               dispatcher.get_route(SYS_exit).action==SyscallAction::EMULATE &&
               dispatcher.get_route(SYS_clone3).action==SyscallAction::EMULATE &&
-              dispatcher.get_route(SYS_set_tid_address).action==SyscallAction::EMULATE,
+              dispatcher.get_route(SYS_set_tid_address).action==SyscallAction::EMULATE &&
+              dispatcher.get_route(SYS_rt_sigprocmask).action==SyscallAction::EMULATE,
               "thread lifecycle never executes the guest kernel syscall");
         result=execute(dispatcher,child,SYS_clone);
         check(result.rejected,"unsupported clone flags reject before kernel");

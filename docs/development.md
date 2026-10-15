@@ -25,6 +25,7 @@ make check-storage       # storage faults/concurrency/reopen + read-only tools; 
 make check-integration   # production DWARF/ELF fixtures; default NP=1
 make check-scenarios     # build NP=1 tracer and run isolated native ptrace scenarios
 make check-thread-control check-thread-identity check-thread-carrier # NP=1 thread gates
+make check-thread-signal-mask # NP=1 per-task masks, inheritance, restore and pending rejection
 make check-thread-tid # NP=1 clone/clone3 TID, clear-tid/join and restore
 make check-thread-lifecycle # NP=1 raw clone/exit, TLS, full/pages + cache pressure
 make check-futex check-futex-snapshot # NP=1 wait/wake/requeue and branch restore
@@ -131,8 +132,8 @@ enter snapshot state. Loader CPU-feature normalization still logs an unresolved
 symbol (C17). Passing counter/replay tests does not close that gap,
 nor does it prove multithread, cross-process-run or eviction correctness.
 
-Default snapshot format is version 17; older formats are rejected without migration.
-This branch additionally reads opt-in version 18 page manifests, selected with
+Default snapshot format is version 19; older formats are rejected without migration.
+This branch additionally reads opt-in version 20 page manifests, selected with
 `DETSIM_SNAPSHOT_BACKEND=pages`; `verify-pages` adds a full memory oracle.
 See [page snapshots and whole-exploration measurements](page-snapshots.md).
 Private readable mappings are captured; shared/unreadable mappings, overlaps with
@@ -222,7 +223,7 @@ successor. Pure predecessor/target comparisons need no monitor state.
 
 Plugin binaries/schema/configuration, target executable contents and semantic
 execution configuration form the model compatibility fingerprint. Executables must remain immutable during a run. Changing cache
-sizes or loading a decoder does not change it. Flat17/page18 and the versioned
+sizes or loading a decoder does not change it. Flat19/page20 and the versioned
 system metadata reject older archives without deleting or migrating stores.
 Changes to kernel-model or inspection semantics require an explicit compatibility
 version bump; fingerprints do not prove equivalence between different implementations.
@@ -293,7 +294,7 @@ closure within an explicit environment, not compatibility with all Linux program
 
 ## Logical thread archives
 
-Flat17/page18 archive explicit thread liveness and logical parent IDs; physical
+Flat19/page20 archive explicit thread liveness and logical parent IDs; physical
 TIDs are transient bindings. Same-run captured hashes retain compact runtime
 provenance tied to an owned process pidfd, which is required on the host kernel.
 Disk reload may inspect any valid snapshot, but execution restore requires local
@@ -451,3 +452,25 @@ clone3 error precedence. `check-runtime-profile` verifies initial-thread logical
 identity and disabled physical clear-tid registration. A minimal unmodified glibc
 pthread probe still stops at rt_sigprocmask (syscall14); this slice is ABI progress,
 not complete pthread support. Its local transcript is in build/tid-pthread-probe/.
+
+## Per-task signal masks
+
+`rt_sigprocmask` is modeled through the Linux task ABI, including startup. Each
+logical task owns its 64-bit mask; clone inherits its logical parent's mask,
+including when that parent is not the physical anchor. Capture checks the real
+mask, and restore installs saved masks even on same-hash restores and carrier
+reuse. Internal carrier creation temporarily unblocks its control traps.
+Flat19/page20 and kernel model v6 reject incompatible older execution contexts.
+
+`check-thread-signal-mask` covers full/pages, normal/tiny caches, persisted replay,
+worker-parent inheritance, blocked SIGTRAP, raw bits32/33, pointer aliasing and
+Linux's update-before-oldset-copyout EFAULT behavior. TID adoption independently
+preserves inherited masks. Startup and process-state gates cover inherited and
+prelude-modified masks. All owned carriers are checked for thread/shared pending
+bits using `/proc/<tid>/status`; pending signals explicitly reject capture/restore.
+This does not implement signal delivery, cancellation, temporary-mask syscalls,
+altstack or Go's asynchronous preemption.
+
+The unmodified pthread TLS/join probe now advances past syscall14 and stops at
+the readable-private mapping restriction. Guard mappings remain the next observed
+boundary; this smoke does not demonstrate complete pthread execution.

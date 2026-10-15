@@ -16,6 +16,7 @@
 #include <chrono>
 #include <fstream>
 #include <cstdio>
+#include <csignal>
 #include <linux/audit.h>
 #include <sys/wait.h>
 #include <map>
@@ -156,6 +157,8 @@ void clear_logical_tid(int node, tracee_state& state, thread_state& thread)
     if (written && thread.clear_child_tid % alignof(int32_t) == 0 && state.futex_state)
       state.futex_state->futex_wake(thread.clear_child_tid, 1, ~0u, false);
   }
+  write_thread_signal_mask(thread.physical_tid, 0);
+  thread.signal_mask = 0;
   thread.clear_child_tid = 0;
   thread.child_settid_pending = false;
   thread.pending_child_settid = 0;
@@ -175,6 +178,9 @@ void validate_bound_slots(const CarrierPool& pool, const tracee_state& state)
     const auto& thread = state.threads[i];
     if (thread.tid != static_cast<pid_t>(i + 1) || thread.is_main != (i == 0))
       throw std::runtime_error("Invalid logical thread slot or main-thread designation");
+    constexpr uint64_t unblockable = (uint64_t(1) << (SIGKILL - 1)) | (uint64_t(1) << (SIGSTOP - 1));
+    if ((thread.signal_mask & unblockable) || (!thread.alive && thread.signal_mask))
+      throw std::runtime_error("Invalid logical thread signal mask");
     if (!thread.alive) continue;
     if (!std::binary_search(pool.carriers.begin(), pool.carriers.end(), thread.physical_tid) ||
         !occupied.insert(thread.physical_tid).second ||
@@ -206,7 +212,9 @@ pid_t record_logical_clear_tid(int node, pid_t physical_tid, uint64_t address)
   if (state.threads.empty()) {
     if (physical_tid != ptmc_state.pids[node])
       throw std::runtime_error("Initial logical thread must be the owned leader");
+    const uint64_t mask = read_thread_signal_mask(physical_tid);
     state.add_thread(physical_tid, 0, 0, 0, true);
+    state.threads.back().signal_mask = mask;
   }
   const auto found = std::find_if(state.threads.begin(), state.threads.end(),
       [physical_tid](const thread_state& thread) { return thread.alive && thread.physical_tid == physical_tid; });
@@ -231,6 +239,75 @@ void adopt_clear_child_tid(int node, pid_t physical_tid)
       SYS_set_tid_address, 0, 0, 0, 0, 0, 0));
   if (result != physical_tid)
     throw std::runtime_error("Cannot disable carrier clear_child_tid registration");
+}
+
+void adopt_thread_signal_mask(int node, pid_t physical_tid)
+{
+  if (node < 0 || node >= NP || pools.count(node))
+    throw std::runtime_error("Signal mask adoption requires initial owned thread bootstrap");
+  auto& state = ptmc_state.running_state.child[node];
+  if (state.threads.empty()) {
+    if (physical_tid != ptmc_state.pids[node])
+      throw std::runtime_error("Cannot adopt unowned thread signal mask");
+    require_no_pending_signals(physical_tid);
+    const uint64_t mask = read_thread_signal_mask(physical_tid);
+    record_logical_clear_tid(node, physical_tid, 0);
+    state.threads.front().signal_mask = mask;
+    return;
+  }
+  const auto found = std::find_if(state.threads.begin(), state.threads.end(),
+      [physical_tid](const thread_state& thread) { return thread.alive && thread.physical_tid == physical_tid; });
+  if (found == state.threads.end()) throw std::runtime_error("Cannot adopt unowned thread signal mask");
+  require_no_pending_signals(physical_tid);
+  found->signal_mask = read_thread_signal_mask(physical_tid);
+}
+
+long emulate_thread_sigprocmask(int node, pid_t physical_tid, uint64_t how,
+                               uint64_t new_mask, uint64_t old_mask, uint64_t size)
+{
+  if (size != sizeof(uint64_t)) return -EINVAL;
+  if (node < 0 || node >= NP) throw std::runtime_error("Thread pool node out of range");
+  auto& state = ptmc_state.running_state.child[node];
+  const auto found = std::find_if(state.threads.begin(), state.threads.end(),
+      [physical_tid](const thread_state& thread) { return thread.alive && thread.physical_tid == physical_tid; });
+  if (found == state.threads.end()) throw std::runtime_error("sigprocmask has no live owned thread");
+  for (uint64_t address : {new_mask, old_mask})
+    if (address < scratch_page + 4096 && address > scratch_page - sizeof(uint64_t))
+      throw std::runtime_error("Signal mask pointer overlaps reserved control memory");
+  require_no_pending_signals(physical_tid);
+  const uint64_t previous = found->signal_mask;
+  if (read_thread_signal_mask(physical_tid) != previous)
+    throw std::runtime_error("Physical thread signal mask differs from model");
+  if (new_mask) {
+    uint64_t value = 0;
+    if (!guest_read_exact(physical_tid, reinterpret_cast<void*>(new_mask), &value, sizeof(value)))
+      return -EFAULT;
+    uint64_t replacement = previous;
+    switch (static_cast<int32_t>(how)) {
+      case SIG_BLOCK: replacement |= value; break;
+      case SIG_UNBLOCK: replacement &= ~value; break;
+      case SIG_SETMASK: replacement = value; break;
+      default: return -EINVAL;
+    }
+    replacement &= ~((uint64_t(1) << (SIGKILL - 1)) | (uint64_t(1) << (SIGSTOP - 1)));
+    write_thread_signal_mask(physical_tid, replacement);
+    found->signal_mask = replacement;
+  }
+  // Linux commits the new mask before copying oldset out, including EFAULT.
+  if (old_mask && !guest_write_exact(physical_tid, reinterpret_cast<void*>(old_mask),
+                                    &previous, sizeof(previous))) return -EFAULT;
+  return 0;
+}
+
+void restore_thread_signal_masks(int node, const tracee_state& state)
+{
+  const auto& pool = pool_for(node);
+  for (pid_t carrier : pool.carriers) {
+    uint64_t mask = 0;
+    for (const auto& thread : state.threads)
+      if (thread.alive && thread.physical_tid == carrier) { mask = thread.signal_mask; break; }
+    write_thread_signal_mask(carrier, mask);
+  }
 }
 
 void complete_thread_start(int node, pid_t physical_tid)
@@ -265,7 +342,14 @@ void prepare_thread_pool(int node, const tracee_state& state)
     found = pools.emplace(node, CarrierPool{ptmc_state.pids[node], std::move(carriers)}).first;
   } else verify_thread_pool(node);
   validate_bound_slots(found->second, state);
-  for (pid_t tid : found->second.carriers) require_thread_capture_boundary(tid);
+  for (pid_t tid : found->second.carriers) {
+    require_thread_capture_boundary(tid);
+    uint64_t mask = 0;
+    for (const auto& thread : state.threads)
+      if (thread.alive && thread.physical_tid == tid) { mask = thread.signal_mask; break; }
+    if (read_thread_signal_mask(tid) != mask)
+      throw std::runtime_error("Physical thread signal mask differs from captured model");
+  }
 }
 
 void verify_thread_pool(int node)
@@ -380,6 +464,7 @@ pid_t create_logical_thread(int node, pid_t parent, const CloneRequest& request)
     throw std::runtime_error("Cannot capture raw clone parent registers");
   const auto xstate = capture_xstate(parent);
   const auto parent_slot = static_cast<size_t>(source - state.threads.begin());
+  const uint64_t inherited_mask = source->signal_mask;
   std::set<pid_t> occupied;
   for (const auto& thread : state.threads)
     if (thread.alive) occupied.insert(thread.physical_tid);
@@ -399,10 +484,12 @@ pid_t create_logical_thread(int node, pid_t parent, const CloneRequest& request)
   if (ptrace(PTRACE_SETREGS, carrier, nullptr, &regs) == -1)
     throw std::runtime_error("Cannot initialize logical child registers");
   restore_xstate(carrier, xstate);
+  write_thread_signal_mask(carrier, inherited_mask);
   state.add_thread(carrier, flags, stack, parent, false);
   auto& child = state.threads.back();
   child.regs = regs;
   child.xstate = xstate;
+  child.signal_mask = inherited_mask;
   child.clear_child_tid = (flags & CLONE_CHILD_CLEARTID) ? child_tid : 0;
   child.child_settid_pending = flags & CLONE_CHILD_SETTID;
   child.pending_child_settid = child.child_settid_pending ? child_tid : 0;

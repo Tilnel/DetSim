@@ -21,6 +21,10 @@ pid_t record_logical_clear_tid(int node, pid_t physical_tid, uint64_t address);
 // Bootstrap only, after all nodes are stopped and scratch memory is installed.
 // Transfer a physical registration into model state, then disable it in Linux.
 void adopt_clear_child_tid(int node, pid_t physical_tid);
+void adopt_thread_signal_mask(int node, pid_t physical_tid);
+long emulate_thread_sigprocmask(int node, pid_t physical_tid, uint64_t how,
+                               uint64_t new_mask, uint64_t old_mask, uint64_t size);
+void restore_thread_signal_masks(int node, const tracee_state& state);
 void validate_logical_clone(uint64_t flags);
 pid_t create_logical_thread(int node, pid_t parent, uint64_t flags,
                             uint64_t stack, uint64_t tls);

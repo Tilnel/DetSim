@@ -764,3 +764,27 @@ With CC=/usr/bin/gcc and CXX=/usr/bin/g++:
 
 The unmodified minimal pthread probe in build/tid-pthread-probe stops explicitly
 at syscall14, rt_sigprocmask. No pthread/private-runtime state patches were added.
+
+## Per-task signal mask verification (2026-10-15)
+
+With CC=/usr/bin/gcc and CXX=/usr/bin/g++:
+- `make check`: 9 component and 10 build-contract tests pass.
+- NP1 `check-thread-signal-mask` and `check-thread-tid`: eight variants each pass.
+  Thread control/carrier/identity/lifecycle, futex/futex-snapshot, exec and the
+  fourteen native scenarios also pass.
+- NP2 capture/identity/state-view/plugins/runtime-profile/syscall-policy/
+  process-state/io-boundary/accept/Redis gates pass. Startup inheritance and
+  prelude mask updates use the production dispatcher path.
+- GCC `-Wall -Wextra -Werror -fsyntax-only` checks cover control/carrier/pool and
+  signal-mask/TID fixtures. Independent read-only review passes.
+- NP3 production build; depth8 Raft smoke produces 2,582 visits and 1,347 new
+  states for both backends. Full375/pages491 states/s, compared with prior single
+  samples381/547. Additional pending/mask validation has overhead; these samples
+  do not establish a statistically measured regression or performance equivalence.
+  Artifacts: build/thread-sigmask-raft and build/thread-sigmask-raft-pages.
+- Actual unmodified pthread probe now passes syscall14 and explicitly stops at
+  the ordinary-readable-private mapping restriction (guard mapping support is
+  still open). Artifact: build/tid-pthread-probe/signal-mask-transcript.log.
+
+No workload-specific state extraction was added. Pending signal queues, delivery,
+altstack, cancellation and Go asynchronous preemption remain unsupported.

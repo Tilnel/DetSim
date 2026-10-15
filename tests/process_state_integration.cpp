@@ -112,24 +112,29 @@ int main() {
         if(ptrace(PTRACE_TRACEME,0,nullptr,nullptr)) _exit(3);
         asm volatile("int3");_exit(0);
     }
-    bool bootstrap_ok=false,mask_rejected=false;
+    bool bootstrap_ok=false,mask_adopted=false,pending_rejected=false;
     if(child>0) {
         int status=0;
         if(waitpid(child,&status,0)==child && WIFSTOPPED(status) &&
            ptrace(PTRACE_SETOPTIONS,child,nullptr,PTRACE_O_TRACESYSGOOD|PTRACE_O_EXITKILL)==0) {
             try {
+                ptmc_state.pids[0]=child;
                 capture_process_kernel_state(child,0);
                 bootstrap_ok=ptmc_state.process_states[0].signal_actions.at(SIGINT).handler==1 &&
                     ptmc_state.fs_states[0].creation_mask()==0077;
                 const uint64_t mask=1ULL<<(SIGUSR1-1);
                 guest_write_exact(child,reinterpret_cast<void*>(scratch_page+0x900),&mask,sizeof(mask));
                 tracee_do_syscall(child,SYS_rt_sigprocmask,SIG_BLOCK,scratch_page+0x900,0,8,0,0);
-                try {capture_process_kernel_state(child,0);}catch(const std::runtime_error&){mask_rejected=true;}
+                capture_process_kernel_state(child,0);
+                mask_adopted=ptmc_state.running_state.child[0].threads.front().signal_mask==mask;
+                kill(child,SIGUSR1);
+                try {capture_process_kernel_state(child,0);}catch(const std::runtime_error&){pending_rejected=true;}
             } catch(const std::exception& e) {fprintf(stderr,"bootstrap fixture: %s\n",e.what());}
         }
         kill(child,SIGKILL);waitpid(child,&status,0);
     }
     check(bootstrap_ok,"native bootstrap imports inherited dispositions and umask");
-    check(mask_rejected,"native bootstrap rejects inherited blocked signals");
+    check(mask_adopted,"native bootstrap adopts inherited blocked mask");
+    check(pending_rejected,"native bootstrap rejects inherited pending signals");
     printf("process kernel model: %d failures\n",failures);return failures?1:0;
 }

@@ -95,3 +95,6 @@
 
 !thread_tid.mk
 !thread_tid_integration.cpp
+
+!thread_signal_mask.mk
+!thread_signal_mask_integration.cpp

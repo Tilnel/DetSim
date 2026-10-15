@@ -1,6 +1,8 @@
 #include "process_state.h"
 #include "monitor.h"
 #include "guest.h"
+#include "engine/thread_pool.h"
+#include "engine/thread_control.h"
 #include "cereal/archives/binary.hpp"
 #include <algorithm>
 #include <cerrno>
@@ -72,6 +74,7 @@ void capture_process_kernel_state(int pid,int node) {
         if(++threads>1) throw std::runtime_error("Already multithreaded startup boundaries are unsupported");
     }
     if(threads!=1) throw std::runtime_error("Cannot inspect startup process thread set");
+    adopt_thread_signal_mask(node,pid);
     ProcessKernelState captured;
     const uintptr_t address=scratch_page+0x800;
     std::array<unsigned char,128> original{};
@@ -96,7 +99,8 @@ void capture_process_kernel_state(int pid,int node) {
         }
         uint64_t mask=0;
         query(SYS_rt_sigprocmask,SIG_SETMASK,0,address,8);read(mask);
-        if(mask) throw std::runtime_error("Inherited blocked signals are unsupported");
+        if(mask!=ptmc_state.running_state.child[node].threads.front().signal_mask)
+            throw std::runtime_error("Bootstrap signal mask changed during capture");
         query(SYS_rt_sigpending,address,8,0,0);read(mask);
         if(mask) throw std::runtime_error("Inherited pending signals are unsupported");
         for(int timer=ITIMER_REAL;timer<=ITIMER_PROF;++timer) {
@@ -118,11 +122,6 @@ void capture_process_kernel_state(int pid,int node) {
     std::ifstream status("/proc/"+std::to_string(pid)+"/status");
     std::string line;unsigned creation_mask=0;bool found=false;
     while(std::getline(status,line)) {
-        if(line.starts_with("SigPnd:") || line.starts_with("ShdPnd:")) {
-            uint64_t pending=0;
-            std::istringstream input(line.substr(line.find(':')+1));input>>std::hex>>pending;
-            if(!input || pending) throw std::runtime_error("Inherited pending signals are unsupported");
-        }
         if(line.starts_with("Umask:")) {
             std::istringstream input(line.substr(6));input>>std::oct>>creation_mask;
             if(!input || creation_mask>0777) throw std::runtime_error("Invalid inherited process umask");
@@ -130,6 +129,7 @@ void capture_process_kernel_state(int pid,int node) {
         }
     }
     if(!found) throw std::runtime_error("Cannot read inherited process umask");
+    require_no_pending_signals(pid);
     ptmc_state.process_states[node]=std::move(captured);
     ptmc_state.fs_states[node].set_creation_mask(creation_mask);
 }

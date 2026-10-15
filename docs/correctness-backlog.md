@@ -197,3 +197,15 @@ and full/pages replay tests pass; format17/18 and kernel modelv5 reject prior
 execution contexts. Parent-first syscall atoms and fixed group cleanup order
 remain scoped. The next observed blocker for unmodified pthread is rt_sigprocmask;
 guard mappings, rseq policy, robust ownership and full signal delivery remain open.
+
+## Per-task mask slice completed
+
+Logical task masks now have capture/copy/archive/identity/restore coverage,
+including initial inheritance, clone from a non-anchor task, carrier reuse and
+same-hash restore. `rt_sigprocmask` uses native argument/error ordering, including
+committing a new mask before an oldset copyout fault. Flat19/page20 and kernel
+model v6 record this boundary. The eight signal-mask backend/cache/pending
+variants and eight clone/clone3 TID variants pass. Actual pending bits (thread
+and shared) reject before restore; no pending queue is silently discarded.
+General signal delivery, altstack, timed/temporary-mask waits, cancellation and
+external asynchronous input remain open. This is not complete pthread/Go support.

@@ -166,7 +166,7 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
             return SyscallRoute(SyscallCategory::UNSUPPORTED,SyscallAction::REJECT,
                                 "Unsupported virtual I/O or descriptor lifecycle");
 
-        case SYS_clone: case SYS_clone3: case SYS_set_tid_address:
+        case SYS_clone: case SYS_clone3: case SYS_set_tid_address: case SYS_rt_sigprocmask:
         case SYS_exit: case SYS_getpid: case SYS_gettid:
             return SyscallRoute(SyscallCategory::EMULATED, SyscallAction::EMULATE,
                                 "Modeled logical thread lifecycle or identity");
@@ -353,6 +353,7 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
         case SYS_clone3:
         case SYS_gettid:
         case SYS_set_tid_address:
+        case SYS_rt_sigprocmask:
         case SYS_exit:
         case SYS_exit_group:
             return handle_thread_exit(pid, info);

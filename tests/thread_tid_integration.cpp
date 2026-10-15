@@ -154,6 +154,8 @@ static void run(bool tiny, bool clone3) {
         if (__rseq_size && syscall(SYS_rseq,
                 static_cast<char*>(__builtin_thread_pointer()) + __rseq_offset,
                 32, RSEQ_FLAG_UNREGISTER, RSEQ_SIG)) _exit(2);
+        const uint64_t inherited_mask = uint64_t{1} << (SIGUSR2 - 1);
+        if (syscall(SYS_rt_sigprocmask, SIG_SETMASK, &inherited_mask, nullptr, 8)) _exit(5);
         syscall(SYS_set_tid_address, &main_word);
         if (mmap(reinterpret_cast<void*>(scratch_page), 4096, PROT_READ|PROT_WRITE|PROT_EXEC,
                  MAP_FIXED_NOREPLACE|MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) == MAP_FAILED) _exit(3);
@@ -187,6 +189,8 @@ static void run(bool tiny, bool clone3) {
         ptmc_state.fs_states[0].set_fd_manager(ptmc_state.fd_managers[0]);
         ptmc_state.sock_states[0].set_fd_manager(ptmc_state.fd_managers[0]);
         adopt_clear_child_tid(0, pid);
+        require(ptmc_state.running_state.child[0].threads.front().signal_mask ==
+                (uint64_t{1} << (SIGUSR2 - 1)), "clear-tid adoption lost inherited signal mask");
         auto* query_address = reinterpret_cast<uint64_t*>(scratch_page + 0x300);
         const auto query_saved = read_guest(pid, query_address);
         require(tracee_do_syscall(pid, SYS_prctl, PR_GET_TID_ADDRESS,

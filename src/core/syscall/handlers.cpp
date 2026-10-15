@@ -372,6 +372,9 @@ int handle(pid_t pid, syscall_info &info) {
         case SYS_clone:      return handle_clone(pid, info);
         case SYS_clone3:     return handle_clone3(pid, info);
         case SYS_gettid:     return handle_gettid(pid, info);
+        case SYS_rt_sigprocmask:
+            info.rval=emulate_thread_sigprocmask(ptmc_state.cursor,pid,info.args[0],info.args[1],info.args[2],info.args[3]);
+            tracee_set_rax(pid,info.rval);return CKPT_YES;
         case SYS_set_tid_address:
             info.rval=record_logical_clear_tid(ptmc_state.cursor,pid,info.args[0]);
             tracee_set_rax(pid,info.rval);return CKPT_YES;

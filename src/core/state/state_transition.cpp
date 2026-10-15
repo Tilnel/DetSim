@@ -370,6 +370,11 @@ syscall_info extract_one_syscall(pid_t pid)
   if (ret.nr == SYS_clone || ret.nr == SYS_clone3)
     throw std::runtime_error("RuntimeProfile startup boundary must precede thread creation");
   if (ret.nr == SYS_set_tid_address) tracee_set_rdi(pid,0);
+  if (ret.nr == SYS_rt_sigprocmask) {
+    if (ptmc_state.running_state.child[ptmc_state.cursor].threads.empty())
+      adopt_thread_signal_mask(ptmc_state.cursor,pid);
+    tracee_set_orig_rax(pid,-1);tracee_set_rax(pid,-1);
+  }
 
   /* exit */
   resume_startup_syscall(pid);
@@ -379,7 +384,10 @@ syscall_info extract_one_syscall(pid_t pid)
     throw std::runtime_error("Unexpected syscall phase before configured RuntimeProfile startup boundary");
   ret.rval = info.exit.rval;
 
-  if (ret.nr == SYS_set_tid_address) {
+  if (ret.nr == SYS_rt_sigprocmask) {
+    ret.rval=emulate_thread_sigprocmask(ptmc_state.cursor,pid,ret.args[0],ret.args[1],ret.args[2],ret.args[3]);
+    tracee_set_rax(pid,ret.rval);
+  } else if (ret.nr == SYS_set_tid_address) {
     if (static_cast<int64_t>(ret.rval)<0)
       throw std::runtime_error("Cannot detach startup clear_child_tid registration");
     tracee_set_rdi(pid,ret.args[0]);
@@ -450,6 +458,10 @@ static void init_tracee_state(int index)
   if (waitpid(pid, &wstatus, 0) != pid || !WIFSTOPPED(wstatus) || WSTOPSIG(wstatus) != SIGTRAP)
     throw std::runtime_error("Tracee failed to exec before configured RuntimeProfile startup boundary");
 
+  // exec replaced the old user image; adopt its inherited task mask before
+  // executing the loader prelude through the same rt_sigprocmask model.
+  ptmc_state.running_state.child[index]=tracee_state{};
+  adopt_thread_signal_mask(index,pid);
   if (profile.disable_vdso) remove_vdso(pid);
   if (profile.deterministic_at_random && patch_at_random(pid) != 0)
     throw std::runtime_error("Cannot normalize tracee AT_RANDOM");

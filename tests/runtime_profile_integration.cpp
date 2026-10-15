@@ -7,6 +7,7 @@ extern "C" detsim::ui::NCursesUI* get_ncurses_ui() { return nullptr; }
 #include "scheduler.h"
 #include "monitor.h"
 #include "engine/thread_pool.h"
+#include "engine/thread_control.h"
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <elf.h>
@@ -105,6 +106,7 @@ static void check_startup_exit_diagnostic() {
 }
 static uint32_t startup_tid_word=0xaabbccdd;
 static volatile long startup_tid_result=0;
+static uint64_t startup_new_mask=uint64_t{1}<<(SIGUSR2-1),startup_old_mask=0;
 static void check_startup_tid_contract() {
   const auto old_child=ptmc_state.running_state.child[0];
   const int old_pid=ptmc_state.pids[0],old_cursor=ptmc_state.cursor;
@@ -113,10 +115,13 @@ static void check_startup_tid_contract() {
     if (mmap(reinterpret_cast<void*>(scratch_page),4096,PROT_READ|PROT_WRITE|PROT_EXEC,
              MAP_FIXED_NOREPLACE|MAP_PRIVATE|MAP_ANONYMOUS,-1,0)==MAP_FAILED) _exit(104);
     auto* code=reinterpret_cast<unsigned char*>(scratch_page+0xff0);code[0]=0x0f;code[1]=0x05;
+    const uint64_t inherited=uint64_t{1}<<(SIGUSR1-1);
+    if (syscall(SYS_rt_sigprocmask,SIG_SETMASK,&inherited,nullptr,8)) _exit(106);
     if (ptrace(PTRACE_TRACEME,0,nullptr,nullptr)) _exit(105);
     asm volatile("int3");
     startup_tid_result=syscall(SYS_set_tid_address,&startup_tid_word);
-    syscall(SYS_gettid);syscall(SYS_getpid);_exit(0);
+    syscall(SYS_gettid);syscall(SYS_getpid);
+    syscall(SYS_rt_sigprocmask,SIG_BLOCK,&startup_new_mask,&startup_old_mask,8);_exit(0);
   }
   auto cleanup=[&] {kill(pid,SIGKILL);waitpid(pid,nullptr,0);
     ptmc_state.running_state.child[0]=old_child;ptmc_state.pids[0]=old_pid;ptmc_state.cursor=old_cursor;};
@@ -124,6 +129,7 @@ static void check_startup_tid_contract() {
     int status=0;require(waitpid(pid,&status,0)==pid && WIFSTOPPED(status),"TID prelude stop");
     require(ptrace(PTRACE_SETOPTIONS,pid,nullptr,PTRACE_O_TRACESYSGOOD|PTRACE_O_EXITKILL)==0,"TID prelude options");
     ptmc_state.pids[0]=pid;ptmc_state.cursor=0;ptmc_state.running_state.child[0]=tracee_state{};
+    adopt_thread_signal_mask(0,pid);
     auto registration=extract_one_syscall(pid);
     require(registration.nr==SYS_set_tid_address && registration.rval==uint64_t(logical_process_id(0)),
             "prelude set_tid_address returned a fabricated or physical TID");
@@ -131,6 +137,14 @@ static void check_startup_tid_contract() {
             "prelude lost clear-child-tid registration");
     require(extract_one_syscall(pid).rval==registration.rval && extract_one_syscall(pid).rval==registration.rval,
             "prelude gettid/getpid disagree with registration identity");
+    const auto mask_call=extract_one_syscall(pid);
+    uint64_t old_mask=0;
+    const uint64_t inherited=uint64_t{1}<<(SIGUSR1-1);
+    require(mask_call.nr==SYS_rt_sigprocmask && mask_call.rval==0 &&
+            guest_read_exact(pid,&startup_old_mask,&old_mask,sizeof(old_mask)) && old_mask==inherited &&
+            ptmc_state.running_state.child[0].threads[0].signal_mask==(inherited|startup_new_mask) &&
+            read_thread_signal_mask(pid)==(inherited|startup_new_mask),
+            "prelude signal mask did not use the logical task ABI");
     long observed=0;
     require(guest_read_exact(pid,const_cast<const long*>(&startup_tid_result),&observed,sizeof(observed)) &&
             observed==logical_process_id(0),"prelude guest did not receive logical ID");

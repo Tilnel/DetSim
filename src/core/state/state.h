@@ -24,14 +24,14 @@ void clear_snapshot_thread_bindings();
  * State Data Format (shared with StateStore)
  * ====================================================================== */
 
-inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 17;
-inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 18;
+inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 19;
+inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 20;
 
 /* Packed to avoid alignment padding */
 struct __attribute__((packed)) StateDataHeader
 {
   uint32_t magic;         // 'DSTM' = 0x4453544D
-  uint32_t version;       // 17: flat; 18: pages (logical TID registration and writeback)
+  uint32_t version;       // 19: flat; 20: pages (per-thread signal masks)
   uint32_t num_regions;   // number of memory regions
   uint64_t tstate_offset; // offset to serialized tracee_state
   uint64_t tstate_size;   // size of serialized tracee_state
@@ -94,6 +94,7 @@ struct thread_state
   uint64_t stack_addr;            // Stack address (for clone)
   pid_t ptid;                     // Parent thread TID
   bool is_main;                   // Whether this is the main thread
+  uint64_t signal_mask = 0;        // Linux native 64-signal blocked mask
   uint64_t clear_child_tid = 0;    // Logical set_tid_address / CLONE_CHILD_CLEARTID
   uint64_t pending_child_settid = 0;
   bool child_settid_pending = false; // Attempt at first child schedule, even for NULL
@@ -111,7 +112,7 @@ struct thread_state
        regs.rsi, regs.rdi, regs.orig_rax, regs.rip, regs.cs, regs.eflags,
        regs.rsp, regs.ss, regs.fs_base, regs.gs_base, regs.ds, regs.es,
        regs.fs, regs.gs, clone_flags, stack_addr, ptid, is_main, xstate,
-       clear_child_tid, pending_child_settid, child_settid_pending);
+       clear_child_tid, pending_child_settid, child_settid_pending, signal_mask);
     if constexpr (Archive::is_loading::value) physical_tid = 0;
   }
 };

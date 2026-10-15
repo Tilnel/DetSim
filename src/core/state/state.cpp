@@ -726,6 +726,7 @@ void tracee_state::recover_running_state(int index, hash_type ts_hash) const
 {
   const auto resolved = resolve_thread_bindings(index, ts_hash);
   ptmc_state.tracee_image_dirty[index] = true;
+  restore_thread_signal_masks(index, resolved);
   normalize_thread_pool_for_restore(index);
   resolved.recover_stopped(index, ts_hash);
   resolved.restore_runtime_state(index);
@@ -1095,7 +1096,10 @@ tracee_state::tracee_state(int which, const struct syscall_info info[])
 void tracee_state::prepare_capture(pid_t pid)
 {
   if (threads.empty()) {
-    for (pid_t tid : get_thread_list(pid)) add_thread(tid, 0, 0, 0, tid == pid);
+    for (pid_t tid : get_thread_list(pid)) {
+      add_thread(tid, 0, 0, 0, tid == pid);
+      threads.back().signal_mask = read_thread_signal_mask(tid);
+    }
   }
   if (threads.size() > MAX_THREADS_PER_PROCESS)
     throw std::runtime_error("Snapshot exceeds supported thread count");
@@ -1322,8 +1326,10 @@ void sys_state::recover_running_state() const
     // running snapshot. Retain dirty flags until the whole operation commits.
     ptmc_state.tracee_image_dirty[i] = true;
   }
-  for (int i = 0; i < NP; ++i)
+  for (int i = 0; i < NP; ++i) {
+    restore_thread_signal_masks(i, resolved.child[i]);
     if (restore_image[i]) normalize_thread_pool_for_restore(i);
+  }
   ptmc_state.error_bound = error_bound;
   for (int i = 0; i < NP; ++i) {
     ptmc_state.status[i] = status[i];
