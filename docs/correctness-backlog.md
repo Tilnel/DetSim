@@ -8,8 +8,8 @@ relationship to the native-binary model-checking goal.
 
 | ID | Priority | Evidence / problem | Evidence required to close |
 | --- | --- | --- | --- |
-| C01 | Fixed (unchanged live thread set) | Futex queues are branch-owned, captured and archived; restore reconstructs blocked state, including same-hash restores. | `check-futex-snapshot` exercises capture/copy/assignment/archive, persisted reload and repeated ptrace restore/wake. Thread creation/exit across restore is explicitly rejected (C02). |
-| C02 | P0 / partial | Capture preserves virtual slots and creation records; restore rejects changed physical thread sets instead of speculative recreation or positional register assignment. Physical TIDs now stay in transient bindings; explicit liveness and logical parent IDs enter archives. Guest-visible physical IDs in register/memory contents are not normalized. | Create A/B, exit A, create C, repeatedly restore with correct logical identity and TLS/stop phases. This lifecycle remains unsupported; rejection is not lifecycle reconstruction. |
+| C01 | Fixed (unchanged live thread set) | Futex queues are branch-owned, captured and archived; restore reconstructs blocked state, including same-hash restores. | `check-futex-snapshot` exercises capture/copy/assignment/archive, persisted reload and repeated ptrace restore/wake. Raw lifecycle/carrier restore has separate C02 tests; combined lifecycle and futex waiting still needs wider coverage. |
+| C02 | P0 / partial | Capture preserves virtual slots and creation records; raw clone/exit now restore logical contexts over retained carriers; unexpected physical death or untracked creation rejects. Physical TIDs now stay in transient bindings; explicit liveness and logical parent IDs enter archives. Guest-visible physical IDs in register/memory contents are not normalized. | Create A/B, exit A, create C, repeatedly restore with correct logical identity and TLS/stop phases. `check-thread-lifecycle` now covers that sequence, TLS, persisted replay, main-first exit and actual carrier reuse. pthread, TID writeback, robust owner-death and rseq remain unsupported. |
 | C03 | P0 | New BFS sets a selected thread before `state_transition`; recovery and `execute_step` synchronization can overwrite that selection. Two exploration implementations remain compiled; CLI uses the old one. | A two-thread finite program exposes both successor transitions from one snapshot. Trace all callers, compare BFS/DFS results, then consolidate to one path. |
 | C04 | Partial | Ordered system metadata identity includes status/budget; storage now compares duplicate bytes in cache, packed records and metadata instead of trusting hashes alone. | Identity and all storage gates cover ordering and duplicate conflicts. Logical thread identity and equivalence of differently encoded semantic states remain open. |
 | C05 | Fixed (scoped) | Removed filename heuristics; corrected libelf string-table index in Go-section detection. | Native `test_probe` starts at the same boundary as `probe`; ordinary/Go-section ELF fixtures and two existing gc Go binaries classified correctly. gccgo and actual Go runtime execution remain unverified. |
@@ -159,3 +159,19 @@ coordination and general canonicalization remain open.
 Virtual termination still retains modeled descriptors; Linux exit-driven close/EOF
 and other resource teardown semantics require a separate lifecycle model. The
 regressions above establish branch-image isolation, not complete exit semantics.
+
+## Raw thread carrier lifecycle
+
+Logical clone/exit reconstructs thread contexts across births and exits using
+retained stopped carriers; the physical group leader remains an anchor. Pool
+spares do not enter snapshots. Frozen logical-main registers define the header,
+so anchor injections cannot change terminal-main identity. Flat15/page16 adds
+thread exit codes; kernel model v4 includes logical syscall-visible IDs.
+
+The bounded profile requires explicit raw sharing flags, no inherited clear-tid or
+rseq for birth, and no robust ownership at exit. It does not claim pthread support.
+All-node ownership/stop preflight precedes restore; physical dirty flags force a
+full rollback after failed guest execution or partial restore. Entry cancellation
+skips a pending syscall before restore injection; capture refuses such a phase.
+C02 remains partial for full Linux lifecycle; C03/C25 actor and instruction-level
+coverage remain open despite the explicit transition actor API.

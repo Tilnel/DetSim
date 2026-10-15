@@ -8,6 +8,7 @@
 #include "log_wrapper.h"
 #include "monitor.h"
 #include "thread_manager.h"
+#include "engine/thread_pool.h"
 #include "sync/futexstate.h"
 #include "process/process_state.h"
 #include <cassert>
@@ -165,13 +166,15 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
             return SyscallRoute(SyscallCategory::UNSUPPORTED,SyscallAction::REJECT,
                                 "Unsupported virtual I/O or descriptor lifecycle");
 
-        // Physical lifecycle changes cannot yet be reconstructed on restore.
-        case SYS_clone:
+        // Process trees/clone3 are outside the raw-thread profile.
         case SYS_clone3:
-        case SYS_exit:
             return SyscallRoute(SyscallCategory::UNSUPPORTED,
                                SyscallAction::REJECT,
                                "Unsupported physical thread lifecycle");
+
+        case SYS_clone: case SYS_exit: case SYS_getpid: case SYS_gettid:
+            return SyscallRoute(SyscallCategory::EMULATED, SyscallAction::EMULATE,
+                                "Modeled logical thread lifecycle or identity");
 
         // Blocked syscalls
         case SYS_exit_group:
@@ -188,7 +191,6 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
 
         // Native queries are stable within the owned tracee. Private-memory
         // effects are included in capture; argument restrictions run on entry.
-        case SYS_getpid: case SYS_gettid:
         case SYS_getuid: case SYS_geteuid: case SYS_getgid: case SYS_getegid:
         case SYS_brk: case SYS_mprotect: case SYS_munmap:
         case SYS_prlimit64:
@@ -243,6 +245,7 @@ bool SyscallDispatcher::on_enter(pid_t pid, int syscall_nr, syscall_info& info)
         case SyscallAction::REJECT:
             throw std::runtime_error(std::string(route.description)+": syscall "+std::to_string(syscall_nr));
         case SyscallAction::EMULATE:
+            if (syscall_nr == SYS_clone) validate_logical_clone(info.args[0]);
             // Block the syscall - will be emulated on exit
             tracee_set_orig_rax(pid, -1);
             tracee_set_rax(pid, -1);
@@ -275,8 +278,9 @@ bool SyscallDispatcher::on_enter(pid_t pid, int syscall_nr, syscall_info& info)
             if (syscall_nr == SYS_mprotect || syscall_nr == SYS_munmap)
                 validate_guest_mapping_range(info.args[0],info.args[1]);
             if (syscall_nr == SYS_prlimit64 &&
-                (info.args[2] || (info.args[0] && info.args[0] != uint64_t(ptmc_state.pids[ptmc_state.cursor]))))
+                (info.args[2] || (info.args[0] && info.args[0] != uint64_t(logical_process_id(ptmc_state.cursor)))))
                 throw std::runtime_error("Only owned-process prlimit64 queries are supported");
+            if (syscall_nr == SYS_prlimit64 && info.args[0]) tracee_set_rdi(pid,0);
             if (syscall_nr == SYS_mprotect &&
                 (!(info.args[2] & PROT_READ) || (info.args[2] & ~(PROT_READ|PROT_WRITE|PROT_EXEC))))
                 throw std::runtime_error("Unreadable or extended-protection mappings are unsupported");
@@ -288,6 +292,7 @@ bool SyscallDispatcher::on_enter(pid_t pid, int syscall_nr, syscall_info& info)
 
 int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
 {
+    if (info.nr == SYS_prlimit64 && info.args[0]) tracee_set_rdi(pid,info.args[0]);
     // Handle choice for syscalls with multiple outcomes
     ptmc_state.n_choose = analyze_choose(info);
     if (ptmc_state.n_choose != 0) {
@@ -343,6 +348,10 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
         case SYS_getcwd:
         case SYS_lstat:
             return handle_fs_exit(pid, info);
+
+        case SYS_getpid:
+            info.rval=logical_process_id(ptmc_state.cursor);
+            tracee_set_rax(pid,info.rval);return CKPT_YES;
 
         // Thread syscalls
         case SYS_clone:

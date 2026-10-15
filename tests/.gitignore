@@ -89,3 +89,6 @@
 
 !thread_carrier.mk
 !thread_carrier_integration.cpp
+
+!thread_lifecycle.mk
+!thread_lifecycle_integration.cpp

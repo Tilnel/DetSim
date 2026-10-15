@@ -59,6 +59,11 @@ int ExecutionEngine::do_single_syscall(pid_t pid, syscall_info& info)
     int wstatus = 0;
     struct ptrace_syscall_info psi;
 
+    // User instructions may change memory before the next syscall entry, and
+    // an unsupported handler can throw after that advance. Invalidate the
+    // old snapshot image before the first resume, not after handler success.
+    if (ptmc_state.cursor >= 0 && ptmc_state.cursor < NP)
+        ptmc_state.tracee_image_dirty[ptmc_state.cursor] = true;
     // Entry
     ptrace_right(PTRACE_SYSCALL, pid, NULL, NULL);
     waitpid(pid, &wstatus, 0);
@@ -94,32 +99,8 @@ int ExecutionEngine::do_single_syscall(pid_t pid, syscall_info& info)
     // previous syscall or an uninitialized argument buffer.
     syscall_dispatch::enter(pid, info.nr, info);
 
-    // Mark exit_group
-    if (info.nr == SYS_exit_group) {
-        ptmc_state.status[ptmc_state.cursor] = dstatus_exit(info.args[0]);
-    }
-
     // Execute syscall
     ptrace_right(PTRACE_SYSCALL, pid, NULL, NULL);
-
-    // Special handling for SYS_exit
-    if (info.nr == SYS_exit) {
-        pid_t wait_result = waitpid(pid, &wstatus, 0);
-        if (on_thread_exit(pid, wait_result, wstatus, info)) {
-            return CKPT_NO;
-        }
-
-        if (wait_result == pid && WIFSTOPPED(wstatus) &&
-            WSTOPSIG(wstatus) == PTRACE_TRAP_SIG) {
-            ptrace_right(PTRACE_GET_SYSCALL_INFO, pid, (void*)sizeof(psi), &psi);
-            if (psi.op == PTRACE_SYSCALL_INFO_EXIT) {
-                info.rval = psi.exit.rval;
-                return syscall_dispatch::exit(pid, info);
-            }
-        }
-        LOG_ERROR("Unexpected waitpid result for SYS_exit");
-        return CKPT_STOP;
-    }
 
     // Normal exit handling
     waitpid(pid, &wstatus, 0);

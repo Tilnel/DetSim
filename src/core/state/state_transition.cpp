@@ -173,14 +173,26 @@ static bool check_assertions(const sys_state& state, unsigned actor)
 }
 
 TransitionResult state_transition(const sys_state &source_state,
-                                  int process_index)
+                                  int process_index, int requested_thread)
 {
+  if (&source_state == &ptmc_state.running_state) {
+    const sys_state detached_source=source_state;
+    return state_transition(detached_source,process_index,requested_thread);
+  }
   if (process_index < 0 || process_index >= NP)
     throw std::runtime_error("Transition process index out of range");
   if (DISDEAD(source_state.status[process_index]))
     throw std::runtime_error("Cannot execute a terminated process; load a predecessor state first");
   if (source_state.property_failed)
     throw std::runtime_error("Cannot execute a terminal property violation; load a predecessor state first");
+  if (requested_thread < -1 || requested_thread >= static_cast<int>(source_state.child[process_index].threads.size()))
+    throw std::runtime_error("Transition thread index out of range");
+  if (requested_thread >= 0) {
+    const auto& actor=source_state.child[process_index].threads[requested_thread];
+    if (!actor.alive || (source_state.child[process_index].futex_state &&
+        source_state.child[process_index].futex_state->is_thread_waiting(actor.tid)))
+      throw std::runtime_error("Transition thread is not runnable");
+  }
   TransitionResult result;
   ptmc_state.cursor = process_index;
 
@@ -190,6 +202,11 @@ TransitionResult state_transition(const sys_state &source_state,
   auto t2 = std::chrono::high_resolution_clock::now();
   result.restore_time =
       std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1);
+
+  if (requested_thread >= 0) {
+    ptmc_state.current_thread_idx[process_index]=requested_thread;
+    ptmc_state.running_state.child[process_index].current_thread_idx=requested_thread;
+  }
 
   // do syscalls - copy per-thread syscall info for each process
   syscall_info new_syscalls[NP][MAX_THREADS_PER_PROCESS];
@@ -204,6 +221,11 @@ TransitionResult state_transition(const sys_state &source_state,
   // completed syscall to the actor that actually ran, preserving other slots.
   thread_idx = ptmc_state.current_thread_idx[process_index];
   new_syscalls[process_index][thread_idx] = executed;
+  // A modeled clone publishes a stopped logical child during this transition.
+  // Carry its initial child-side syscall result into the candidate snapshot.
+  const auto& runtime_child=ptmc_state.running_state.child[process_index];
+  for (size_t slot=source_state.child[process_index].threads.size(); slot<runtime_child.threads.size(); ++slot)
+    new_syscalls[process_index][slot]=runtime_child.si[slot];
 
   // save state with timing
   auto t3 = std::chrono::high_resolution_clock::now();
@@ -230,6 +252,7 @@ TransitionResult state_transition(const sys_state &source_state,
   state_tree_add(source_state, result.new_state, process_index,
                  ptmc_state.n_choose ? ptmc_state.choose : -1);
   ptmc_state.running_state = result.new_state;
+  for (int node=0; node<NP; ++node) ptmc_state.tracee_image_dirty[node]=false;
   return result;
 }
 
@@ -557,6 +580,7 @@ static void start_tracee(int id)
 int state_initialization()
 {
   clear_snapshot_thread_bindings();
+  for (int node=0; node<NP; ++node) ptmc_state.tracee_image_dirty[node]=false;
   /* initialization for multiple process */
   // setpgid(0, pgid);
   setbuf(stdout, NULL);
@@ -616,6 +640,7 @@ int state_initialization()
   first_state.property_failed = violation;
   first_state.commit_metadata();
   ptmc_state.running_state = first_state;
+  for (int node=0; node<NP; ++node) ptmc_state.tracee_image_dirty[node]=false;
   if (violation) throw std::runtime_error("Initial state violates configured properties");
   return 0;
 }

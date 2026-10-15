@@ -10,6 +10,7 @@
 #include "proc_status.h"
 #include "state/state.h"
 #include "thread_manager.h"
+#include "engine/thread_pool.h"
 #include "sync/futexstate.h"
 #include "fs/fsstate.h"
 #include "net/sockstate.h"
@@ -374,87 +375,36 @@ int handle(pid_t pid, syscall_info &info) {
 }
 
 int handle_clone(pid_t pid, syscall_info &info) {
-    // Thread creation is recorded in extract_one_syscall
-    // Just checkpoint here
-    if (info.rval > 0) {
-        pid_t new_tid = (pid_t)info.rval;
-        LOG_INFO("Clone completed: new thread TID %d", new_tid);
-
-        // Wait for and continue the new thread
-        int wstatus;
-        int retries = 0;
-        pid_t waited = 0;
-
-        while (retries < 100 && waited == 0) {
-            waited = waitpid(new_tid, &wstatus, WNOHANG);
-            if (waited == 0) {
-                usleep(1000);
-                retries++;
-            }
-        }
-
-        if (waited == new_tid && WIFSTOPPED(wstatus)) {
-            LOG_INFO("New thread %d stopped with signal %d, continuing",
-                     new_tid, WSTOPSIG(wstatus));
-            ptrace(PTRACE_SYSCALL, new_tid, NULL, NULL);
-        } else {
-            LOG_WARN("New thread %d not in expected stopped state (waited=%d)",
-                     new_tid, waited);
-        }
-    }
+    const pid_t slot=create_logical_thread(ptmc_state.cursor,pid,info.args[0],info.args[1],info.args[4]);
+    auto& child_info=ptmc_state.running_state.child[ptmc_state.cursor].si[slot-1];
+    child_info=info;child_info.rval=0;
+    info.rval=logical_thread_id(ptmc_state.cursor,slot);
+    tracee_set_rax(pid,info.rval);
     return CKPT_YES;
 }
 
-int handle_clone3(pid_t pid, syscall_info &info) {
-    // Similar to clone
-    if (info.rval > 0) {
-        pid_t new_tid = (pid_t)info.rval;
-        LOG_INFO("Clone3 completed: new thread TID %d", new_tid);
-
-        // Wait for and continue the new thread
-        // The new thread is created in a stopped state (CLONE_PTRACE),
-        // so we need to wait for it and continue it for it to make progress
-        int wstatus;
-        int retries = 0;
-        pid_t waited = 0;
-
-        while (retries < 100 && waited == 0) {
-            waited = waitpid(new_tid, &wstatus, WNOHANG);
-            if (waited == 0) {
-                usleep(1000);
-                retries++;
-            }
-        }
-
-        if (waited == new_tid && WIFSTOPPED(wstatus)) {
-            LOG_INFO("New thread %d stopped with signal %d, continuing",
-                     new_tid, WSTOPSIG(wstatus));
-            // Continue the new thread to its first syscall entry
-            ptrace(PTRACE_SYSCALL, new_tid, NULL, NULL);
-        } else {
-            LOG_WARN("New thread %d not in expected stopped state (waited=%d)",
-                     new_tid, waited);
-        }
-    }
-    return CKPT_YES;
+int handle_clone3(pid_t, syscall_info &) {
+    throw std::runtime_error("clone3 is outside the supported raw-thread profile");
 }
 
 int handle_gettid(pid_t pid, syscall_info &info) {
-    // Kernel-owned identity must agree with TLS/futex and getpid. Snapshot
-    // identity normalization is separate from syscall-visible identity.
-    (void)pid;
-    (void)info;
-    return CKPT_NO;
+    const auto& threads=ptmc_state.running_state.child[ptmc_state.cursor].threads;
+    const int slot=ptmc_state.current_thread_idx[ptmc_state.cursor];
+    const pid_t tid=threads.empty()?1:threads.at(slot).tid;
+    info.rval=logical_thread_id(ptmc_state.cursor,tid);
+    tracee_set_rax(pid,info.rval);
+    return CKPT_YES;
 }
 
 int handle_exit(pid_t pid, syscall_info &info) {
-    // Thread exit is handled in do_one_syscall via handle_thread_exit
-    return CKPT_EXIT;
+    info.rval=0;tracee_set_rax(pid,0);
+    const bool last=exit_logical_thread(ptmc_state.cursor,pid,info.args[0]);
+    return last?CKPT_EXIT:CKPT_YES;
 }
 
 int handle_exit_group(pid_t pid, syscall_info &info) {
-    // Mark process as exited
-    ptmc_state.status[ptmc_state.cursor] = dstatus_exit(info.args[0]);
+    info.rval=0;tracee_set_rax(pid,0);
+    exit_logical_process(ptmc_state.cursor,pid,info.args[0]);
     return CKPT_EXIT;
 }
 

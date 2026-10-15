@@ -1,5 +1,6 @@
 #include "config.h"
 #include "monitor.h"
+#include "engine/thread_pool.h"
 #include "ncurses_ui.h"
 #include "guest.h"
 #include "dispatcher.h"
@@ -117,7 +118,7 @@ int main() {
         check(SyscallRoute{}.action == SyscallAction::REJECT, "default route rejects unknown host effects");
         bool unknown_rejected = true;
         for (const auto number : {-1, 1000000, SYS_prctl, SYS_kill, SYS_ptrace, SYS_reboot,
-                                  SYS_clone,SYS_clone3,SYS_exit})
+                                  SYS_clone3})
             unknown_rejected &= dispatcher.get_route(number).action == SyscallAction::REJECT;
         check(unknown_rejected, "unmodeled and out-of-range syscalls reject");
         auto result = execute(dispatcher, child, SYS_prctl,
@@ -129,9 +130,14 @@ int main() {
                   "clock and random input never passes through");
         }
         result = execute(dispatcher, child, SYS_getpid);
-        check(!result.rejected && result.value == child, "owned process getpid remains available");
+        check(!result.rejected && result.value == logical_process_id(0), "getpid reports the modeled process identity");
         const auto tid = execute(dispatcher, child, SYS_gettid);
-        check(!tid.rejected && tid.value == child, "gettid preserves the owned main-thread kernel identity");
+        check(!tid.rejected && tid.value == result.value, "main gettid agrees with logical getpid");
+        check(dispatcher.get_route(SYS_clone).action==SyscallAction::EMULATE &&
+              dispatcher.get_route(SYS_exit).action==SyscallAction::EMULATE,
+              "thread lifecycle never executes the guest kernel syscall");
+        result=execute(dispatcher,child,SYS_clone);
+        check(result.rejected,"unsupported clone flags reject before kernel");
         result = execute(dispatcher, child, SYS_brk);
         check(!result.rejected && result.value > 0, "brk query remains available");
         const auto mapping = execute(dispatcher, child, SYS_mmap,
@@ -154,6 +160,9 @@ int main() {
         check(!result.rejected && result.value == 0 &&
               guest_read_exact(child, &guest_limit, &limit, sizeof(limit)) && limit.rlim_cur > 0,
               "prlimit64 self query remains available");
+        result=execute(dispatcher,child,SYS_prlimit64,
+                       {uint64_t(logical_process_id(0)),RLIMIT_NOFILE,0,reinterpret_cast<uint64_t>(&guest_limit),0,0});
+        check(!result.rejected && result.value==0,"logical self PID resolves to owned resource query");
         result = execute(dispatcher, child, SYS_prlimit64,
                          {0, RLIMIT_NOFILE, reinterpret_cast<uint64_t>(&guest_limit), 0, 0, 0});
         check(result.rejected, "prlimit64 mutation rejected before execution");

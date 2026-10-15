@@ -24,14 +24,14 @@ void clear_snapshot_thread_bindings();
  * State Data Format (shared with StateStore)
  * ====================================================================== */
 
-inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 13;
-inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 14;
+inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 15;
+inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 16;
 
 /* Packed to avoid alignment padding */
 struct __attribute__((packed)) StateDataHeader
 {
   uint32_t magic;         // 'DSTM' = 0x4453544D
-  uint32_t version;       // 13: flat; 14: pages (logical thread lifecycle)
+  uint32_t version;       // 15: flat; 16: pages (logical thread exits and carrier pools)
   uint32_t num_regions;   // number of memory regions
   uint64_t tstate_offset; // offset to serialized tracee_state
   uint64_t tstate_size;   // size of serialized tracee_state
@@ -87,6 +87,7 @@ struct thread_state
   pid_t tid;                      // Virtual TID (stable thread index + 1)
   pid_t physical_tid;             // Runtime only; omitted from archives
   bool alive;                    // Logical lifecycle, independent of binding
+  int exit_code = 0;             // Frozen virtual exit status
   struct user_regs_struct regs{}; // General-purpose register context
   std::vector<uint8_t> xstate;     // Complete Linux NT_X86_XSTATE register set
   uint64_t clone_flags;           // Clone flags used to create this thread
@@ -102,7 +103,7 @@ struct thread_state
   template <class Archive>
   void serialize(Archive &ar)
   {
-    ar(tid, alive, regs.r15, regs.r14, regs.r13, regs.r12, regs.rbp, regs.rbx,
+    ar(tid, alive, exit_code, regs.r15, regs.r14, regs.r13, regs.r12, regs.rbp, regs.rbx,
        regs.r11, regs.r10, regs.r9, regs.r8, regs.rax, regs.rcx, regs.rdx,
        regs.rsi, regs.rdi, regs.orig_rax, regs.rip, regs.cs, regs.eflags,
        regs.rsp, regs.ss, regs.fs_base, regs.gs_base, regs.ds, regs.es,

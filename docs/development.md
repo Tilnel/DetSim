@@ -24,7 +24,8 @@ make check
 make check-storage       # storage faults/concurrency/reopen + read-only tools; NP=1
 make check-integration   # production DWARF/ELF fixtures; default NP=1
 make check-scenarios     # build NP=1 tracer and run isolated native ptrace scenarios
-make check-thread-control check-thread-identity # NP=1 stopped-thread and archive gates
+make check-thread-control check-thread-identity check-thread-carrier # NP=1 thread gates
+make check-thread-lifecycle # NP=1 raw clone/exit, TLS, full/pages + cache pressure
 make check-futex check-futex-snapshot # NP=1 wait/wake/requeue and branch restore
 make check-xstate check-exec check-state-io check-mappings # NP=1 state/atom gates
 make check-identity check-port # NP=2 identity and deterministic network state
@@ -129,14 +130,14 @@ enter snapshot state. Loader CPU-feature normalization still logs an unresolved
 symbol (C17). Passing counter/replay tests does not close that gap,
 nor does it prove multithread, cross-process-run or eviction correctness.
 
-Default snapshot format is version 13; older formats are rejected without migration.
-This branch additionally reads opt-in version 14 page manifests, selected with
+Default snapshot format is version 15; older formats are rejected without migration.
+This branch additionally reads opt-in version 16 page manifests, selected with
 `DETSIM_SNAPSHOT_BACKEND=pages`; `verify-pages` adds a full memory oracle.
 See [page snapshots and whole-exploration measurements](page-snapshots.md).
 Private readable mappings are captured; shared/unreadable mappings, overlaps with
 the reserved scratch page and missing file-backed restore mappings fail explicitly.
-Thread slots and futex queues survive restore for unchanged live physical thread
-sets. Restoring across thread creation/exit is rejected. Timed/PI futex operations
+Logical thread slots and futex queues survive restore. Raw-thread births/exits
+restore onto retained stopped carriers; unexpected host thread death or creation rejects. Timed/PI futex operations
 are unsupported and fail explicitly; successful waits remain suspended until wake.
 
 Run the NP=1 and NP=2 gates in separate make invocations. The Redis gate requires
@@ -220,7 +221,7 @@ successor. Pure predecessor/target comparisons need no monitor state.
 
 Plugin binaries/schema/configuration, target executable contents and semantic
 execution configuration form the model compatibility fingerprint. Executables must remain immutable during a run. Changing cache
-sizes or loading a decoder does not change it. Flat13/page14 and the versioned
+sizes or loading a decoder does not change it. Flat15/page16 and the versioned
 system metadata reject older archives without deleting or migrating stores.
 Changes to kernel-model or inspection semantics require an explicit compatibility
 version bump; fingerprints do not prove equivalence between different implementations.
@@ -249,7 +250,7 @@ execution, faithful restore and exhaustive exploration are separate support leve
 | --- | --- | --- |
 | Kernel-state closure (P0) | Unclassified syscalls reject; signal/timer delivery and CPU nondeterminism are not fully modeled | Explicit syscall support is scoped; asynchronous and CPU inputs still need a complete contract |
 | Scheduling/atoms (P0) | Runnable thread/outcome enumeration, all-thread stop barrier, bounded pure computation and shared-memory access boundaries | Syscall stepping does not cover all concurrent behavior; weak-memory semantics also require an explicit model |
-| Lifecycle/restore (P0) | Thread creation/exit reconstruction and process trees/fork/exec | Changed physical thread sets are rejected; parked virtual-exit/fatal images now restore across branches (C02/C08) |
+| Lifecycle/restore (P0) | Full pthread/kernel thread-state reconstruction and process trees/fork/exec | Raw births/exits rebind retained carriers; untracked physical changes reject; parked terminal images restore across branches (C02/C08) |
 | Blocking/event loop (P1) | Wait registration, readiness wakeups, deadlines, timeout ordering and signal interruption | Returning EAGAIN/zero is not Linux blocking semantics; sleep and epoll timing are incomplete |
 | Files/IPC/network (P1) | Reusable rootfs and external inputs, shared filesystem/open-file descriptions, dup/vector/positioned I/O, directory mutations, Unix/IPv6 sockets, eventfd/timerfd/io_uring | Many common runtime interfaces explicitly reject; fsync does not model crash durability |
 | Mappings (P1) | Shared/unreadable mappings, guard/reserved pages and mutable file-backed coherence | Common allocators/JITs/shared-memory applications can hit explicit unsupported cases |
@@ -278,9 +279,9 @@ architecture summary or an unverified “completed” report.
 ## Closed syscall profile
 
 Exploration rejects unregistered system calls before kernel execution. The native
-allowlist is limited to owned-process identity/credential queries, query-only
-resource limits and supported private memory operations. Thread creation and
-thread exit remain unsupported; `exit_group` retains the virtual termination path.
+allowlist is limited to credential queries, query-only
+resource limits and supported private memory operations. Raw thread clone/exit use the carrier model below; `clone3`, fork and unsupported
+thread flags reject. `exit_group` retains virtual process termination.
 The trusted ELF prelude and internal restore injections are separate boundaries.
 
 Clocks use the saved virtual clock. `getrandom` uses a saved deterministic stream;
@@ -291,17 +292,47 @@ closure within an explicit environment, not compatibility with all Linux program
 
 ## Logical thread archives
 
-Flat13/page14 archive explicit thread liveness and logical parent IDs; physical
+Flat15/page16 archive explicit thread liveness and logical parent IDs; physical
 TIDs are transient bindings. Same-run captured hashes retain compact runtime
 provenance tied to an owned process pidfd, which is required on the host kernel.
 Disk reload may inspect any valid snapshot, but execution restore requires local
 provenance for that hash and the same live process incarnation. Bootstrap/cleanup
 clear these records; state-store cache eviction does not. Host IDs may still be
-present in guest registers/TLS/memory, and getpid/gettid remain native queries, so
+present in initial guest registers/TLS/memory despite modeled getpid/gettid, so
 this does not establish cross-run canonical identity or complete TID virtualization.
 
 All nodes pass the owned stopped-thread barrier before capture injections or
 restore mutations. The gate checks a preexisting stop; it does not interrupt a
 running pure-user loop. Native clone-event tests prove running-worker rejection
-and successful validation after stopping it. Physical thread creation/exit
-reconstruction remains disabled until carrier reconciliation is integrated.
+and successful validation after stopping it. Raw carrier reconciliation now covers the explicit profile below.
+
+## Raw thread lifecycle profile
+
+`clone` requires VM/FS/FILES/SIGHAND/THREAD sharing, with optional SYSVSEM and
+SETTLS. Other flags, clone3, TID writeback and clear-child-tid registration are
+unsupported. An inherited nonzero clear-child-tid pointer or active kernel rseq
+registration rejects birth. Nonempty/pending robust futex ownership rejects exit;
+raw thread exit also requires a zero clear-child-tid registration. The tests clear
+these registrations explicitly; ordinary glibc/pthread startup is not certified.
+Host support for PR_GET_TID_ADDRESS and PTRACE_GET_RSEQ_CONFIGURATION is required.
+
+The creator suppresses the guest clone, creates a kernel carrier only when the
+pool has no free one, and parks it at an internal breakpoint before assigning
+logical registers/TLS. Virtual exit freezes the logical slot and parks its carrier.
+The physical leader remains a control anchor after logical main exits. Spare
+carriers participate in the stop barrier but not snapshot identity. Slots are not
+reused; the current limit is64 retained births per process, including main.
+
+Guest getpid/gettid and clone results share a deterministic ID namespace (64 IDs
+per node, main equal to process ID). Owned prlimit queries translate that namespace
+without leaking a physical ID into guest registers. This does not patch IDs already
+cached by arbitrary runtime initialization. `state_transition(source,node,thread)`
+provides explicit runnable actor selection; the omitted thread uses existing
+selection. Search does not yet enumerate every thread/outcome or shared-memory
+instruction interleaving.
+
+Every guest resume marks its physical image dirty until publication. Recovery
+therefore cannot mistake a failed step for an unchanged source. Syscall-entry
+rollback first cancels the pending call without executing guest code; capture
+rejects entry stops. Internal carrier/injection failures abort exploration.
+Process exit still lacks complete descriptor/clear-tid teardown and crash semantics.

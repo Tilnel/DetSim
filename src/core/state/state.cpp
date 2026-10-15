@@ -5,6 +5,7 @@
 #include "state.h"
 #include "xstate.h"
 #include "../engine/thread_control.h"
+#include "../engine/thread_pool.h"
 #include <poll.h>
 #include "soft_dirty_experiment.h"
 #include "page_capture.h"
@@ -605,8 +606,19 @@ bool same_layout(const ThreadBindingLayout& layout, const tracee_state& state)
   if (layout.size() != state.threads.size()) return false;
   for (size_t i = 0; i < layout.size(); ++i)
     if (layout[i].tid != state.threads[i].tid ||
-        layout[i].physical_tid != state.threads[i].physical_tid ||
         layout[i].alive != state.threads[i].alive) return false;
+  return true;
+}
+
+bool same_runtime_bindings(const tracee_state& left, const tracee_state& right)
+{
+  if (left.threads.size() != right.threads.size()) return false;
+  for (size_t i = 0; i < left.threads.size(); ++i) {
+    const auto& a = left.threads[i];
+    const auto& b = right.threads[i];
+    if (a.tid != b.tid || a.alive != b.alive ||
+        (a.alive && a.physical_tid != b.physical_tid)) return false;
+  }
   return true;
 }
 
@@ -677,6 +689,7 @@ void clear_snapshot_thread_bindings()
 {
   snapshot_thread_bindings.clear();
   process_owners.clear();
+  clear_thread_pools();
 }
 
 tracee_state tracee_state::resolve_thread_bindings(int index, hash_type hash) const
@@ -701,17 +714,19 @@ void tracee_state::bind_threads_for_restore(int index, hash_type hash)
   for (size_t i = 0; i < threads.size(); ++i) {
     if (threads[i].tid != layout[i].tid || threads[i].alive != layout[i].alive)
       throw std::runtime_error("Snapshot logical thread lifecycle differs from its capture");
-    threads[i].physical_tid = layout[i].physical_tid;
+
   }
   for (auto& record : thread_create_records) record.physical_tid = 0;
-  const auto expected = bound_threads(*this);
-  verify_stopped_thread_set(binding.owner->pid, expected);
+  verify_thread_pool(index);
+  bind_thread_carriers(index, *this);
   validate_io_state();
 }
 
 void tracee_state::recover_running_state(int index, hash_type ts_hash) const
 {
   const auto resolved = resolve_thread_bindings(index, ts_hash);
+  ptmc_state.tracee_image_dirty[index] = true;
+  normalize_thread_pool_for_restore(index);
   resolved.recover_stopped(index, ts_hash);
   resolved.restore_runtime_state(index);
 }
@@ -901,9 +916,10 @@ hash_type tracee_state::capture_stopped(pid_t pid, hash_type comparison_hash)
   LOG_INFO("Saved state for %zu threads in process %d", threads.size(), pid);
 
   // Get main thread registers (for backward compatibility)
-  struct user_regs_struct regs;
-  if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) == -1)
-    throw std::runtime_error("Cannot capture main thread registers");
+  const auto main = std::find_if(threads.begin(), threads.end(),
+      [](const thread_state& thread) { return thread.is_main; });
+  if (main == threads.end()) throw std::runtime_error("Snapshot has no logical main thread");
+  const auto regs = main->regs;
 
   // Serialize tracee_state AFTER threads have been populated
   std::vector<uint8_t> tstate_data;
@@ -1083,8 +1099,14 @@ void tracee_state::prepare_capture(pid_t pid)
   }
   if (threads.size() > MAX_THREADS_PER_PROCESS)
     throw std::runtime_error("Snapshot exceeds supported thread count");
-  const auto expected = bound_threads(*this);
-  verify_stopped_thread_set(pid, expected);
+  int node = -1;
+  for (int i = 0; i < NP; ++i) if (ptmc_state.pids[i] == pid) node = i;
+  if (node >= 0) prepare_thread_pool(node, *this);
+  else {
+    const auto expected = bound_threads(*this);
+    verify_stopped_thread_set(pid, expected);
+    for (pid_t tid : expected) require_thread_capture_boundary(tid);
+  }
 }
 
 hash_type tracee_state::save(int pid, hash_type comparison_hash)
@@ -1293,14 +1315,26 @@ void sys_state::recover_running_state() const
   sys_state resolved = *this;
   for (int i = 0; i < NP; ++i)
     resolved.child[i].bind_threads_for_restore(i, ts_hash[i]);
+  bool restore_image[NP];
+  for (int i = 0; i < NP; ++i) {
+    restore_image[i] = ptmc_state.tracee_image_dirty[i] || ts_hash[i] != ptmc_state.running_state.ts_hash[i];
+    // A failed restore must not leave its partial writes labelled as the old
+    // running snapshot. Retain dirty flags until the whole operation commits.
+    ptmc_state.tracee_image_dirty[i] = true;
+  }
+  for (int i = 0; i < NP; ++i)
+    if (restore_image[i]) normalize_thread_pool_for_restore(i);
   ptmc_state.error_bound = error_bound;
   for (int i = 0; i < NP; ++i) {
     ptmc_state.status[i] = status[i];
-    if (ts_hash[i] != ptmc_state.running_state.ts_hash[i])
+    if (restore_image[i])
       resolved.child[i].recover_stopped(i, ts_hash[i]);
+    else if (!same_runtime_bindings(resolved.child[i], ptmc_state.running_state.child[i]))
+      resolved.child[i].restore_thread_registers(ptmc_state.pids[i]);
     resolved.child[i].restore_resources(i);
   }
   ptmc_state.running_state = std::move(resolved);
+  for (int i = 0; i < NP; ++i) ptmc_state.tracee_image_dirty[i] = false;
 }
 
 /* ======================================================================
@@ -1310,6 +1344,7 @@ void sys_state::recover_running_state() const
 void cleanup_all()
 {
   clear_snapshot_thread_bindings();
+  for (int i = 0; i < NP; ++i) ptmc_state.tracee_image_dirty[i] = false;
   detsim::ui::ui_printf("[DEBUG] Starting global cleanup...\n");
 
   /* 0. Cleanup DWARF resources */

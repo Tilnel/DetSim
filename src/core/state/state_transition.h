@@ -24,6 +24,6 @@ struct TransitionResult {
     bool property_violation = false;
 };
 int state_initialization();
-TransitionResult state_transition(const sys_state &source_state, int process_index);
+TransitionResult state_transition(const sys_state &source_state, int process_index, int thread_index = -1);
 
 #endif /* __STATE_TRANSITION_H */

@@ -700,3 +700,44 @@ Raft smoke to383states/s (2,582 visits / 1,347new), compared to prior394. These
 single samples do not establish statistical performance equivalence. Carrier
 creation is tested infrastructure; rawclone/exit dispatch remains disabled in
 this prerequisite commit. Failed internal carrier creation requires abort.
+
+## Raw clone/exit carrier integration (2026-10-15)
+
+Implemented a runtime carrier pool over the verified creator, with deterministic
+logical getpid/gettid/clone results, logical exit codes, explicit actor selection,
+canonical frozen-main headers and spare-carrier exclusion. Replaced dormant real
+clone/exit handlers with one modeled path. Flat15/page16 and kernel model v4 reject
+prior execution contexts. No vendor code or dependencies changed.
+
+The initial extended negative clear-tid test exposed a failed-step rollback bug:
+a source hash still looked current after the guest reached a rejected syscall.
+Runtime dirty flags now invalidate before resume and remain set through failures;
+only successful publication clears them. A restore at syscall entry first skips
+the pending call with orig_rax=-1; capture rejects entry before injection/storage.
+The global running-state alias also detaches before clone mutates its source.
+
+Validation with `/usr/bin/gcc` and `/usr/bin/g++`:
+
+- `make check`: eight component cases, ten build-contract tests.
+- NP1 `check-thread-lifecycle`: full/pages x normal/tiny cache, real A/B birth,
+  A exit, C birth, four logical slots over three physical tasks, TLS/IDs,
+  persisted restore/recapture and replay; main exits77 while peers continue and
+  last worker exits0. Negative clear-tid/rseq/robust ownership and entry rollback
+  paths are native, including no guest clone escape and source-alias replay.
+- NP1 thread-control/identity/carrier/futex-snapshot/exec/scenarios/state-io/
+  mapping/page-snapshot gates pass; native scenario suite has fourteen tests.
+- NP2 verify-pages capture/identity/state-view/plugins/runtime-profile/
+  syscall-policy/process-state/io-boundary/accept/Redis gates pass. Redis SET/GET
+  completes. The identity test separately checks exit-code archive/identity.
+- GCC `-Wall -Wextra -Werror -fsyntax-only` on new pool and lifecycle/identity
+  tests; `git diff --check`; independent read-only review passes.
+- NP3 production build, one depth8 Raft smoke per backend: both2,582 visits and
+  1,347new states. Flat about375states/s, pages507states/s. Historical earlier
+  single samples were394/587; these runs do not prove performance equivalence
+  and include new validation overhead. Artifacts `build/thread-pool-raft{,-pages}`.
+
+Scope remains raw same-address-space threads. TID writeback/clear-tid modeling,
+pthread/rseq/robust owner-death, full process teardown, automatic exhaustive actor
+selection and instruction-level shared-memory boundaries remain open. A raw birth
+requires zero actual clear-tid/rseq registration; nonempty robust ownership rejects
+exit. Internal creation failures abort rather than pretending a guest errno.

@@ -49,6 +49,8 @@ struct PTMC_STATE
   ProcessKernelState process_states[NP];
 
   int pids[NP] = {};
+  // Runtime image validity; never enters snapshot identity.
+  bool tracee_image_dirty[NP] = {};
 
   /* Multi-threading support */
   int current_thread_idx[NP] = {};  /* Currently selected thread index per tracee */

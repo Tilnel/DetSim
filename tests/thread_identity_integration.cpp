@@ -51,6 +51,11 @@ static void check_thread_archive()
     rebound = original;
     rebound.alive = false;
     require(encoded(original) != encoded(rebound), "thread liveness absent from identity");
+    auto exited = rebound;
+    exited.exit_code = 7;
+    require(encoded(exited) != encoded(rebound), "thread exit code absent from identity");
+    require(decoded<thread_state>(encoded(exited)).exit_code == 7,
+            "thread exit code lost in archive");
     rebound = original;
     ++rebound.regs.rip;
     require(encoded(original) != encoded(rebound), "registers absent from identity");
