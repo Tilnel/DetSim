@@ -155,3 +155,18 @@ runner复制现有库输入到独立build目录，仅将一次`switch(r->vote_gr
 出发各42次访问/27个unique状态；搜索仍受深度3及错误预算约束，不是Raft
 一般安全证明。提交后的状态边三次恢复一致。日志payload由owned driver深拷贝
 并在pop释放，无Raft日志压缩；DetSim的full/pages快照均实际使用。
+
+
+### Rust std 与 CPython：真实线程生产/消费协议
+
+详见 [concurrency/README.md](concurrency/README.md)。Rust使用std::thread/mpsc，
+Python使用threading.Condition/list；保持实际GC/调度设置。两种注错分别遗漏或
+重复任务1，worker输出实际消费的任务ID，公开ABI检查器要求精确一次、已创建
+worker及退出0，不把运行时futex等待视为死锁。
+
+full/pages共12项均完成原生对照、实际搜索和终点/违例边3x身份一致重放：
+Rust健康45状态，遗漏/重复各41；Python健康410、遗漏390、重复392。
+有界现有actor策略不等于穷尽共享内存交织。可选Queue实现仍保留；其_queue
+动态扩展触发SIGBUS-backed映射拒绝，两个后端非绿色，未删除失败证据。
+驱动仅在请求矩阵完整、唯一、全部通过时报告成功；七项负向回归覆盖原生超时、
+Session创建异常和退出码，避免前几项成功掩盖后续缺行。

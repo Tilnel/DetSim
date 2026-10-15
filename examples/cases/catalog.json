@@ -53,6 +53,20 @@
       "status": "healthy/mutant native and full/pages bounded suffix search plus3x replay pass",
       "command": "python3 examples/cases/raft_run.py --tracer ./tracer --depth 3 --timeout 240",
       "scope": "NP3 controlled election prefix;2 commands;no Raft compaction;explicit depth and error budget"
+    },
+    {
+      "id": "runtime-exact-once",
+      "languages": [
+        "Rust std",
+        "CPython Condition"
+      ],
+      "processes": 1,
+      "threads": 2,
+      "command": "python3 examples/cases/concurrency_run.py --tracer ./tracer --backend both --languages rust,python --variants healthy,omit,duplicate --timeout 180 --depth 1500 --memory-mb 4096",
+      "property": "worker consumes task IDs0 and1 exactly once; observed worker, exact output and zero exit",
+      "mutation": "omit or duplicate task1",
+      "scope": "native plus full/pages search and3x endpoint/counterexample replay under existing actor policy",
+      "unsupported_variant": "CPython Queue/_queue remains non-green due SIGBUS-backed file mapping"
     }
   ],
   "next_targets": [

@@ -577,3 +577,21 @@ exact election receipts and9 negative acceptance tests close those runner defect
 The final-state cutoff flag is only an observation of the final state, never proof
 that all branches avoided budget cutoffs. This finite case does not close C03/C25
 or establish general Raft/snapshot compaction correctness. No vendor tree changed.
+
+
+### Native runtime concurrency acceptance
+
+Real Rust std thread/mpsc and CPython Condition/list producer-consumer pairs now
+exercise normal operation, omitted task and duplicated task. Twelve actual
+full/pages rows pass exact protocol/worker/exit checks and final or violation
+edge3x replay, without disabling GC or preemption. Rust visits45/41/41 states;
+Python410/390/392. Evidence: build/cases/concurrency-0jmhl7i4/report.json (Rust6),
+build/cases/concurrency-nuo4il7p/report.json (Condition6). Optional Python Queue
+still reports unsupported SIGBUS-backed mappings and remains non-green.
+
+Independent review approved the public-ABI property and native fixtures, then
+caught partial-matrix false green after an exception. Exact complete/unique
+matrix acceptance and per-combination failure recording now pass7 negative tests.
+Existing12actual rows were revalidated without altering evidence. This is bounded
+case capability, not full language/runtime or exhaustive interleaving support.
+Go gc/gccgo concurrency and OpenJDK conditional target remain separately pending.
