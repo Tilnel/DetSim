@@ -5,6 +5,8 @@
 #include "common.h"
 #include "runtime_profile.h"
 #include "engine/thread_pool.h"
+#include "engine/pending_syscall.h"
+#include "pending_io.h"
 #include <stdexcept>
 #include <algorithm>
 #include "emu.h"
@@ -191,8 +193,7 @@ TransitionResult state_transition(const sys_state &source_state,
     throw std::runtime_error("Transition thread index out of range");
   if (requested_thread >= 0) {
     const auto& actor=source_state.child[process_index].threads[requested_thread];
-    if (!actor.alive || (source_state.child[process_index].futex_state &&
-        source_state.child[process_index].futex_state->is_thread_waiting(actor.tid)))
+    if (!actor.alive || (actor.pending_syscall && actor.pending_syscall->phase == PendingPhase::Waiting))
       throw std::runtime_error("Transition thread is not runnable");
   }
   TransitionResult result;
@@ -229,16 +230,30 @@ TransitionResult state_transition(const sys_state &source_state,
   for (size_t slot=source_state.child[process_index].threads.size(); slot<runtime_child.threads.size(); ++slot)
     new_syscalls[process_index][slot]=runtime_child.si[slot];
 
+  // Grant readiness without consuming a peer's data or publishing its return.
+  refresh_pending_syscalls();
+
   // save state with timing
   auto t3 = std::chrono::high_resolution_clock::now();
   result.new_state = sys_state(new_syscalls, &source_state, false);
   if (ckpt != CKPT_DISCARD) {
-    detsim_event_v1 event{};
+    detsim_event_v2 event{};
     event.process = process_index; event.thread = thread_idx;
     event.syscall_number = executed.nr;
     event.choice = ptmc_state.n_choose ? ptmc_state.choose : -1;
     std::copy(std::begin(executed.args), std::end(executed.args), event.args);
-    event.result = static_cast<int64_t>(executed.rval);
+    const bool unfinished=result.new_state.child[process_index].threads.at(thread_idx).pending_syscall.has_value();
+    if (ckpt==CKPT_STOP) {
+      event.phase=DETSIM_EXECUTION_STOPPED;
+      event.syscall_number=-1;event.choice=-1;
+      std::fill(std::begin(event.args),std::end(event.args),0);
+    } else if (executed.nr==SYS_exit || executed.nr==SYS_exit_group) {
+      event.phase=DETSIM_THREAD_EXITED;
+    } else {
+      event.phase=unfinished?DETSIM_SYSCALL_BLOCKED:DETSIM_SYSCALL_COMPLETED;
+      event.result_valid=!unfinished;
+      event.result=unfinished?0:static_cast<int64_t>(executed.rval);
+    }
     result.property_violation = detsim::plugins::check_transition(source_state, result.new_state, event);
     result.property_violation |= check_assertions(result.new_state, process_index);
   }

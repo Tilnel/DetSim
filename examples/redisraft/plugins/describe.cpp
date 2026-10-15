@@ -13,7 +13,7 @@ int describe(detsim_bytes bytes, detsim_writer output) {
     return output.append(output.context, text.data(), text.size()) ? -1 : 1;
   } catch (...) { return -1; }
 }
-const detsim_plugin_v1 descriptor{DETSIM_PLUGIN_ABI_V1, sizeof(detsim_plugin_v1), "redisraft.message-display", 0,
+const detsim_plugin_v2 descriptor{DETSIM_PLUGIN_ABI_V2, sizeof(detsim_plugin_v2), "redisraft.message-display", 0,
  nullptr, nullptr, nullptr, nullptr, nullptr, describe};
 }
-extern "C" const detsim_plugin_v1 *detsim_plugin_entry_v1() { return &descriptor; }
+extern "C" const detsim_plugin_v2 *detsim_plugin_entry_v2() { return &descriptor; }

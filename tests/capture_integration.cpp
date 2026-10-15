@@ -282,6 +282,12 @@ int main(int argc, char**)
         ExecutionEngine engine;
         syscall_info exit_info{};
         ptmc_state.cursor=1;
+        // This slice models graceful normal exit; accept/drain the fixture's
+        // connection rather than requiring the not-yet-modeled TCP reset path.
+        const int exiting_connection=ptmc_state.sock_states[1].do_accept(listener_fd,nullptr,nullptr);
+        require(exiting_connection>=0,"accept before graceful exit");
+        require(ptmc_state.sock_states[1].do_recv(exiting_connection,guest_address,4096,0)==sizeof(tcp_payload),
+                "drain unread fixture payload before graceful exit");
         require(engine.execute_syscall(children[1],exit_info)==2 && exit_info.nr==SYS_exit_group &&
                 DISEXITED(ptmc_state.status[1]), "fixture must exit through the virtual lifecycle path");
         syscall_info dead_info[NP][MAX_THREADS_PER_PROCESS];

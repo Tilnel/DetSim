@@ -214,6 +214,8 @@ class SockState
   int do_epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
 
   /* epoll_wait(epfd, events, maxevents, timeout) -> num_events or -errno */
+  uint32_t ready_events(int fd, int node) const;
+  bool epoll_ready(int epfd, int node) const;
   int do_epoll_wait(int epfd, struct epoll_event *events, int maxevents,
                     int timeout);
 
@@ -346,6 +348,7 @@ int emu_getsockopt(int sockfd, int level, int optname, void *optval,
                    socklen_t *optlen);
 
 
+int emu_accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags);
 int emu_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 
 typedef std::deque<UdpDatagram> udp_buffer;

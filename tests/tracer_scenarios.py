@@ -203,6 +203,62 @@ finally:
         self.assertIn("has exited with status 0", output)
         self.assertEqual(code, 0, output)
 
+    def pending_plugin(self):
+        plugin = self.root / "pending.so"
+        subprocess.run(shlex.split(os.environ.get("CXX", "/usr/bin/g++")) +
+                       ["-std=gnu++20", "-shared", "-fPIC", "-I" + str(ROOT / "src"),
+                        "-I" + str(ROOT / "third_party"), str(ROOT / "tests/native_pending_plugin.cpp"),
+                        "-o", str(plugin)], check=True)
+        return str(plugin)
+
+    def test_fatal_stop_has_no_syscall_return_event(self):
+        source = self.root / "crash_probe.c"
+        source.write_text('#include <unistd.h>\nint main(void) { getpid(); __asm__ volatile("ud2"); }\n')
+        subprocess.run(shlex.split(os.environ.get("CC", "/usr/bin/gcc")) +
+                       ["-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie",
+                        str(source), "-o", str(self.root / "probe")], check=True)
+        code, output = self.run_tracer("sw 0\nbfs\nsi\nq\n", plugins=[self.pending_plugin()])
+        self.assertEqual(code,0,output)
+        self.assertIn("stopped for signal",output)
+        self.assertNotIn("Stopped for illegal state",output)
+
+    def test_pipe_read_pending_completion_and_eof(self):
+        source = self.root / "pipe_probe.c"
+        source.write_text(r"""
+#include <pthread.h>
+#include <unistd.h>
+static int ends[2];
+volatile int counter;
+static void *writer(void *unused) {
+  (void)unused;
+  if (write(ends[1], "xy", 2) != 2 || close(ends[1])) return (void*)1;
+  return 0;
+}
+int main(void) {
+  pthread_t t;void* result=0;char c;
+  if (pipe(ends) || pthread_create(&t,0,writer,0)) return 2;
+  if (read(ends[0],&c,1)!=1 || c!='x') return 3;
+  ++counter;
+  if (read(ends[0],&c,1)!=1 || c!='y') return 4;
+  ++counter;
+  if (read(ends[0],&c,1)!=0 || pthread_join(t,&result) || result) return 5;
+  ++counter;return 0;
+}
+""")
+        subprocess.run(shlex.split(os.environ.get("CC", "/usr/bin/gcc")) +
+                       ["-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie", "-pthread",
+                        str(source), "-o", str(self.root / "probe")], check=True)
+        subprocess.run([str(self.root / "probe")], check=True, timeout=10)
+        plugin = self.pending_plugin()
+        for backend in ("full", "pages"):
+            code, output = self.run_tracer("sw 0\nbfs\np counter\nsi\nq\n",
+                name="pipe_"+backend, plugins=[plugin], extra_env={"DETSIM_SNAPSHOT_BACKEND":backend})
+            self.assertEqual(code,0,output)
+            self.assertIn("counter = 3",output)
+            self.assertIn("<pending:waiting>",output)
+            self.assertIn("has exited with status 0",output)
+            self.assertNotIn("Stopped for illegal state",output)
+
     def test_pthread_tls_join_owner_death_and_condition_wait(self):
         source = self.root / "pthread_probe.c"
         source.write_text(r"""
@@ -252,6 +308,7 @@ int main(void) {
                        ["-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie", "-pthread",
                         str(source), "-o", str(self.root / "probe")], check=True)
         subprocess.run([str(self.root / "probe")], check=True, timeout=10)
+        plugin = self.pending_plugin()
         for backend in ("full", "pages"):
             for terminate in (False, True):
                 with self.subTest(backend=backend, terminate=terminate):
@@ -272,7 +329,7 @@ int main(void) {
                             tracer = int(re.search(r"(?m)^PPid:\s+(\d+)", status).group(1))
                             os.kill(tracer, signal.SIGTERM)
                     name = "pthread_" + backend + ("_term" if terminate else "_normal")
-                    code, output = self.run_tracer(scenario, name=name,
+                    code, output = self.run_tracer(scenario, name=name, plugins=[plugin],
                         extra_env={"DETSIM_SNAPSHOT_BACKEND": backend})
                     self.assertEqual(code, 128 + signal.SIGTERM if terminate else 0, output)
                     self.assertTrue(owned_tasks)

@@ -31,8 +31,12 @@ int main(int argc, char** argv)
         try {
             StateStore::instance().init();
             tracee_state disk(static_cast<hash_type>(std::stoull(argv[2])));
-            require(disk.futex_state && disk.futex_state->get_wait_address(1) == 0x1000,
+            require(disk.futex_state && disk.futex_state->get_wait_address(1) == 0x50000000,
                     "fresh-process disk reload lost waiter");
+            require(disk.threads[0].pending_syscall &&
+                    disk.threads[0].pending_syscall->phase == PendingPhase::Waiting &&
+                    disk.threads[0].pending_syscall->nr == SYS_futex,
+                    "fresh-process disk reload lost unfinished syscall");
             require(StateStore::instance().get_stats().disk_reads > 0, "reload did not read disk");
             StateStore::instance().shutdown();
             return 0;
@@ -45,23 +49,40 @@ int main(int argc, char** argv)
     const auto cwd = std::filesystem::current_path();
     try {
         auto& live = ptmc_state.running_state.child[0];
+        live.add_thread(0, 0, 0, 0, true);
+        live.threads[0].pending_syscall.emplace();
+        auto& pending = *live.threads[0].pending_syscall;
+        pending.nr = SYS_futex;
+        pending.args[0] = 0x50000000;
+        pending.args[1] = (FUTEX_WAIT | FUTEX_PRIVATE_FLAG);
+        pending.args[2] = 7;
+        live.si[0].nr = pending.nr;
+        live.si[0].rval = -ENOSYS;
+        std::copy(std::begin(pending.args), std::end(pending.args), live.si[0].args);
+        live.threads[0].regs.orig_rax = -1;
+        live.threads[0].regs.rax = -ENOSYS;
         live.futex_state.emplace();
-        wait_on(*live.futex_state, 1, 0x1000);
+        wait_on(*live.futex_state, 1, 0x50000000);
         tracee_state captured(0, live.si);
         require(captured.futex_state && captured.futex_state->is_thread_waiting(1), "capture dropped live futex wait queues");
         tracee_state branch = captured;
         require(branch.metadata_equal(captured), "equal snapshot metadata differs");
         branch.futex_state->wake_thread(1);
+        branch.threads[0].pending_syscall->phase = PendingPhase::Ready;
         require(!branch.metadata_equal(captured), "metadata identity omitted futex queues");
         require(captured.futex_state->is_thread_waiting(1), "copied branch aliases saved futex queues");
         branch = captured;
         branch.futex_state->wake_thread(1);
+        branch.threads[0].pending_syscall->phase = PendingPhase::Ready;
         require(captured.futex_state->is_thread_waiting(1), "assigned branch aliases saved futex queues");
         std::stringstream archive;
         { cereal::BinaryOutputArchive out(archive); out(captured); }
         tracee_state decoded;
         { cereal::BinaryInputArchive in(archive); in(decoded); }
-        require(decoded.futex_state && decoded.futex_state->get_wait_address(1) == 0x1000, "archive lost futex queue");
+        require(decoded.threads[0].pending_syscall &&
+                decoded.threads[0].pending_syscall->phase == PendingPhase::Waiting,
+                "archive lost unfinished wait");
+        require(decoded.futex_state && decoded.futex_state->get_wait_address(1) == 0x50000000, "archive lost futex queue");
         tracee_state empty;
         std::stringstream empty_archive;
         { cereal::BinaryOutputArchive out(empty_archive); out(empty); }
@@ -79,7 +100,12 @@ int main(int argc, char** argv)
             code[0] = 0x0f; code[1] = 0x05;
             if (syscall(SYS_set_robust_list, nullptr, 24)) _exit(91);
             if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr)) _exit(3);
+            auto* word = static_cast<int*>(mmap(reinterpret_cast<void*>(0x50000000), 4096,
+                PROT_READ | PROT_WRITE, MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+            if (word == MAP_FAILED) _exit(92);
+            *word = 7;
             asm volatile("int3");
+            syscall(SYS_futex, word, (FUTEX_WAIT | FUTEX_PRIVATE_FLAG), 7, nullptr, nullptr, 0);
             _exit(0);
         }
         int status;
@@ -88,7 +114,19 @@ int main(int argc, char** argv)
         StateStore::instance().init();
         ptmc_state.pids[0] = child;
         ptmc_state.fd_managers[0] = std::make_shared<FdManager>();
-        live.add_thread(child, 0, 0, 0, true);
+        // Park the physical carrier at the skipped WAIT exit, matching the
+        // logical unfinished call seeded above rather than an unrelated int3.
+        require(ptrace(PTRACE_SYSCALL, child, nullptr, nullptr) == 0 &&
+                waitpid(child, &status, __WALL) == child && WIFSTOPPED(status), "wait entry");
+        user_regs_struct wait_regs{};
+        require(ptrace(PTRACE_GETREGS, child, nullptr, &wait_regs) == 0 &&
+                wait_regs.orig_rax == SYS_futex, "futex entry registers");
+        wait_regs.orig_rax = -1;
+        require(ptrace(PTRACE_SETREGS, child, nullptr, &wait_regs) == 0 &&
+                ptrace(PTRACE_SYSCALL, child, nullptr, nullptr) == 0 &&
+                waitpid(child, &status, __WALL) == child && WIFSTOPPED(status), "skipped wait exit");
+        live.threads[0].physical_tid = child;
+        live.thread_create_records[0].physical_tid = child;
         live.add_thread(child + 1, 0x1234, 0x5000, child);
         live.remove_thread(2);
         tracee_state saved(0, live.si);
@@ -110,19 +148,23 @@ int main(int argc, char** argv)
         require(rejected, "changed thread set accepted");
         require(ptrace(PTRACE_GETREGS, child, nullptr, &after) == 0 && memcmp(&before, &after, sizeof(before)) == 0,
                 "lifecycle rejection mutated tracee registers");
-        require(disk.futex_state && disk.futex_state->get_wait_address(1) == 0x1000, "stored snapshot lost waiter");
+        require(disk.futex_state && disk.futex_state->get_wait_address(1) == 0x50000000, "stored snapshot lost waiter");
         for (int replay = 0; replay < 3; ++replay) {
             live.futex_state->wake_thread(1);
+            live.threads[0].pending_syscall->phase = PendingPhase::Ready;
             ptmc_state.thread_blocked[0][0] = false;
             ptmc_state.thread_blocked[0][17] = true;
             disk.recover_running_state(0, hash);
             require(live.futex_state && live.futex_state->is_thread_waiting(1), "restore lost queue after branch wake");
+            require(live.threads[0].pending_syscall &&
+                    live.threads[0].pending_syscall->phase == PendingPhase::Waiting,
+                    "restore retained completed branch phase");
             require(ptmc_state.thread_exited[0][1], "restore lost exited virtual slot");
             require(ptmc_state.thread_blocked[0][0] && !ptmc_state.thread_blocked[0][17], "restore failed to reconstruct blocked flags");
             ThreadManager manager;
             manager.sync_from_tracee_state(live);
             const auto* info = manager.get_thread_info(0);
-            require(info && info->state == ThreadState::BLOCKED && info->blocked_on == 0x1000,
+            require(info && info->state == ThreadState::BLOCKED && info->blocked_on == 0x50000000,
                     "scheduler sync made waiting thread runnable");
             require(saved.futex_state->is_thread_waiting(1) && disk.futex_state->is_thread_waiting(1), "restore aliases snapshots");
         }
@@ -133,6 +175,7 @@ int main(int argc, char** argv)
         ptmc_state.running_state.ts_hash[0] = hash;
         ptmc_state.status[0] = DIFEXITED;
         live.futex_state->wake_thread(1);
+        live.threads[0].pending_syscall->phase = PendingPhase::Ready;
         ptmc_state.thread_blocked[0][0] = false;
         source.recover_running_state();
         require(DISALIVE(ptmc_state.status[0]), "same-hash restore retained virtual exit status");

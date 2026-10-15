@@ -91,6 +91,13 @@ static void check_io_archive_validation()
         must_fail([&] { tracee_state decoded(hash); }, why);
     };
     auto invalid = valid;
+    invalid.add_thread(123,0,0,0,true);
+    invalid.threads[0].pending_syscall.emplace();
+    invalid.threads[0].pending_syscall->reason=PendingReason::Io;
+    invalid.threads[0].pending_syscall->nr=SYS_read;
+    invalid.threads[0].pending_syscall->args[0]=999;
+    rejected(invalid,"pending I/O without retained descriptor accepted");
+    invalid = valid;
     invalid.fd_manager_state.allocate_fd(FdType::FILE, O_RDONLY);
     rejected(invalid, "file descriptor without payload accepted");
     invalid = valid;

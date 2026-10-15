@@ -5,6 +5,7 @@
 #include "exec_engine.h"
 #include "thread_manager.h"
 #include "thread_pool.h"
+#include "pending_syscall.h"
 #include "signal_handler.h"
 #include "syscall/dispatcher.h"
 #include "guest.h"
@@ -57,6 +58,7 @@ bool ExecutionEngine::handle_signal(pid_t pid, int wstatus)
 
 int ExecutionEngine::do_single_syscall(pid_t pid, syscall_info& info)
 {
+    if (complete_pending_syscall(ptmc_state.cursor, pid, info)) return CKPT_YES;
     int wstatus = 0;
     struct ptrace_syscall_info psi;
 
@@ -144,16 +146,8 @@ ExecResult ExecutionEngine::execute_step(const sys_state& state, syscall_info& i
     // Sync thread manager from saved state
     tm->sync_from_tracee_state(ptmc_state.running_state.child[tracee_idx]);
 
-    // Update thread blocked status from ptmc_state.thread_blocked
-    for (int i = 0; i < static_cast<int>(tm->thread_count()); i++) {
-        if (ptmc_state.thread_blocked[tracee_idx][i]) {
-            auto* tinfo = tm->get_thread_info(i);
-            if (tinfo && tinfo->state == ThreadState::RUNNING) {
-                tm->mark_blocked(i);
-                LOG_DEBUG("Thread %d marked as BLOCKED from ptmc_state", i);
-            }
-        }
-    }
+    // Scheduling derives solely from the archived unfinished-call state.
+    sync_pending_blocked(tracee_idx);
 
     // In manual mode, only execute the currently selected thread
     if (!auto_mode) {
@@ -197,8 +191,8 @@ ExecResult ExecutionEngine::execute_step(const sys_state& state, syscall_info& i
         }
     }
 
-    // Reference atom policy: one completed syscall per step, as in manual
-    // mode. CKPT_NO is a handler hint, not permission to swallow scheduling
+    // Reference atom policy: one syscall boundary or pending completion per step.
+    // CKPT_NO is a handler hint, not permission to swallow scheduling
     // points indefinitely (e.g. receive retries or getpid busy loops).
     // This does not expose shared-memory interleavings inside user code.
     // Try each thread until a runnable one is found.
@@ -253,7 +247,7 @@ ExecResult ExecutionEngine::execute_step(const sys_state& state, syscall_info& i
     }
 
     LOG_WARN("All threads blocked, possible deadlock");
-    return ExecResult(ExecStatus::SUCCESS, CKPT_YES, "Possible deadlock");
+    return ExecResult(ExecStatus::DISCARD, CKPT_DISCARD, "All threads waiting");
 }
 void ExecutionEngine::on_thread_created(pid_t parent_pid, pid_t new_tid,
                                         uint64_t clone_flags, uint64_t stack_addr)

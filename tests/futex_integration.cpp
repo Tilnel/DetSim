@@ -71,7 +71,25 @@ static void run_case(int mode) {
     uint64_t address = reinterpret_cast<uint64_t>(mode == 10 ? mapping : words), value = 7;
     if (mode != 1 && mode != 5 && mode != 6 && mode != 7 && mode != 8) {
         for (int tid = 2; tid <= 4; ++tid) {
-            thread_state waiter{}; waiter.tid = tid; state.threads.push_back(waiter);
+            thread_state waiter{};
+            waiter.tid = tid;
+            // Synthetic peers are never resumed; this handler-only fixture
+            // gives each a distinct scheduling binding without host tasks.
+            waiter.physical_tid = child + tid;
+            waiter.alive = true;
+            waiter.pending_syscall.emplace();
+            auto& pending = *waiter.pending_syscall;
+            pending.nr = SYS_futex;
+            pending.args[0] = address;
+            pending.args[1] = FUTEX_WAIT_BITSET_PRIVATE;
+            pending.args[2] = 7;
+            pending.args[5] = tid == 3 ? 2 : 1;
+            waiter.regs.orig_rax = -1;
+            waiter.regs.rax = -ENOSYS;
+            state.si[tid - 1].nr = pending.nr;
+            state.si[tid - 1].rval = -ENOSYS;
+            std::copy(std::begin(pending.args), std::end(pending.args), state.si[tid - 1].args);
+            state.threads.push_back(waiter);
             require(futex.handle_futex(tid, address, FUTEX_WAIT_BITSET_PRIVATE,
                                       7, 0, 0, tid == 3 ? 2 : 1, &value) == 0, "seed wait");
             ptmc_state.thread_blocked[0][tid - 1] = true;
@@ -89,11 +107,36 @@ static void run_case(int mode) {
         require(rejected && futex.get_waiters(address).size() == 3 &&
             ptmc_state.thread_blocked[0][1] && *mapping == 73,
             "unsupported madvise must preserve waiters and tracer memory");
-    } else if (mode == 6 || mode == 8) require(rejected, "unsupported futex must fail checker");
+    } else if (mode == 8) require(rejected, "unsupported futex must fail checker");
     else {
         require(!rejected, "supported operation rejected");
         long result = static_cast<long>(info.rval);
-        if (mode == 1) require(result == 0 && futex.is_thread_waiting(1) && ptmc_state.thread_blocked[0][0], "32-bit signed wait must block with success on eventual wake");
+        if (mode == 1) require(result == -ENOSYS && futex.is_thread_waiting(1) &&
+            ptmc_state.thread_blocked[0][0] && state.threads[0].pending_syscall &&
+            state.threads[0].pending_syscall->phase == PendingPhase::Waiting,
+            "32-bit signed wait must remain unfinished until wake");
+        if (mode == 6) {
+            require(result == -ENOSYS && state.threads[0].pending_syscall &&
+                    state.threads[0].pending_syscall->deadline &&
+                    !expire_pending_syscall(0,1),"timed WAIT did not retain its future deadline");
+            const auto deadline=*state.threads[0].pending_syscall->deadline;
+            ptmc_state.time[0].tv_sec=deadline.sec+1;
+            require(expire_pending_syscall(0,1) && !futex.is_thread_waiting(1),"due WAIT did not grant timeout result");
+            user_regs_struct before{},after{};
+            require(ptrace(PTRACE_GETREGS,child,nullptr,&before)==0,"timed completion registers");
+            require(engine.execute_syscall(child,info)==1 && static_cast<long>(info.rval)==-ETIMEDOUT &&
+                    !state.threads[0].pending_syscall,"timed WAIT completion lost ETIMEDOUT");
+            require(ptrace(PTRACE_GETREGS,child,nullptr,&after)==0 && after.rip==before.rip,
+                    "timed completion executed user code");
+        }
+        for (size_t i = 1; i < state.threads.size(); ++i) {
+            const auto& pending = state.threads[i].pending_syscall;
+            require(pending && pending->phase == (futex.is_thread_waiting(i + 1) ?
+                    PendingPhase::Waiting : PendingPhase::Ready),
+                    "wake must ready only removed pending calls");
+            require(state.si[i].rval == static_cast<uintptr_t>(-ENOSYS),
+                    "wake prematurely published a completed wait");
+        }
         if (mode == 0 || mode == 4 || mode == 11 || mode == 12) require(result == (mode == 4 ? 3 : 1) && !futex.is_thread_waiting(2)
             && !ptmc_state.thread_blocked[0][1] && ptmc_state.thread_blocked[0][2] && ptmc_state.thread_blocked[0][3], "wake must unblock only removed waiter");
         if (mode == 2) require(result == -EAGAIN && futex.get_waiters(address).size() == 3
@@ -113,7 +156,7 @@ static void run_case(int mode) {
 
 int main() {
     const char *names[] = {"wake flags", "signed wait checkpoint", "cmp mismatch", "requeue ABI",
-        "same-address requeue", "bad address", "timed wait rejection", "zero bitset", "PI rejection", "bitset wake flags", "madvise preserves waiters", "zero wake count", "negative wake count"};
+        "same-address requeue", "bad address", "timed wait registration and controlled expiry", "zero bitset", "PI rejection", "bitset wake flags", "madvise preserves waiters", "zero wake count", "negative wake count"};
     int failures = 0;
     for (int mode = 0; mode < 13; ++mode) {
         fflush(nullptr);

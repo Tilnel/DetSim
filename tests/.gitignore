@@ -101,3 +101,12 @@
 
 !thread_robust_integration.cpp
 !thread_robust.mk
+
+!pending_syscall_integration.cpp
+!pending_syscall.mk
+!pending_io_integration.cpp
+!pending_io.mk
+!native_pending_plugin.cpp
+
+!pending_io_snapshot_integration.cpp
+!pending_io_snapshot.mk

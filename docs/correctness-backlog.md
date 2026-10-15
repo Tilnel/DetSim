@@ -23,14 +23,14 @@ relationship to the native-binary model-checking goal.
 | C13 | Fixed (BFS/DFS/RAND) | BFS formerly continued after violation; DFS ignored its stop code and RAND only broke an inner loop. All now stop the entire search, retaining a failed product-state witness. | Native scenarios verify reachable assertion violations stop each mode without a false completion; counter-plugin replay preserves terminal identity. Ordinary finite BFS still explores the expected five states. |
 | C14 | Fixed | Batch command parser pointed at the NUL inserted by strtok and discarded all arguments. | Real batch handles whitespace, `sw 0`, `p counter` and `q`. |
 | C15 | Fixed (captured streams) | STDIO descriptors share the virtual FD registry; stdin is deterministic EOF and stdout/stderr content is archived VFS state. | `check-io-boundary` covers access modes, writes, close, archive and branch isolation; terminal input/output and interactive stdin remain unsupported. |
-| C16 | Fixed (scoped) | WAKE unblocks removed waiters, successful WAIT saves a suspended successor with return 0; requeue uses arg4 count/arg6 comparison, returns total affected and handles same address safely. | `check-futex` covers real ptrace WAIT/WAKE/bitset/requeue/errors; unsupported timed/realtime/PI operations explicitly fail. Exhaustive wake-order outcomes remain outside coverage. |
+| C16 | Fixed (scoped) | WAKE unblocks removed waiters, WAIT saves an unfinished successor; wake grants a separately published return; requeue uses arg4 count/arg6 comparison, returns total affected and handles same address safely. | `check-futex` covers real ptrace WAIT/WAKE/bitset/requeue/errors; timed wait deadlines and explicit expiry are separately tested; PI operations explicitly fail. Exhaustive wake-order outcomes remain outside coverage. |
 | C17 | P1 | The glibc-private CPU-feature patch has been removed; general nondeterministic CPU instructions/runtime inputs still need a supported execution contract. | Define and test which nondeterministic CPU/runtime state must be normalized; avoid assuming this patch worked from a successful scenario. |
 | C20 | Fixed (host user XSTATE) | Capture/archive/restore NT_X86_XSTATE for each thread; snapshot version 5 rejects old formats. | `check-xstate` covers XMM/AVX/x87/MXCSR; native SIMD scenario repeatedly restores observed=0 and replays observed=11. Cross-host layouts and supervisor state are outside coverage. |
 | C21 | Fixed (scoped) | Save private readable mappings and unnamed anonymous guards including hidden bytes; restore protections/backing and canonicalize equivalent VMA partitions. Reject shared and other unreadable maps and missing file/named backing. | `check-mappings` covers RO contents, permissions, split/merge, anonymous recreation, explicit unsupported cases and wide map fields. Native replay preserves successor identity. |
 | C22 | Fixed (snapshot I/O) | Exact read/write counts and archive bounds required; failures propagate, without zero-fill or live fallback. | `check-state-io` fault-injects short/failed process_vm I/O and corrupt/missing/old archives. Failed restore is fatal; no successor may execute afterward. |
 | C23 | P0 / partial | TCP source ports now derive from saved socket state, independent of search RNG; clocks/getrandom now use saved virtual state; per-task masks now persist; custom signal delivery and asynchronous kernel inputs remain unsupported. | `check-port` covers replay, RNG independence, source addresses, uniqueness and exhaustion. Closed syscall policy and process-model regressions cover rejection, deterministic replay and archives; this does not close general asynchronous inputs. |
 | C24 | Fixed | Populate current syscall number/arguments before the entry handler. | `check-exec` exercises real ptrace FUTEX_WAKE suppression using current arguments. |
-| C25 | P0 / partial | Auto execution now returns after each completed syscall, including CKPT_NO. Runnable threads/outcomes are still not exhaustively enumerated; pure user loops and blocking kernel calls are not bounded. | `check-exec` verifies empty receive, sleep and getpid loops return control. Futex waiting successors are now preserved; enabled actor enumeration and shared-memory atom boundaries remain open. |
+| C25 | P0 / partial | Auto execution returns after each syscall boundary or explicit pending completion, including CKPT_NO. Runnable threads/outcomes are still not exhaustively enumerated; pure user loops and blocking kernel calls are not bounded. | `check-exec` verifies empty receive, sleep and getpid loops return control. Futex waiting successors are now preserved; enabled actor enumeration and shared-memory atom boundaries remain open. |
 | C26 | Fixed | Pending accounting covers queued and executing work; completion waits and synchronizes packed data/index. Async and sync errors poison subsequent operations. | `check-store-cache` holds a worker at compression, proves barrier stays blocked, then opens a fresh read-only process while writer remains alive. Sync failure and shutdown/reinit also covered. |
 
 | C27 | Fixed | Non-owning shared cache buffers and eviction mutations caused wrong bytes and crashes under pressure. Immutable owned buffers replace mutable cross-thread entries; cache and pending budgets are explicit. | `check-store-cache` covers pointer lifetime, zero/tiny caches, concurrent dedup, multiworker and prefetch. Fixed-data constrained-cache benchmark passes every byte comparison. |
@@ -156,8 +156,9 @@ normal and tiny caches run against flat and verify-pages backends. This closes
 that C08 branch-contamination case; changed physical thread sets, stop-all
 coordination and general canonicalization remain open.
 
-Virtual termination still retains modeled descriptors; Linux exit-driven close/EOF
-and other resource teardown semantics require a separate lifecycle model. The
+The original terminal-image slice retained descriptors. Normal last-thread/group
+exit now closes supported modeled resources; fatal-crash teardown and TCP reset
+cases remain outside that later extension. The
 regressions above establish branch-image isolation, not complete exit semantics.
 
 ## Raw thread carrier lifecycle
@@ -268,3 +269,36 @@ and SIGTERM cleanup proving all retained TIDs disappear.
 Flat21/page22 and kernel modelv9 encode the new semantic fields. These results do
 not close C03/C25: current scheduling still does not enumerate every enabled task,
 memory-access boundary, wake outcome or weak-memory behavior.
+
+## Generic pending syscall slice (2026-10-16)
+
+C01/C16/C25 now separate syscall admission, blocking, readiness and completion.
+Waiting/Retry/Ready plus original scalar arguments and copied normalized deadline
+belong to each logical thread. Physically skipped syscall-exit is a carrier stop,
+not a guest return; no user instruction runs on the completion edge. Futex queues
+and blocked caches are validated against this state, not independent truth.
+
+Pipe/socket reads, pipe capacity waits, recvfrom, accept and epoll can suspend.
+Readiness only permits retry; output faults and competing consumption do not lose
+payload. EOF after supported normal peer exit is an explicit completion. Finite
+futex/epoll/sleep deadlines can be expired by the control API after modeled time
+is due, without automatic time advancement or scheduling policy.
+
+ABI2 event phases distinguish unfinished calls, actual returns and nonreturning
+exit/crash. CLI and StateView expose pending rather than a fake success. The old
+per-futex timeout boolean and ad-hoc blocked CLI rollback are removed.
+Flat23/page24 and kernelv10 encode this contract.
+
+Regressions cover real stopped carriers, no-instruction completion, Waiting/Ready
+and Retry persistence, two read attempts competing for one payload, EFAULT after
+buffer protection changes, explicit deadline expiry, last-thread/group EOF, and
+full/pages normal/tiny cache equivalence. A native phase-checking plugin verifies
+pthread, pipe and fatal-stop event observation. Driver-created competing reads
+are not claimed as exhaustive real thread scheduling.
+
+Still open: automatic deadline/actor/outcome enumeration; pending descriptor
+close requires pinned open-file identities (currently explicitly rejected);
+partial-progress blocking writes; poll/select/vector I/O; transport backpressure;
+TCP reset and fatal-crash resource teardown; independent realtime/monotonic axes;
+signals/cancellation and shared-memory instruction boundaries. None is silently
+covered by the successful controlled executions above.

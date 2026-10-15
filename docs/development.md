@@ -25,6 +25,8 @@ make check-storage       # storage faults/concurrency/reopen + read-only tools; 
 make check-integration   # production DWARF/ELF fixtures; default NP=1
 make check-scenarios     # build NP=1 tracer and run isolated native ptrace scenarios
 make check-thread-control check-thread-identity check-thread-carrier # NP=1 thread gates
+make check-pending-syscall # NP=1 blocked/wake/completion/deadline replay
+make check-pending-io check-pending-io-snapshot # NP=2 IO wait/retry/EOF and persisted replay
 make check-thread-robust # NP=1 native owner-death oracle, group exit, persisted replay
 make check-thread-signal-mask # NP=1 per-task masks, inheritance, restore and pending rejection
 make check-thread-tid # NP=1 clone/clone3 TID, clear-tid/join and restore
@@ -133,16 +135,16 @@ enter snapshot state. Loader CPU-feature normalization still logs an unresolved
 symbol (C17). Passing counter/replay tests does not close that gap,
 nor does it prove multithread, cross-process-run or eviction correctness.
 
-Default snapshot format is version 21; older formats are rejected without migration.
-This branch additionally reads opt-in version 22 page manifests, selected with
+Default snapshot format is version 23; older formats are rejected without migration.
+This branch additionally reads opt-in version 24 page manifests, selected with
 `DETSIM_SNAPSHOT_BACKEND=pages`; `verify-pages` adds a full memory oracle.
 See [page snapshots and whole-exploration measurements](page-snapshots.md).
 Private readable mappings and unnamed anonymous PROT_NONE guards are captured;
 shared and other unreadable mappings, overlaps with the reserved scratch page
 and missing file-backed restore mappings fail explicitly.
 Logical thread slots and futex queues survive restore. Raw-thread births/exits
-restore onto retained stopped carriers; unexpected host thread death or creation rejects. Timed/PI futex operations
-are unsupported and fail explicitly; successful waits remain suspended until wake.
+restore onto retained stopped carriers; unexpected host thread death or creation rejects. PI futex operations remain unsupported. Timed waits retain normalized deadlines;
+expiry and completion require explicit control operations, not host wall time.
 
 Run the NP=1 and NP=2 gates in separate make invocations. The Redis gate requires
 the existing `examples/redis/redis/src/redis-server`; it downloads nothing and
@@ -182,7 +184,7 @@ fail; saved readers never fall back to live memory. The explicit `stopped_live()
 view is reserved for environment callbacks before capture.
 
 Public plugins include only `src/api/plugin.h` and export
-`detsim_plugin_entry_v1`. Build the `.so` explicitly. Loading legacy `check()` or
+`detsim_plugin_entry_v2`. Build the `.so` explicitly. Loading legacy `check()` or
 compiling sources while parsing configuration is unsupported. An example:
 
 ```json
@@ -225,7 +227,7 @@ successor. Pure predecessor/target comparisons need no monitor state.
 
 Plugin binaries/schema/configuration, target executable contents and semantic
 execution configuration form the model compatibility fingerprint. Executables must remain immutable during a run. Changing cache
-sizes or loading a decoder does not change it. Flat21/page22 and the versioned
+sizes or loading a decoder does not change it. Flat23/page24 and the versioned
 system metadata reject older archives without deleting or migrating stores.
 Changes to kernel-model or inspection semantics require an explicit compatibility
 version bump; fingerprints do not prove equivalence between different implementations.
@@ -255,7 +257,7 @@ execution, faithful restore and exhaustive exploration are separate support leve
 | Kernel-state closure (P0) | Unclassified syscalls reject; signal/timer delivery and CPU nondeterminism are not fully modeled | Explicit syscall support is scoped; asynchronous and CPU inputs still need a complete contract |
 | Scheduling/atoms (P0) | Runnable thread/outcome enumeration, all-thread stop barrier, bounded pure computation and shared-memory access boundaries | Syscall stepping does not cover all concurrent behavior; weak-memory semantics also require an explicit model |
 | Lifecycle/restore (P0) | Full pthread/kernel thread-state reconstruction and process trees/fork/exec | Raw births/exits rebind retained carriers; untracked physical changes reject; parked terminal images restore across branches (C02/C08) |
-| Blocking/event loop (P1) | Wait registration, readiness wakeups, deadlines, timeout ordering and signal interruption | Returning EAGAIN/zero is not Linux blocking semantics; sleep and epoll timing are incomplete |
+| Blocking/event loop (P1) | Automatic time advancement, timeout outcome selection, pinned descriptors and signal interruption | Supported waits now retain pending calls; broader blocking syscall coverage remains scoped |
 | Files/IPC/network (P1) | Reusable rootfs and external inputs, shared filesystem/open-file descriptions, dup/vector/positioned I/O, directory mutations, Unix/IPv6 sockets, eventfd/timerfd/io_uring | Many common runtime interfaces explicitly reject; fsync does not model crash durability |
 | Mappings (P1) | Shared mappings, unreadable file-backed mappings and mutable file-backed coherence | Common allocators/JITs/shared-memory applications can hit explicit unsupported cases |
 | Startup/inspection (P1) | Portable initial boundary, per-node PIE/shared-image relocation and symbol contexts | PIE execution is possible; symbolic property inspection is more restricted than execution. Debug symbols are optional for raw/resource inspection |
@@ -296,7 +298,7 @@ closure within an explicit environment, not compatibility with all Linux program
 
 ## Logical thread archives
 
-Flat21/page22 archive explicit thread liveness and logical parent IDs; physical
+Flat23/page24 archive explicit thread liveness and logical parent IDs; physical
 TIDs are transient bindings. Same-run captured hashes retain compact runtime
 provenance tied to an owned process pidfd, which is required on the host kernel.
 Disk reload may inspect any valid snapshot, but execution restore requires local
@@ -571,3 +573,56 @@ fork/group registration; EXITKILL and parent-death handling cover interrupted
 startup. The prelude rejects group/session changes and process/thread births.
 Normal and SIGTERM cleanup of the pthread scenario leave no owned TIDs behind;
 unrelated-sibling regression checks remain in the native scenario suite.
+
+## Pending syscalls: execution control (2026-10-16)
+
+A thread owns an optional pending syscall with original number/arguments, wait
+kind (futex/I/O/timer), phase, optional normalized deadline and eventual result.
+Waiting is not runnable. Retry is an I/O readiness opportunity, not a reserved
+resource or a promised result. Ready has an assigned result. The carrier remains
+at the skipped host syscall's exit stop with an internal -ENOSYS sentinel until
+an explicit completion step writes the result and clears pending. That step does
+not execute user instructions or enter the next syscall.
+
+All pending fields participate in copy/archive/identity/restore, including same
+hash restore. The futex queue is only an index of Waiting registrations; it no
+longer defines generic blocked state or owns a duplicate timeout flag. WAKE,
+robust cleanup and clear-tid grant Ready, while requeue retains Waiting. A global
+readiness refresh before capture updates all nodes without consuming peer data.
+A competing reader can turn an I/O Retry back into Waiting.
+
+Supported I/O adapters cover pipe/socket read, pipe write, TCP/UDP recvfrom,
+accept/accept4 and epoll_wait/pwait/pwait2. O_NONBLOCK/MSG_DONTWAIT retain EAGAIN;
+zero epoll timeouts poll immediately. Pipe capacity is modeled as64KiB with
+atomic writes through4096bytes; blocking writes requiring partial in-flight
+progress explicitly reject. TCP send buffers remain unbounded. accept4 flags
+apply to the accepted FD, not the listener's waiting behavior. Regular VFS file
+access is synchronous in-memory; this does not model host disk latency.
+
+FUTEX_WAIT relative deadlines, WAIT_BITSET absolute deadlines, finite epoll waits,
+nanosleep and clock_nanosleep retain copied, normalized time values, saturated to
+Linux ktime range. Retry never rereads the caller's timeout memory. The control API
+in `engine/pending_syscall.h` separates `pending_timeout_due`,
+`expire_pending_syscall` and `complete_pending_syscall`. Expiry grants the timeout
+result; completion publishes it in another step. Nothing automatically advances
+time or chooses expiry. Realtime/monotonic still share the existing modeled clock
+axis. Wake-vs-timeout and actor/outcome exploration policies are future work.
+
+ABI2 plugins export detsim_plugin_entry_v2 and receive explicit BLOCKED,
+COMPLETED, STOPPED or THREAD_EXITED events. Only COMPLETED has a valid return
+value. Fatal stops clear stale syscall metadata. StateView exposes nullable
+pending result/deadline; CLI history labels pending calls without printing a
+fictional return. ABI1 shared objects must be rebuilt and adapted to phases.
+Flat23/page24 and kernel modelv10 reject incompatible execution contexts.
+
+Pending I/O keeps its numeric descriptor stable: close, F_SETFL and FIONBIO on a
+referenced FD reject before mutation, pending a true pinned-open-resource model.
+Peer close remains supported. Normal last-thread/exit_group termination releases
+modeled FDs after preflight, allowing peer EOF completion; unsupported TCP reset
+cases (unaccepted listener connections or local unread payload) reject before
+exit mutation. Fatal-crash teardown is still outside this resource-close scope.
+
+The default pending UDP retry consumes the first queued datagram; it does not
+preserve the optional ordinary-receive choice enumeration. Poll/select, vector
+I/O, cancellation, async delivery and full transport backpressure are not added.
+This change establishes execution/control states, not exhaustive scheduling.

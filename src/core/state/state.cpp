@@ -6,6 +6,7 @@
 #include "xstate.h"
 #include "../engine/thread_control.h"
 #include "../engine/thread_pool.h"
+#include "../engine/pending_syscall.h"
 #include <poll.h>
 #include "soft_dirty_experiment.h"
 #include "page_capture.h"
@@ -222,6 +223,7 @@ int sys_state::save_metadata() const
 
 void tracee_state::validate_io_state() const
 {
+  validate_pending_syscalls(*this);
   auto require = [](bool condition) {
     if (!condition) throw std::runtime_error("Invalid snapshot descriptor/resource graph");
   };
@@ -230,6 +232,17 @@ void tracee_state::validate_io_state() const
   const auto &sockets = sock_state.sockets();
   const auto &epolls = sock_state.epoll_instances();
   const auto &pipe_fds = fs_state.pipe_fds_;
+  for (const auto& thread:threads) {
+    if (!thread.pending_syscall || thread.pending_syscall->reason!=PendingReason::Io ||
+        thread.pending_syscall->phase==PendingPhase::Ready) continue;
+    const auto& call=*thread.pending_syscall;
+    const int fd=static_cast<int>(call.args[0]);
+    require(manager.is_allocated(fd));
+    const auto kind=manager.get_fd_type(fd);
+    if(call.nr==SYS_read || call.nr==SYS_write) require(kind==FdType::PIPE || kind==FdType::SOCKET);
+    else if(call.nr==SYS_recvfrom || call.nr==SYS_accept || call.nr==SYS_accept4) require(kind==FdType::SOCKET);
+    else require(kind==FdType::EPOLL);
+  }
   for (int fd : manager.get_allocated_fds()) {
     const auto kind = manager.get_fd_type(fd);
     const bool file = files.contains(fd), socket = sockets.contains(fd);
@@ -256,6 +269,7 @@ void tracee_state::validate_io_state() const
     else ++ends.second;
   }
   for (const auto &[id, pipe] : fs_state.pipes_) {
+    require(pipe.buffer.size()<=FileSystemState::pipe_capacity);
     require(id > 0 && !(pipe.read_closed && pipe.write_closed));
     const auto ends = pipe_ends[id];
     require(ends.first == unsigned(!pipe.read_closed) && ends.second == unsigned(!pipe.write_closed));
@@ -763,7 +777,7 @@ void tracee_state::restore_resources(int index) const
   for (int t = 0; t < MAX_THREADS_PER_PROCESS; ++t) {
     ptmc_state.thread_blocked[index][t] =
         t < static_cast<int>(threads.size()) && threads[t].alive &&
-        futex_state && futex_state->is_thread_waiting(threads[t].tid);
+        threads[t].pending_syscall && threads[t].pending_syscall->phase == PendingPhase::Waiting;
     ptmc_state.thread_exited[index][t] =
         t < static_cast<int>(threads.size()) && !threads[t].alive;
   }
@@ -1194,6 +1208,7 @@ void tracee_state::remove_thread(pid_t tid)
     if (ts.tid == tid) {
       LOG_INFO("Marked thread %d (physical=%d) as exited", tid, ts.physical_tid);
       ts.alive = false;
+      ts.pending_syscall.reset();
       ts.physical_tid = 0;
       return;
     }

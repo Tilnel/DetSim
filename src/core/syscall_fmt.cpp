@@ -645,6 +645,15 @@ void format(char *buf, int pid, hash_type ts_hash)
   }
 
   char *body_buf = buf + prefix_len;
+  if (ts.current_thread_idx>=0 && ts.current_thread_idx<int(ts.threads.size()) &&
+      ts.threads[ts.current_thread_idx].pending_syscall) {
+    const auto& call=*ts.threads[ts.current_thread_idx].pending_syscall;
+    const char* phase=call.phase==PendingPhase::Waiting?"waiting":
+                      call.phase==PendingPhase::Retry?"retry":"ready";
+    snprintf(body_buf,1024-prefix_len,"%s(0x%lx, 0x%lx, 0x%lx, 0x%lx, 0x%lx, 0x%lx) <pending:%s>",
+             syscalls[call.nr],call.args[0],call.args[1],call.args[2],call.args[3],call.args[4],call.args[5],phase);
+    return;
+  }
 
   switch (info.nr)
   {

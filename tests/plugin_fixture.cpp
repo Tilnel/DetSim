@@ -8,7 +8,7 @@ extern "C" int check() { return 0; }
 #else
 namespace {
 #ifndef DETSIM_FIXTURE_DECODER
-detsim_verdict check(const detsim_host_v1 *host, const detsim_state_view *view, detsim_diagnostic d) {
+detsim_verdict check(const detsim_host_v2 *host, const detsim_state_view *view, detsim_diagnostic d) {
   if (!host->configuration || !*host->configuration || !host->inspect_json || !host->read_buffer) return DETSIM_ERROR;
   std::string metadata;
   detsim_writer writer{&metadata, [](void* context,const void* bytes,size_t length)->int {
@@ -24,24 +24,24 @@ detsim_verdict check(const detsim_host_v1 *host, const detsim_state_view *view, 
   if (value < 0) { if (d.capacity) std::snprintf(d.data, d.capacity, "negative counter"); return DETSIM_VIOLATION; }
   return DETSIM_PASS;
 }
-detsim_verdict edge(const detsim_host_v1 *host, const detsim_state_view *a, const detsim_state_view *b, const detsim_event_v1 *, detsim_diagnostic) {
+detsim_verdict edge(const detsim_host_v2 *host, const detsim_state_view *a, const detsim_state_view *b, const detsim_event_v2 *, detsim_diagnostic) {
   int64_t x = 0, y = 0;
   if (host->read(a, 0, 0x1000, &x, sizeof(x)) || host->read(b, 0, 0x1000, &y, sizeof(y))) return DETSIM_UNAVAILABLE;
   return y < x ? DETSIM_VIOLATION : DETSIM_PASS;
 }
-detsim_verdict init(const detsim_host_v1 *, const detsim_state_view *, const char *configuration, detsim_writer out, detsim_diagnostic) {
+detsim_verdict init(const detsim_host_v2 *, const detsim_state_view *, const char *configuration, detsim_writer out, detsim_diagnostic) {
   const uint8_t zero = 0;
   if (out.append(out.context, &zero, 1)) return DETSIM_ERROR;
   return std::strstr(configuration, "partial_initial") ? DETSIM_VIOLATION : DETSIM_PASS;
 }
-detsim_verdict advance(const detsim_host_v1 *, const detsim_state_view *, const detsim_state_view *, const detsim_event_v1 *event, detsim_bytes previous, detsim_writer out, detsim_diagnostic) {
+detsim_verdict advance(const detsim_host_v2 *, const detsim_state_view *, const detsim_state_view *, const detsim_event_v2 *event, detsim_bytes previous, detsim_writer out, detsim_diagnostic) {
   if (previous.size != 1) return DETSIM_ERROR;
   const uint8_t next = previous.data[0] + event->choice;
   if (out.append(out.context, &next, 1)) return DETSIM_ERROR;
   return event->choice == 99 ? DETSIM_VIOLATION : DETSIM_PASS;
 }
-detsim_verdict choose(const detsim_host_v1 *, const detsim_state_view *, uint32_t, int32_t choice,
- detsim_time now, uint32_t budget, detsim_time_choice_v1 *out, detsim_diagnostic) {
+detsim_verdict choose(const detsim_host_v2 *, const detsim_state_view *, uint32_t, int32_t choice,
+ detsim_time now, uint32_t budget, detsim_time_choice_v2 *out, detsim_diagnostic) {
   *out = {now, choice == 2 ? budget + 1 : 0};
   out->value.seconds += choice;
   if (choice == 3) out->value.microseconds = 1000000;
@@ -62,17 +62,17 @@ int describe(detsim_bytes input, detsim_writer out) {
   if (input.size != 3 || std::memcmp(input.data, "MSG", 3)) return 0;
   return out.append(out.context, "fixture message", 15) ? -1 : 1;
 }
-const detsim_plugin_v1 descriptor{
+const detsim_plugin_v2 descriptor{
 #ifdef DETSIM_FIXTURE_BAD_ABI
-99,
+1, // ABI1 cannot receive the phase-aware ABI2 event contract.
 #else
-DETSIM_PLUGIN_ABI_V1,
+DETSIM_PLUGIN_ABI_V2,
 #endif
 #ifdef DETSIM_FIXTURE_DECODER
-sizeof(detsim_plugin_v1), "test.display", 0, nullptr, nullptr, nullptr, nullptr, nullptr, describe};
+sizeof(detsim_plugin_v2), "test.display", 0, nullptr, nullptr, nullptr, nullptr, nullptr, describe};
 #else
-sizeof(detsim_plugin_v1), "test.counter", 1, check, edge, init, advance, choose, describe};
+sizeof(detsim_plugin_v2), "test.counter", 1, check, edge, init, advance, choose, describe};
 #endif
 }
-extern "C" const detsim_plugin_v1 *detsim_plugin_entry_v1() { return &descriptor; }
+extern "C" const detsim_plugin_v2 *detsim_plugin_entry_v2() { return &descriptor; }
 #endif

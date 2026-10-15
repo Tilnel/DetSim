@@ -1,6 +1,7 @@
 #include "config.h"
 #include "monitor.h"
 #include "engine/thread_pool.h"
+#include "engine/pending_syscall.h"
 #include "ncurses_ui.h"
 #include "guest.h"
 #include "dispatcher.h"
@@ -287,7 +288,22 @@ int main() {
         result=execute(dispatcher,child,SYS_nanosleep,{reinterpret_cast<uint64_t>(&guest_zero),0,0,0,0,0});
         check(!result.rejected && result.value==0,"valid zero nanosleep completes");
         result=execute(dispatcher,child,SYS_nanosleep,{reinterpret_cast<uint64_t>(&guest_delay),0,0,0,0,0});
-        check(result.rejected,"nonzero nanosleep never manufactures success");
+        check(!result.rejected && result.value==-ENOSYS &&
+              ptmc_state.running_state.child[0].threads[0].pending_syscall &&
+              ptmc_state.running_state.child[0].threads[0].pending_syscall->reason==PendingReason::Timer,
+              "nonzero nanosleep registers unfinished timer");
+        check(!expire_pending_syscall(0,1),"sleep cannot expire before its deadline");
+        ptmc_state.time[0].tv_sec+=2;
+        syscall_info completion{};
+        check(expire_pending_syscall(0,1) && complete_pending_syscall(0,child,completion) &&
+              completion.nr==SYS_nanosleep && completion.rval==0,
+              "sleep expires through explicit completion");
+        result=execute(dispatcher,child,SYS_clock_nanosleep,
+                       {CLOCK_MONOTONIC,TIMER_ABSTIME,reinterpret_cast<uint64_t>(&guest_delay),0,0,0});
+        check(!result.rejected && result.value==0,"expired absolute sleep completes immediately");
+        result=execute(dispatcher,child,SYS_clock_nanosleep,
+                       {CLOCK_BOOTTIME,0,reinterpret_cast<uint64_t>(&guest_zero),0,0,0});
+        check(result.rejected,"unmodeled sleep clock rejects explicitly");
         result=execute(dispatcher,child,SYS_nanosleep,{reinterpret_cast<uint64_t>(&guest_invalid),0,0,0,0,0});
         check(!result.rejected && result.value==-EINVAL,"invalid nanosleep duration returns EINVAL");
         result=execute(dispatcher,child,SYS_nanosleep,{1,0,0,0,0,0});

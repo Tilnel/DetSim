@@ -1,4 +1,5 @@
 #include "io.h"
+#include "pending_io.h"
 #include "guest.h"
 #include "monitor.h"
 #include "fs/fsstate.h"
@@ -83,6 +84,7 @@ long emu_write(int fd, const void* source, size_t count) {
 }
 
 long emu_close(int fd) {
+  require_no_pending_fd(ptmc_state.cursor, fd);
   auto& manager=descriptors();
   if (!manager.is_allocated(fd)) return -EBADF;
   int result;
@@ -118,7 +120,10 @@ long emu_fstat(int fd, struct stat* destination) {
   }
   return guest_write_exact(ptmc_state.pids[ptmc_state.cursor],destination,&value,sizeof(value))?0:-EFAULT;
 }
-int emu_fcntl(int fd,int command,long argument) {return descriptors().do_fcntl(fd,command,static_cast<int>(argument));}
+int emu_fcntl(int fd,int command,long argument) {
+  if (command == F_SETFL) require_no_pending_fd(ptmc_state.cursor, fd);
+  return descriptors().do_fcntl(fd,command,static_cast<int>(argument));
+}
 int emu_fsync(int fd) {
   auto& manager=descriptors();
   if (!manager.is_allocated(fd)) return -EBADF;
@@ -133,6 +138,7 @@ int emu_ioctl(int fd, unsigned long request, void* argument) {
   // The profile's standard streams are captured non-terminal streams.
   if (request==TCGETS || request==TIOCGWINSZ) return -ENOTTY;
   if (request==FIONBIO) {
+    require_no_pending_fd(ptmc_state.cursor, fd);
     int enabled;
     if (!guest_read_exact(ptmc_state.pids[ptmc_state.cursor],argument,&enabled,sizeof(enabled))) return -EFAULT;
     int flags=manager.get_status_flags(fd);

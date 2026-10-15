@@ -143,6 +143,10 @@ class FileSystemState
   // Helper to ensure a directory exists in the VFS
   void ensure_dir_exists(const std::string &path);
 
+  // Fixed capacity belongs to the virtual kernel profile.
+  static constexpr size_t pipe_capacity = 65536;
+  static constexpr size_t pipe_atomic_limit = 4096;
+
   // Pipe support
   struct Pipe
   {

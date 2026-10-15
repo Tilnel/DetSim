@@ -11,6 +11,8 @@
 #include "state/state.h"
 #include "thread_manager.h"
 #include "engine/thread_pool.h"
+#include "engine/pending_syscall.h"
+#include "pending_io.h"
 #include "sync/futexstate.h"
 #include "fs/fsstate.h"
 #include "net/sockstate.h"
@@ -26,6 +28,17 @@
 #include <fcntl.h>
 #include <sys/uio.h>
 #include <stdexcept>
+
+static int finish_io_call(pid_t pid, syscall_info& info, long result) {
+    if (io_should_suspend(ptmc_state.cursor, info, result)) {
+        suspend_syscall(ptmc_state.cursor,pid,info,PendingReason::Io);
+        configure_pending_io(ptmc_state.cursor,pid,info);
+    } else {
+        tracee_set_rax(pid,result);
+        info.rval=result;
+    }
+    return CKPT_YES;
+}
 
 /* ======================================================================
  * Network Handlers
@@ -71,12 +84,7 @@ int handle_recvfrom(pid_t pid, syscall_info &info) {
     long ret = emu_recvfrom(info.args[0], (void *)info.args[1], info.args[2],
                             info.args[3], (struct sockaddr *)info.args[4],
                             (socklen_t *)info.args[5]);
-    tracee_set_rax(pid, ret);
-    info.rval = ret;
-    if (ret < 0 && ptmc_state.n_choose < 2) {
-        return CKPT_NO;
-    }
-    return CKPT_YES;
+    return finish_io_call(pid,info,ret);
 }
 
 int handle_socket(pid_t pid, syscall_info &info) {
@@ -110,11 +118,10 @@ int handle_listen(pid_t pid, syscall_info &info) {
 }
 
 int handle_accept(pid_t pid, syscall_info &info) {
-    long ret = emu_accept(info.args[0], (struct sockaddr *)info.args[1],
-                          (socklen_t *)info.args[2]);
-    tracee_set_rax(pid, ret);
-    info.rval = ret;
-    return CKPT_YES;
+    long ret = info.nr==SYS_accept4
+        ? emu_accept4(info.args[0],(struct sockaddr*)info.args[1],(socklen_t*)info.args[2],info.args[3])
+        : emu_accept(info.args[0],(struct sockaddr*)info.args[1],(socklen_t*)info.args[2]);
+    return finish_io_call(pid,info,ret);
 }
 
 int handle_setsockopt(pid_t pid, syscall_info &info) {
@@ -167,27 +174,21 @@ int handle_epoll_ctl(pid_t pid, syscall_info &info) {
 int handle_epoll_wait(pid_t pid, syscall_info &info) {
     long ret = emu_epoll_wait(info.args[0], (struct epoll_event *)info.args[1],
                               info.args[2], info.args[3]);
-    tracee_set_rax(pid, ret);
-    info.rval = ret;
-    return CKPT_YES;
+    return finish_io_call(pid,info,ret);
 }
 
 int handle_epoll_pwait(pid_t pid, syscall_info &info) {
     long ret = emu_epoll_pwait(info.args[0], (struct epoll_event *)info.args[1],
                                info.args[2], info.args[3],
                                (const sigset_t *)info.args[4], info.args[5]);
-    tracee_set_rax(pid, ret);
-    info.rval = ret;
-    return CKPT_YES;
+    return finish_io_call(pid,info,ret);
 }
 
 int handle_epoll_pwait2(pid_t pid, syscall_info &info) {
     long ret = emu_epoll_pwait2(info.args[0], (struct epoll_event *)info.args[1],
                                 info.args[2], (const struct timespec *)info.args[3],
                                 (const sigset_t *)info.args[4], info.args[5]);
-    tracee_set_rax(pid, ret);
-    info.rval = ret;
-    return CKPT_YES;
+    return finish_io_call(pid,info,ret);
 }
 
 } // namespace network
@@ -243,16 +244,12 @@ int handle_openat(pid_t pid, syscall_info &info) {
 
 int handle_read(pid_t pid, syscall_info &info) {
     long ret = emu_read(info.args[0], (void *)info.args[1], info.args[2]);
-    tracee_set_rax(pid, ret);
-    info.rval = ret;
-    return CKPT_YES;
+    return finish_io_call(pid,info,ret);
 }
 
 int handle_write(pid_t pid, syscall_info &info) {
     long ret = emu_write(info.args[0], (const void *)info.args[1], info.args[2]);
-    tracee_set_rax(pid, ret);
-    info.rval = ret;
-    return CKPT_YES;
+    return finish_io_call(pid,info,ret);
 }
 
 int handle_close(pid_t pid, syscall_info &info) {
@@ -449,14 +446,14 @@ int handle_gettid(pid_t pid, syscall_info &info) {
 }
 
 int handle_exit(pid_t pid, syscall_info &info) {
-    info.rval=0;tracee_set_rax(pid,0);
     const bool last=exit_logical_thread(ptmc_state.cursor,pid,info.args[0]);
+    info.rval=0;tracee_set_rax(pid,0);
     return last?CKPT_EXIT:CKPT_YES;
 }
 
 int handle_exit_group(pid_t pid, syscall_info &info) {
-    info.rval=0;tracee_set_rax(pid,0);
     exit_logical_process(ptmc_state.cursor,pid,info.args[0]);
+    info.rval=0;tracee_set_rax(pid,0);
     return CKPT_EXIT;
 }
 
@@ -482,6 +479,18 @@ int handle(pid_t pid, syscall_info &info) {
     const pid_t virtual_tid = child.threads.at(thread_idx).tid;
     const auto previous_waiters = futex.get_waiters(uaddr);
 
+    std::optional<PendingDeadline> deadline;
+    if ((op==FUTEX_WAIT || op==FUTEX_WAIT_BITSET) && info.args[3]) {
+        timespec timeout{};
+        long error=0;
+        if (!guest_read_exact(pid,reinterpret_cast<void*>(info.args[3]),&timeout,sizeof(timeout))) error=-EFAULT;
+        else if(timeout.tv_sec<0 || timeout.tv_nsec<0 || timeout.tv_nsec>=1000000000) error=-EINVAL;
+        if(error) {tracee_set_rax(pid,error);info.rval=error;return CKPT_YES;}
+        deadline=make_pending_deadline(tracee_idx,
+            (futex_op&FUTEX_CLOCK_REALTIME)?CLOCK_REALTIME:CLOCK_MONOTONIC,
+            timeout.tv_sec,timeout.tv_nsec,op==FUTEX_WAIT,-ETIMEDOUT);
+    }
+
     // A futex word is exactly 32 bits. Never synthesize zero after a failed
     // guest read: that can turn EFAULT into a successful blocking wait.
     uint64_t value = 0;
@@ -496,12 +505,15 @@ int handle(pid_t pid, syscall_info &info) {
         }
     }
     const int result = futex.handle_futex(virtual_tid, uaddr, futex_op,
-        static_cast<int>(info.args[2]), info.args[3], info.args[4],
+        static_cast<int>(info.args[2]), deadline?0:info.args[3], info.args[4],
         static_cast<int>(info.args[5]), current_value);
-    tracee_set_rax(pid, static_cast<uint64_t>(result));
-    info.rval = static_cast<uint64_t>(result);
-    if ((op == FUTEX_WAIT || op == FUTEX_WAIT_BITSET) && result == 0)
-        ptmc_state.thread_blocked[tracee_idx][thread_idx] = true;
+    if ((op == FUTEX_WAIT || op == FUTEX_WAIT_BITSET) && result == 0) {
+        suspend_syscall(tracee_idx,pid,info,PendingReason::Futex);
+        if(deadline) set_pending_deadline(tracee_idx,virtual_tid,*deadline);
+    } else {
+        tracee_set_rax(pid,static_cast<uint64_t>(result));
+        info.rval=static_cast<uint64_t>(result);
+    }
 
     // Requeued waiters remain blocked. Only waiters removed by this wake
     // become runnable; the surviving queue is not the set that was woken.
@@ -511,8 +523,8 @@ int handle(pid_t pid, syscall_info &info) {
             if (child.threads[i].tid == tid)
                 ptmc_state.thread_blocked[tracee_idx][i] = false;
     }
-    // A successful wait is a suspended successor at syscall exit. The saved
-    // return value becomes visible only after another transition wakes it.
+    refresh_futex_pending(tracee_idx);
+    // Blocking registration and syscall completion are separate transitions.
     return CKPT_YES;
 }
 
@@ -542,22 +554,36 @@ int handle_gettimeofday(pid_t pid, syscall_info &info) {
     return CKPT_YES;
 }
 
-int handle_nanosleep(pid_t pid, syscall_info &info) {
+static int sleep_call(pid_t pid, syscall_info& info, int clock, int flags, uint64_t request_address) {
+    if (clock!=CLOCK_REALTIME && clock!=CLOCK_MONOTONIC)
+        throw std::runtime_error("Unsupported sleep clock");
+    if (flags&~TIMER_ABSTIME) {
+        tracee_set_rax(pid,-EINVAL);info.rval=-EINVAL;return CKPT_YES;
+    }
     timespec request{};
     long result=0;
-    if (!guest_read_exact(pid,reinterpret_cast<const void*>(info.args[0]),&request,sizeof(request))) result=-EFAULT;
+    if (!guest_read_exact(pid,reinterpret_cast<void*>(request_address),&request,sizeof(request))) result=-EFAULT;
     else if (request.tv_sec<0 || request.tv_nsec<0 || request.tv_nsec>=1000000000) result=-EINVAL;
-    else if (request.tv_sec || request.tv_nsec) throw std::runtime_error("Blocking nanosleep is unsupported");
-    tracee_set_rax(pid,result);info.rval=result;
-    return CKPT_NO;
+    if (result) {tracee_set_rax(pid,result);info.rval=result;return CKPT_YES;}
+    const auto deadline=make_pending_deadline(ptmc_state.cursor,clock,request.tv_sec,request.tv_nsec,
+                                            !(flags&TIMER_ABSTIME),0);
+    const auto& now=ptmc_state.time[ptmc_state.cursor];
+    if (now.tv_sec>deadline.sec || (now.tv_sec==deadline.sec && now.tv_usec*1000>=deadline.nsec)) {
+        tracee_set_rax(pid,0);info.rval=0;return CKPT_YES;
+    }
+    suspend_syscall(ptmc_state.cursor,pid,info,PendingReason::Timer);
+    set_pending_deadline(ptmc_state.cursor,
+        ptmc_state.running_state.child[ptmc_state.cursor].threads.at(ptmc_state.current_thread_idx[ptmc_state.cursor]).tid,
+        deadline);
+    return CKPT_YES;
+}
+
+int handle_nanosleep(pid_t pid, syscall_info &info) {
+    return sleep_call(pid,info,CLOCK_MONOTONIC,0,info.args[0]);
 }
 
 int handle_clock_nanosleep(pid_t pid, syscall_info &info) {
-    if ((info.args[0]!=CLOCK_REALTIME && info.args[0]!=CLOCK_MONOTONIC) || info.args[1])
-        throw std::runtime_error("Unsupported clock_nanosleep clock or flags");
-    syscall_info request=info;request.args[0]=info.args[2];
-    const int checkpoint=handle_nanosleep(pid,request);info.rval=request.rval;
-    return checkpoint;
+    return sleep_call(pid,info,static_cast<int>(info.args[0]),static_cast<int>(info.args[1]),info.args[2]);
 }
 
 } // namespace time

@@ -43,9 +43,9 @@ struct Buffer {
 void expect(bool condition, const char *message) { if (!condition) throw std::runtime_error(message); }
 }
 int main() {
-  const detsim_host_v1 host{1, count, nullptr, evaluate, nullptr, "{}", nullptr, nullptr};
+  const detsim_host_v2 host{1, count, nullptr, evaluate, nullptr, "{}", nullptr, nullptr};
   char message[1024]{}; detsim_diagnostic diagnostic{message, sizeof(message)};
-  detsim_event_v1 event{};
+  detsim_event_v2 event{};
   detsim_state_view a{1, 0, -1, 1, 1}; Buffer history;
   expect(init(&host, &a, "{}", history.writer(), diagnostic) == DETSIM_PASS, "init");
   auto b = a; b.term = 2; b.role = RAFT_LEADER_ROLE; Buffer next;

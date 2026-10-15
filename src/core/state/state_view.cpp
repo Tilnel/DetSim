@@ -186,10 +186,24 @@ std::string StateView::inspect_json(size_t node) const {
   }
   result["epolls"]=std::move(epolls);
   result["threads"]=live_ ? Json(nullptr) : Json::array();
-  if (!live_) for (const auto& thread:state.threads) result["threads"].push_back({{"id",thread.tid},{"alive",thread.alive},{"signal_mask",thread.signal_mask},{"robust_list_head",thread.robust_list_head},{"clear_child_tid",thread.clear_child_tid},{"child_settid_pending",thread.child_settid_pending},{"pending_child_settid",thread.pending_child_settid},{"exit_code",thread.alive?Json(nullptr):Json(thread.exit_code)},{"is_main",thread.is_main},{"registers",registers(thread.regs)}});
+  if (!live_) for (const auto& thread:state.threads) {
+    Json pending=nullptr;
+    if (thread.pending_syscall) {
+      const auto& call=*thread.pending_syscall;
+      pending={{"phase",call.phase==PendingPhase::Waiting?"waiting":call.phase==PendingPhase::Retry?"retry":"ready"},
+               {"reason",call.reason==PendingReason::Futex?"futex":call.reason==PendingReason::Io?"io":"timer"},
+               {"syscall",call.nr},{"args",call.args},
+               {"result",call.phase==PendingPhase::Ready?Json(call.result):Json(nullptr)}};
+      if(call.deadline) pending["deadline"]={{"clock",call.deadline->clock_id},
+          {"seconds",call.deadline->sec},{"nanoseconds",call.deadline->nsec},
+          {"timeout_result",call.deadline->timeout_result}};
+      else pending["deadline"]=nullptr;
+    }
+    result["threads"].push_back({{"pending_syscall",pending},{"id",thread.tid},{"alive",thread.alive},{"signal_mask",thread.signal_mask},{"robust_list_head",thread.robust_list_head},{"clear_child_tid",thread.clear_child_tid},{"child_settid_pending",thread.child_settid_pending},{"pending_child_settid",thread.pending_child_settid},{"exit_code",thread.alive?Json(nullptr):Json(thread.exit_code)},{"is_main",thread.is_main},{"registers",registers(thread.regs)}});
+  }
   result["futex"]=live_ ? Json(nullptr) : Json::array();
   if (!live_ && state.futex_state) for (const auto& [address,queue]:state.futex_state->wait_queues()) {
-    auto waiters=Json::array(); for (const auto& waiter:queue) waiters.push_back({{"thread",waiter.tid},{"value",waiter.val},{"bitset",waiter.bitset},{"timeout",waiter.timeout},{"private",waiter.private_wait}});
+    auto waiters=Json::array(); for (const auto& waiter:queue) waiters.push_back({{"thread",waiter.tid},{"value",waiter.val},{"bitset",waiter.bitset},{"timeout",state.find_thread(waiter.tid) && state.find_thread(waiter.tid)->pending_syscall && state.find_thread(waiter.tid)->pending_syscall->deadline.has_value()},{"private",waiter.private_wait}});
     result["futex"].push_back({{"address",address},{"waiters",std::move(waiters)}});
   }
   return result.dump();

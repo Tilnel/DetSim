@@ -795,6 +795,12 @@ ssize_t FileSystemState::do_pipe_write(int fd, const void *buf, size_t count)
   // Read data from guest
   if (count > static_cast<size_t>(std::numeric_limits<ssize_t>::max()))
     return -EINVAL;
+  const size_t available = pipe_capacity - pipe.buffer.size();
+  if (count > pipe_atomic_limit && count > available &&
+      !(fd_manager_->get_status_flags(fd) & O_NONBLOCK))
+    throw std::runtime_error("Blocking pipe writes requiring partial progress are unsupported");
+  if (!available || (count <= pipe_atomic_limit && count > available)) return -EAGAIN;
+  count = std::min(count, available);
   std::vector<char> data(count);
   if (!guest_read_exact(ptmc_state.pids[ptmc_state.cursor], buf, data.data(), count))
     return -EFAULT;

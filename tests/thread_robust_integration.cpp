@@ -322,6 +322,17 @@ static void run(bool tiny) {
             auto replay = step(sys_state(before_exit.ss_hash), 1, SYS_exit);
             require(replay.ss_hash == exited.ss_hash && ptmc_state.thread_blocked[0][0] == stays_blocked,
                     "restored robust waiter lost wake semantics");
+            const auto& pending = replay.child[0].threads[0].pending_syscall;
+            require(pending && pending->phase == (stays_blocked ? PendingPhase::Waiting : PendingPhase::Ready),
+                    "robust cleanup lost pending wait phase");
+            if (!stays_blocked) {
+                auto completed = step(replay, 0, SYS_futex);
+                require(!completed.child[0].threads[0].pending_syscall && completed.child[0].si[0].rval == 0 &&
+                        completed.child[0].threads[0].regs.rip == replay.child[0].threads[0].regs.rip,
+                        "robust wake completion ran user instructions or lost success");
+                require(step(sys_state(replay.ss_hash), 0, SYS_futex).ss_hash == completed.ss_hash,
+                        "robust wake completion replay changed identity");
+            }
         }
         // exit_group must clean every logical owner, including a worker that
         // is stopped before its own SYS_exit. Restore the live branch afterward.

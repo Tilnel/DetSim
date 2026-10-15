@@ -9,7 +9,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define DETSIM_PLUGIN_ABI_V1 1u
+#define DETSIM_PLUGIN_ABI_V2 2u
 struct detsim_state_view;
 typedef enum detsim_verdict {
   DETSIM_PASS = 0, DETSIM_VIOLATION = 1,
@@ -26,14 +26,20 @@ typedef struct detsim_writer {
   int (*append)(void *context, const void *bytes, size_t length);
 } detsim_writer;
 typedef struct detsim_time { int64_t seconds; int32_t microseconds; } detsim_time;
-typedef struct detsim_event_v1 {
+typedef enum detsim_event_phase {
+  DETSIM_SYSCALL_BLOCKED = 1, DETSIM_SYSCALL_COMPLETED = 2,
+  DETSIM_EXECUTION_STOPPED = 3, DETSIM_THREAD_EXITED = 4
+} detsim_event_phase;
+typedef struct detsim_event_v2 {
   uint32_t process;
   uint32_t thread;
   int32_t syscall_number;
   int32_t choice;
   uint64_t args[6];
-  int64_t result;
-} detsim_event_v1;
+  int64_t result; // Valid only when result_valid != 0; zero otherwise.
+  uint32_t phase; // detsim_event_phase; only COMPLETED is a syscall return.
+  uint32_t result_valid;
+} detsim_event_v2;
 /* Read-only payload selectors. item is an endpoint key for TCP_PENDING and zero
  * otherwise; message indexes a TCP chunk/UDP datagram, zero for FILE/PIPE.
  * offset may equal the selected buffer size (EOF), but may not exceed it. */
@@ -46,7 +52,7 @@ typedef struct detsim_buffer_selector {
   int32_t fd;
   uint64_t item, message, offset;
 } detsim_buffer_selector;
-typedef struct detsim_host_v1 {
+typedef struct detsim_host_v2 {
   uint32_t abi_version;
   size_t (*process_count)(const struct detsim_state_view *);
   int (*read)(const struct detsim_state_view *, uint32_t process,
@@ -63,27 +69,27 @@ typedef struct detsim_host_v1 {
    * shorter than length at EOF. No descriptor offset or queue is consumed. */
   int (*read_buffer)(const struct detsim_state_view *, uint32_t process,
                      const detsim_buffer_selector *, void *destination, size_t length, size_t *copied);
-} detsim_host_v1;
-typedef struct detsim_time_choice_v1 {
+} detsim_host_v2;
+typedef struct detsim_time_choice_v2 {
   detsim_time value;
   uint32_t budget_cost;
-} detsim_time_choice_v1;
-typedef struct detsim_plugin_v1 {
+} detsim_time_choice_v2;
+typedef struct detsim_plugin_v2 {
   uint32_t abi_version;
   uint32_t struct_size;
   const char *id;
   uint32_t monitor_schema;
-  detsim_verdict (*check_state)(const detsim_host_v1 *, const struct detsim_state_view *, detsim_diagnostic);
-  detsim_verdict (*check_transition)(const detsim_host_v1 *, const struct detsim_state_view *, const struct detsim_state_view *, const detsim_event_v1 *, detsim_diagnostic);
-  detsim_verdict (*init_monitor)(const detsim_host_v1 *, const struct detsim_state_view *, const char *configuration, detsim_writer, detsim_diagnostic);
-  detsim_verdict (*advance_monitor)(const detsim_host_v1 *, const struct detsim_state_view *, const struct detsim_state_view *, const detsim_event_v1 *, detsim_bytes previous, detsim_writer next, detsim_diagnostic);
-  detsim_verdict (*choose_time)(const detsim_host_v1 *, const struct detsim_state_view *, uint32_t process, int32_t choice, detsim_time now, uint32_t budget, detsim_time_choice_v1 *, detsim_diagnostic);
+  detsim_verdict (*check_state)(const detsim_host_v2 *, const struct detsim_state_view *, detsim_diagnostic);
+  detsim_verdict (*check_transition)(const detsim_host_v2 *, const struct detsim_state_view *, const struct detsim_state_view *, const detsim_event_v2 *, detsim_diagnostic);
+  detsim_verdict (*init_monitor)(const detsim_host_v2 *, const struct detsim_state_view *, const char *configuration, detsim_writer, detsim_diagnostic);
+  detsim_verdict (*advance_monitor)(const detsim_host_v2 *, const struct detsim_state_view *, const struct detsim_state_view *, const detsim_event_v2 *, detsim_bytes previous, detsim_writer next, detsim_diagnostic);
+  detsim_verdict (*choose_time)(const detsim_host_v2 *, const struct detsim_state_view *, uint32_t process, int32_t choice, detsim_time now, uint32_t budget, detsim_time_choice_v2 *, detsim_diagnostic);
   /* Optional presentation only: 0 = unrecognized, 1 = decoded, -1 = error. */
   int (*describe_bytes)(detsim_bytes, detsim_writer);
-} detsim_plugin_v1;
-typedef const detsim_plugin_v1 *(*detsim_plugin_entry_v1_fn)(void);
+} detsim_plugin_v2;
+typedef const detsim_plugin_v2 *(*detsim_plugin_entry_v2_fn)(void);
 /* Each shared object exports exactly this entry point. */
-const detsim_plugin_v1 *detsim_plugin_entry_v1(void);
+const detsim_plugin_v2 *detsim_plugin_entry_v2(void);
 #ifdef __cplusplus
 }
 #endif

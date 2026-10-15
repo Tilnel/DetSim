@@ -233,9 +233,20 @@ static void run(bool tiny, bool clone3) {
         require(read_guest(pid, &child_word) == 0xaabbccdd00000000ULL &&
                 !ptmc_state.thread_blocked[0][0] && !exited.child[0].threads[1].alive,
                 "exit failed to clear 32 bits and wake join waiter");
-        auto joined = step(exited, 0, SYS_getpid);
+        const auto& pending_join = exited.child[0].threads[0].pending_syscall;
+        require(pending_join && pending_join->phase == PendingPhase::Ready &&
+                static_cast<int64_t>(exited.child[0].si[0].rval) == -ENOSYS,
+                "exit wake prematurely completed the join syscall");
+        auto completed = step(exited, 0, SYS_futex);
+        require(!completed.child[0].threads[0].pending_syscall && completed.child[0].si[0].rval == 0 &&
+                completed.child[0].threads[0].regs.rip == exited.child[0].threads[0].regs.rip,
+                "join completion must publish zero without running user instructions");
+        auto persisted_completion = step(sys_state(exited.ss_hash), 0, SYS_futex);
+        require(persisted_completion.ss_hash == completed.ss_hash,
+                "persisted ready join completion changed identity");
+        auto joined = step(completed, 0, SYS_getpid);
         require(read_guest(pid, &job).registration == 2, "guest saw wrong registration result");
-        for (const auto* saved : {&born, &waiting, &registered, &exited, &joined}) roundtrip(*saved);
+        for (const auto* saved : {&born, &waiting, &registered, &exited, &completed, &joined}) roundtrip(*saved);
         auto replay_started = step(sys_state(born.ss_hash), 1, SYS_gettid);
         require(replay_started.ss_hash == started.ss_hash, "pending CHILD_SETTID replay changed identity");
         auto replay_waiting = step(replay_started, 0, SYS_futex);

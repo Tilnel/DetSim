@@ -3,9 +3,9 @@
 #include <limits>
 #include <string>
 namespace {
-detsim_verdict choose_time(const detsim_host_v1 *host, const detsim_state_view *view,
+detsim_verdict choose_time(const detsim_host_v2 *host, const detsim_state_view *view,
  uint32_t node, int32_t choice, detsim_time now, uint32_t budget,
- detsim_time_choice_v1 *out, detsim_diagnostic diagnostic) {
+ detsim_time_choice_v2 *out, detsim_diagnostic diagnostic) {
   auto fail = [&](const char *message) {
     if (diagnostic.capacity) std::snprintf(diagnostic.data, diagnostic.capacity, "%s", message);
     return DETSIM_UNAVAILABLE;
@@ -35,7 +35,7 @@ detsim_verdict choose_time(const detsim_host_v1 *host, const detsim_state_view *
     return DETSIM_PASS;
   } catch (...) { return fail("timeout projection failed"); }
 }
-const detsim_plugin_v1 descriptor{DETSIM_PLUGIN_ABI_V1, sizeof(detsim_plugin_v1), RAFT_CHOICE_ID, 1,
+const detsim_plugin_v2 descriptor{DETSIM_PLUGIN_ABI_V2, sizeof(detsim_plugin_v2), RAFT_CHOICE_ID, 1,
   nullptr, nullptr, nullptr, nullptr, choose_time, nullptr};
 }
-extern "C" const detsim_plugin_v1 *detsim_plugin_entry_v1() { return &descriptor; }
+extern "C" const detsim_plugin_v2 *detsim_plugin_entry_v2() { return &descriptor; }

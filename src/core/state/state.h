@@ -5,6 +5,7 @@
 #ifndef __STATE_H
 #define __STATE_H
 
+#include "../engine/pending_syscall.h"
 #include "../engine/thread_manager.h"  // For MAX_THREADS_PER_PROCESS
 #include "../fs/fsstate.h"
 #include "../net/sockstate.h"
@@ -24,14 +25,14 @@ void clear_snapshot_thread_bindings();
  * State Data Format (shared with StateStore)
  * ====================================================================== */
 
-inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 21;
-inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 22;
+inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 23;
+inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 24;
 
 /* Packed to avoid alignment padding */
 struct __attribute__((packed)) StateDataHeader
 {
   uint32_t magic;         // 'DSTM' = 0x4453544D
-  uint32_t version;       // 21: flat; 22: pages (robust lists and virtual file mapping provenance)
+  uint32_t version;       // 23: flat; 24: pages (unfinished per-thread syscalls)
   uint32_t num_regions;   // number of memory regions
   uint64_t tstate_offset; // offset to serialized tracee_state
   uint64_t tstate_size;   // size of serialized tracee_state
@@ -94,6 +95,7 @@ struct thread_state
   uint64_t stack_addr;            // Stack address (for clone)
   pid_t ptid;                     // Parent thread TID
   bool is_main;                   // Whether this is the main thread
+  std::optional<PendingSyscall> pending_syscall; // Logical unfinished call
   uint64_t robust_list_head = 0;   // Logical native robust-list registration
   uint64_t signal_mask = 0;        // Linux native 64-signal blocked mask
   uint64_t clear_child_tid = 0;    // Logical set_tid_address / CLONE_CHILD_CLEARTID
@@ -114,7 +116,14 @@ struct thread_state
        regs.rsp, regs.ss, regs.fs_base, regs.gs_base, regs.ds, regs.es,
        regs.fs, regs.gs, clone_flags, stack_addr, ptid, is_main, xstate,
        clear_child_tid, pending_child_settid, child_settid_pending, signal_mask, robust_list_head);
-    if constexpr (Archive::is_loading::value) physical_tid = 0;
+    bool pending = pending_syscall.has_value();
+    ar(pending);
+    if constexpr (Archive::is_loading::value) {
+      if (pending) pending_syscall.emplace();
+      else pending_syscall.reset();
+      physical_tid = 0;
+    }
+    if (pending) ar(*pending_syscall);
   }
 };
 

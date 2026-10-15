@@ -14,7 +14,7 @@ struct Unavailable : std::runtime_error { using std::runtime_error::runtime_erro
 struct Violation : std::runtime_error { using std::runtime_error::runtime_error; };
 using View = const detsim_state_view *;
 struct Reader {
-  const detsim_host_v1 *host;
+  const detsim_host_v2 *host;
   View view;
   unsigned node;
   int64_t eval(const std::string &expression) const {
@@ -39,7 +39,7 @@ struct Node {
   std::map<int64_t, int64_t> logs, match;
 };
 using Projection = std::vector<Node>;
-Projection project(const detsim_host_v1 *host, View view) {
+Projection project(const detsim_host_v2 *host, View view) {
   Projection nodes(host->process_count(view));
   for (unsigned i = 0; i < nodes.size(); ++i) {
     Reader r{host, view, i}; auto &n = nodes[i];
@@ -173,13 +173,13 @@ template<class F> detsim_verdict guarded(detsim_diagnostic diagnostic, F action)
   catch (const std::exception &e) { if (diagnostic.capacity) std::snprintf(diagnostic.data, diagnostic.capacity, "%s", e.what()); return DETSIM_UNAVAILABLE; }
   catch (...) { return DETSIM_ERROR; }
 }
-detsim_verdict init(const detsim_host_v1 *host, View view, const char *, detsim_writer out, detsim_diagnostic diagnostic) {
+detsim_verdict init(const detsim_host_v2 *host, View view, const char *, detsim_writer out, detsim_diagnostic diagnostic) {
   return guarded(diagnostic, [&] { auto nodes = project(host, view); state_properties(nodes); History history; observe(history, nodes); encode(history, out); });
 }
-detsim_verdict advance(const detsim_host_v1 *host, View before, View after, const detsim_event_v1 *, detsim_bytes previous, detsim_writer out, detsim_diagnostic diagnostic) {
+detsim_verdict advance(const detsim_host_v2 *host, View before, View after, const detsim_event_v2 *, detsim_bytes previous, detsim_writer out, detsim_diagnostic diagnostic) {
   return guarded(diagnostic, [&] { auto a = project(host, before), b = project(host, after); state_properties(b); edge_properties(a, b); auto history = decode(previous); observe(history, b); encode(history, out); });
 }
-const detsim_plugin_v1 descriptor{DETSIM_PLUGIN_ABI_V1, sizeof(detsim_plugin_v1), RAFT_PLUGIN_ID, 1,
+const detsim_plugin_v2 descriptor{DETSIM_PLUGIN_ABI_V2, sizeof(detsim_plugin_v2), RAFT_PLUGIN_ID, 1,
   nullptr, nullptr, init, advance, nullptr, nullptr};
 }
-extern "C" const detsim_plugin_v1 *detsim_plugin_entry_v1() { return &descriptor; }
+extern "C" const detsim_plugin_v2 *detsim_plugin_entry_v2() { return &descriptor; }

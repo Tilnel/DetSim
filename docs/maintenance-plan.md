@@ -897,3 +897,64 @@ PI/timed futexes, cancellation, asynchronous delivery, full rseq semantics,
 mutable file coherence, broader madvise behavior, process trees and exhaustive
 thread/shared-memory interleavings. Successful pthread scenarios certify their
 controlled paths, not unrestricted pthread or Go runtime support.
+
+## Generic pending syscall verification (2026-10-16)
+
+Product changes: engine/pending_syscall owns Waiting/Retry/Ready, immutable call
+arguments, captured normalized deadlines and explicit completion; pending_io
+adapts existing resource emulators and descriptor lifetime guards. Scheduler and
+snapshot paths derive blocking from the saved pending state. Futex's duplicate
+timeout flag and CLI's ad-hoc blocked rollback are removed. Event observation is
+ABI2 (including nonreturning crash/exit phases), with matching example plugins.
+Normal supported process exit closes descriptors so peer reads can complete EOF.
+No new dependency or target-runtime-private extraction was introduced.
+
+RED: a real futex WAIT exposed return0 before wake/completion. The initial Redis
+gate additionally demonstrated that finite epoll waits need captured pending
+state rather than a fabricated timeout or unconditional unsupported path.
+
+With CC=/usr/bin/gcc and CXX=/usr/bin/g++:
+- `make check` passes nine component and ten build-contract tests.
+- NP1 `check-pending-syscall` passes full/pages x normal/tiny: real ptrace WAIT,
+  frozen arguments/deadline, wake vs explicit expiry, Ready and completion disk
+  replay, no user instruction on completion, real sleep registration and replay.
+- NP1 futex13, futex-snapshot, thread TID8, robust4, lifecycle4, signal-mask8,
+  control/carrier/identity, exec, state-io, mappings and page-snapshot gates pass.
+  Old fixtures now represent coherent waiting syscalls instead of isolated queues.
+- NP2 `check-pending-io` covers blocking/nonblocking read/write, capacity/atomic
+  pipe writes, accept4 flags, TCP/UDP and epoll readiness, copied17ns pwait2
+  deadlines, descriptor mutation rejection and explicit expiry. Blocking writes
+  requiring partial in-flight progress reject before mutation.
+- NP2 `check-pending-io-snapshot` passes four backend/cache variants: whole-system
+  waiting/retry/completion persistence, cross-node TCP delivery, no duplicate
+  consumption, competing driver read, output-page EFAULT, sender final-thread/
+  exit_group EOF and repeated before/after-exit branch replay.
+- NP2 capture/identity/state-view/plugins/runtime-profile/syscall-policy/
+  process-state/io-boundary/accept/Redis gates pass. Additional malformed snapshot
+  test rejects pending IO with no retained descriptor. ABI1 is explicitly rejected.
+- Seventeen native tracer scenarios pass, including a phase-checking ABI2 plugin
+  over real pthread/pipe blocking and a fatal instruction stop. Pending CLI output
+  never displays the internal placeholder as a completed return.
+- Strict GCC diagnostics on changed core/IO and native fixtures pass; unused
+  parameter warnings from old handlers are excluded in the combined invocation.
+  Independent architectural/final review and git diff --check pass.
+- NP1/NP2/NP3 production builds pass. Raft depth8 full/pages both visit1,511 states
+  with782new; single-run throughput366/486 states/s. Artifacts
+  build/pending-syscall-raft{,-pages}. Prior semantics visited2,582/1,347: this is a
+  changed transition system, so reduced elapsed time is not an optimization claim.
+  Equal counts do not establish exhaustive exploration equivalence.
+
+Fresh verification logs: /tmp/detsim-pending-validated-np{1,2}.log,
+/tmp/detsim-pending-release-np{1,2}.log, /tmp/detsim-pending-release-check.log,
+/tmp/detsim-pending-release-scenarios.log, /tmp/detsim-pending-validated-syntax.log.
+Source timestamps were refreshed for a final controlled rebuild after agent edits
+so linked verification does not depend on objects compiled during source changes.
+
+Scope: no automatic time advancement or expiry/actor/outcome choice policy.
+Pending descriptors cannot be concurrently closed/rebound; pinned resource
+identity is future work. Pending UDP retry currently chooses the first datagram.
+TCP send queues remain unbounded; unread-data reset, unaccepted-server-exit reset,
+fatal-crash teardown, partial-progress blocking writes, poll/select/vector IO,
+signals/cancellation and independent realtime/monotonic axes remain scoped gaps.
+Snapshot versions23/24 and kernel modelv10 encode the new semantic state; plugins
+must rebuild for detsim_plugin_entry_v2 and honor event phase/result_valid.

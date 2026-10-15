@@ -1246,6 +1246,53 @@ int SockState::do_epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
   return 0;
 }
 
+uint32_t SockState::ready_events(int fd, int node) const
+{
+  uint32_t ready = 0;
+  const Socket *socket = get_socket(fd);
+  if (socket) {
+    if (socket->type == SOCK_DGRAM) {
+      if (get_udp_buffer_size(fd)) ready |= EPOLLIN;
+      ready |= EPOLLOUT;
+    } else if (socket->listening) {
+      if (!socket->pending_connections.empty()) ready |= EPOLLIN;
+    } else if (socket->connected) {
+      auto connection = tcp_connections_.find(fd);
+      if (connection != tcp_connections_.end()) {
+        const auto &queue = connection->second.recv_buffer;
+        if (!queue.empty()) ready |= EPOLLIN;
+        if (!queue.empty() && queue.back().empty()) ready |= EPOLLRDHUP;
+        ready |= EPOLLOUT;
+      }
+    }
+  } else {
+    const auto &fs = ptmc_state.fs_states[node];
+    auto pipe_fd = fs.pipe_fds_.find(fd);
+    if (pipe_fd != fs.pipe_fds_.end()) {
+      auto pipe = fs.pipes_.find(std::abs(pipe_fd->second));
+      if (pipe != fs.pipes_.end()) {
+        if (pipe_fd->second > 0) {
+          if (!pipe->second.buffer.empty() || pipe->second.write_closed) ready |= EPOLLIN;
+          if (pipe->second.write_closed) ready |= EPOLLHUP;
+        } else {
+          if (pipe->second.read_closed) ready |= EPOLLERR;
+          else if (pipe->second.buffer.size() < FileSystemState::pipe_capacity) ready |= EPOLLOUT;
+        }
+      }
+    }
+  }
+  return ready;
+}
+
+bool SockState::epoll_ready(int epfd, int node) const
+{
+  const auto it = epoll_instances_.find(epfd);
+  if (it == epoll_instances_.end()) return true; // Retry produces EBADF.
+  for (const auto &[fd, watch] : it->second.watched_fds)
+    if (ready_events(fd, node) & (watch.events | EPOLLERR | EPOLLHUP)) return true;
+  return false;
+}
+
 int SockState::do_epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)
 {
   (void)timeout; // Blocking/time progression remains part of the scheduling profile.
@@ -1255,39 +1302,7 @@ int SockState::do_epoll_wait(int epfd, struct epoll_event *events, int maxevents
   std::vector<epoll_event> output;
   for (const auto &[fd, watch] : it->second.watched_fds) {
     if (int(output.size()) >= maxevents) break;
-    uint32_t ready = 0;
-    const Socket *socket = get_socket(fd);
-    if (socket) {
-      if (socket->type == SOCK_DGRAM) {
-        if (get_udp_buffer_size(fd)) ready |= EPOLLIN;
-        ready |= EPOLLOUT;
-      } else if (socket->listening) {
-        if (!socket->pending_connections.empty()) ready |= EPOLLIN;
-      } else if (socket->connected) {
-        auto connection = tcp_connections_.find(fd);
-        if (connection != tcp_connections_.end()) {
-          const auto &queue = connection->second.recv_buffer;
-          if (!queue.empty()) ready |= EPOLLIN;
-          if (!queue.empty() && queue.back().empty()) ready |= EPOLLRDHUP;
-          ready |= EPOLLOUT;
-        }
-      }
-    } else {
-      const auto &fs = ptmc_state.fs_states[ptmc_state.cursor];
-      auto pipe_fd = fs.pipe_fds_.find(fd);
-      if (pipe_fd != fs.pipe_fds_.end()) {
-        auto pipe = fs.pipes_.find(std::abs(pipe_fd->second));
-        if (pipe != fs.pipes_.end()) {
-          if (pipe_fd->second > 0) {
-            if (!pipe->second.buffer.empty() || pipe->second.write_closed) ready |= EPOLLIN;
-            if (pipe->second.write_closed) ready |= EPOLLHUP;
-          } else {
-            if (pipe->second.read_closed) ready |= EPOLLERR;
-            else ready |= EPOLLOUT;
-          }
-        }
-      }
-    }
+    uint32_t ready = ready_events(fd, ptmc_state.cursor);
     ready &= watch.events | EPOLLERR | EPOLLHUP;
     if (ready) {
       epoll_event event{};
@@ -1465,4 +1480,15 @@ int emu_getsockopt(int sockfd, int level, int optname, void *optval,
   socklen_t actual = std::min<size_t>(capacity, sizeof(value));
   if (!guest_write_exact(pid, optlen, &actual, sizeof(actual))) return -EFAULT;
   return 0;
+}
+
+int emu_accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags)
+{
+  if (flags & ~(SOCK_NONBLOCK | SOCK_CLOEXEC)) return -EINVAL;
+  const int fd = emu_accept(sockfd, addr, addrlen);
+  if (fd < 0) return fd;
+  auto& manager = *ptmc_state.fd_managers[ptmc_state.cursor];
+  if (flags & SOCK_NONBLOCK) manager.do_fcntl(fd, F_SETFL, O_NONBLOCK);
+  if (flags & SOCK_CLOEXEC) manager.do_fcntl(fd, F_SETFD, FD_CLOEXEC);
+  return fd;
 }

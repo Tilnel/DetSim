@@ -1,4 +1,6 @@
 #include "thread_pool.h"
+#include "pending_syscall.h"
+#include "pending_io.h"
 #include "thread_carrier.h"
 #include "thread_control.h"
 #include "thread_manager.h"
@@ -247,19 +249,20 @@ void clear_logical_tid(int node, tracee_state& state, thread_state& thread)
   }
   write_thread_signal_mask(thread.physical_tid, 0);
   thread.signal_mask = 0;
+  thread.pending_syscall.reset();
   thread.robust_list_head = 0;
   thread.clear_child_tid = 0;
   thread.child_settid_pending = false;
   thread.pending_child_settid = 0;
   if (state.futex_state) {
     state.futex_state->wake_thread(thread.tid);
-    for (size_t i = 0; i < state.threads.size(); ++i)
-      ptmc_state.thread_blocked[node][i] = state.futex_state->is_thread_waiting(state.threads[i].tid);
+    refresh_futex_pending(node);
   }
 }
 
 void validate_bound_slots(const CarrierPool& pool, const tracee_state& state)
 {
+  validate_pending_syscalls(state);
   if (state.threads.empty() || state.main_tid != 1 || !state.threads.front().is_main)
     throw std::runtime_error("Thread pool requires logical slot 1 as its unique main thread");
   std::set<pid_t> occupied;
@@ -658,6 +661,9 @@ bool exit_logical_thread(int node, pid_t physical_tid, int exit_code)
   const auto found = std::find_if(state.threads.begin(), state.threads.end(),
       [physical_tid](const thread_state& thread) { return thread.alive && thread.physical_tid == physical_tid; });
   if (found == state.threads.end()) throw std::runtime_error("Logical exit has no live owned thread");
+  const bool last = std::none_of(state.threads.begin(), state.threads.end(),
+      [&found](const thread_state& thread) { return &thread != &*found && thread.alive; });
+  if (last) preflight_process_io_exit(node);
   if (query_clear_child_tid(physical_tid))
     throw std::runtime_error("Thread carrier has unadopted inherited clear_child_tid registration");
   RobustExitPlan robust_plan(physical_tid);
@@ -677,9 +683,10 @@ bool exit_logical_thread(int node, pid_t physical_tid, int exit_code)
   found->physical_tid = 0;
   ptmc_state.thread_exited[node][slot] = true;
   ptmc_state.thread_blocked[node][slot] = false;
-  const bool last = std::none_of(state.threads.begin(), state.threads.end(),
-      [](const thread_state& thread) { return thread.alive; });
-  if (last) ptmc_state.status[node] = dstatus_exit(exit_code);
+  if (last) {
+    close_process_io(node);
+    ptmc_state.status[node] = dstatus_exit(exit_code);
+  }
   return last;
 }
 
@@ -691,6 +698,7 @@ void exit_logical_process(int node, pid_t caller, int exit_code)
   if (std::none_of(state.threads.begin(), state.threads.end(),
       [caller](const thread_state& thread) { return thread.alive && thread.physical_tid == caller; }))
     throw std::runtime_error("Logical process exit has no live owned caller");
+  preflight_process_io_exit(node);
   // Preflight the entire group with an overlay of the stores that earlier
   // exits perform, including aliased child-settid and clear-tid addresses.
   RobustExitPlan robust_plan(caller);
@@ -726,5 +734,6 @@ void exit_logical_process(int node, pid_t caller, int exit_code)
     ptmc_state.thread_blocked[node][i] = false;
     ptmc_state.thread_exited[node][i] = true;
   }
+  close_process_io(node);
   ptmc_state.status[node] = dstatus_exit(exit_code);
 }

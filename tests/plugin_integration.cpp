@@ -66,7 +66,7 @@ int main(int argc, char **argv) {
       require(a.monitor_states.size() == 1 && a.monitor_states.begin()->second == std::vector<uint8_t>{0}, "monitor init");
       auto original = a.monitor_states;
       auto b = state(11, pages), c = state(12, !pages);
-      detsim_event_v1 event{}; event.choice = 1;
+      detsim_event_v2 event{}; event.choice = 1;
       require(!detsim::plugins::check_transition(a, b, event), "forward violation");
       event.choice = 2; require(!detsim::plugins::check_transition(a, c, event), "branch violation");
       require(b.monitor_states.begin()->second == std::vector<uint8_t>{1} && c.monitor_states.begin()->second == std::vector<uint8_t>{2} && a.monitor_states == original, "monitor branches alias");
@@ -109,7 +109,7 @@ int main(int argc, char **argv) {
     initial_partial.ts_hash[0] = 0; // terminal marks survive inspection, no callbacks
     require(detsim::plugins::check_initial(initial_partial) && initial_partial.property_failed,
       "terminal property failure was cleared");
-    auto forbidden_next = state(11, true); detsim_event_v1 terminal_event{};
+    auto forbidden_next = state(11, true); detsim_event_v2 terminal_event{};
     rejects([&] { detsim::plugins::check_transition(initial_partial, forbidden_next, terminal_event); },
       "terminal property source accepted");
     // Presentation plugins cannot change semantic context or monitor identity.

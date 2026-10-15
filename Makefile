@@ -9,12 +9,12 @@ ifneq ($(filter benchmark-redisraft,$(MAKECMDGOALS)),)
 NP ?= 3
 endif
 
-ifneq ($(filter check-accept check-redis check-port check-identity check-capture check-io-boundary check-state-view check-plugins check-runtime-profile check-syscall-policy check-process-state,$(MAKECMDGOALS)),)
+ifneq ($(filter check-accept check-redis check-port check-identity check-capture check-io-boundary check-state-view check-plugins check-runtime-profile check-syscall-policy check-process-state check-pending-io check-pending-io-snapshot,$(MAKECMDGOALS)),)
 NP ?= 2
 endif
 
 # Integration fixtures use one node unless explicitly overridden.
-ifneq ($(filter check-integration check-dwarf check-elf check-scenarios check-xstate check-exec check-state-io check-mappings check-futex-snapshot check-futex check-thread-control check-thread-identity check-thread-carrier check-thread-lifecycle check-thread-tid check-thread-signal-mask check-thread-robust check-storage check-store-cache check-store-packed check-store-metadata check-store-tools benchmark-storage check-soft-dirty check-page-snapshot,$(MAKECMDGOALS)),)
+ifneq ($(filter check-integration check-dwarf check-elf check-scenarios check-xstate check-exec check-state-io check-mappings check-futex-snapshot check-futex check-thread-control check-thread-identity check-thread-carrier check-thread-lifecycle check-thread-tid check-thread-signal-mask check-thread-robust check-pending-syscall check-storage check-store-cache check-store-packed check-store-metadata check-store-tools benchmark-storage check-soft-dirty check-page-snapshot,$(MAKECMDGOALS)),)
 NP ?= 1
 endif
 
@@ -45,10 +45,10 @@ SRCS = src/main.cpp\
        src/core/scheduler/exploration.cpp \
        src/core/dwarf.cpp src/core/plugins.cpp src/core/runtime_profile.cpp src/core/state/state_view.cpp \
        src/core/state/state.cpp src/core/state/page_snapshot.cpp src/core/state/page_capture.cpp src/core/state/xstate.cpp src/core/state/state_store.cpp src/core/state/state_store_packed.cpp src/core/state/sysstate_store.cpp src/core/state/state_transition.cpp src/core/state/serialize.cpp \
-       src/core/engine/thread_manager.cpp src/core/engine/thread_control.cpp src/core/engine/thread_carrier.cpp src/core/engine/thread_pool.cpp src/core/engine/signal_handler.cpp src/core/engine/exec_engine.cpp \
+       src/core/engine/pending_syscall.cpp src/core/engine/thread_manager.cpp src/core/engine/thread_control.cpp src/core/engine/thread_carrier.cpp src/core/engine/thread_pool.cpp src/core/engine/signal_handler.cpp src/core/engine/exec_engine.cpp \
        src/core/syscall/dispatcher.cpp src/core/syscall/handlers.cpp \
        src/subsys/net/sockstate.cpp src/subsys/net/emu.cpp \
-       src/subsys/fs/fsstate.cpp src/subsys/fs/fd_manager.cpp src/subsys/io.cpp \
+       src/subsys/fs/fsstate.cpp src/subsys/fs/fd_manager.cpp src/subsys/io.cpp src/subsys/pending_io.cpp \
        src/subsys/sync/futexstate.cpp src/subsys/process/process_state.cpp \
        src/utils/utils.cpp src/utils/expr.cpp src/utils/expr_ast.cpp \
        src/utils/expr_lexer.cpp src/utils/expr_parser.cpp \
@@ -116,7 +116,7 @@ check-build-contracts:
 check: test check-build-contracts
 
 # Optional fragments are absent in the disposable build-contract fixtures.
--include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk tests/futex_snapshot.mk tests/futex.mk tests/storage.mk tests/store_cache.mk tests/store_packed.mk tests/redisraft.mk tests/capture.mk tests/soft_dirty.mk tests/page_snapshot.mk tests/io_boundary.mk tests/framework.mk tests/runtime_profile.mk tests/syscall_policy.mk tests/process_state.mk tests/thread_control.mk tests/thread_identity.mk tests/thread_carrier.mk tests/thread_lifecycle.mk tests/thread_tid.mk tests/thread_signal_mask.mk tests/thread_robust.mk
+-include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk tests/futex_snapshot.mk tests/futex.mk tests/storage.mk tests/store_cache.mk tests/store_packed.mk tests/redisraft.mk tests/capture.mk tests/soft_dirty.mk tests/page_snapshot.mk tests/io_boundary.mk tests/framework.mk tests/runtime_profile.mk tests/syscall_policy.mk tests/process_state.mk tests/thread_control.mk tests/thread_identity.mk tests/thread_carrier.mk tests/thread_lifecycle.mk tests/thread_tid.mk tests/thread_signal_mask.mk tests/thread_robust.mk tests/pending_syscall.mk tests/pending_io.mk tests/pending_io_snapshot.mk
 check-integration: check-dwarf check-elf
 
 # This gate executes native programs via ptrace; keep it separate from make check.

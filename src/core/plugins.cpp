@@ -20,7 +20,7 @@ namespace {
 constexpr size_t max_blob = 64 * 1024 * 1024;
 struct Module {
   void *handle;
-  const detsim_plugin_v1 *api;
+  const detsim_plugin_v2 *api;
   std::string configuration, key;
   ~Module() { dlclose(handle); }
 };
@@ -53,7 +53,7 @@ int read_buffer(const detsim_state_view* v, uint32_t node, const detsim_buffer_s
     return 0;
   } catch (...) { return -1; }
 }
-const detsim_host_v1 host{DETSIM_PLUGIN_ABI_V1, process_count, read, evaluate, get_time, nullptr, inspect_json, read_buffer};
+const detsim_host_v2 host{DETSIM_PLUGIN_ABI_V2, process_count, read, evaluate, get_time, nullptr, inspect_json, read_buffer};
 struct Output {
   std::vector<uint8_t> bytes;
   bool failed = false;
@@ -115,18 +115,18 @@ std::string fingerprint(const std::string &path, const std::string &configuratio
 }
 void load(const std::string &path, const std::string &configuration) {
   if (path.size() < 3 || path.substr(path.size() - 3) != ".so")
-    throw std::runtime_error("plugin must be an explicitly built .so exporting detsim_plugin_entry_v1; compile-on-load/legacy check() is unsupported: " + path);
+    throw std::runtime_error("plugin must be an explicitly built .so exporting detsim_plugin_entry_v2; compile-on-load/legacy check() is unsupported: " + path);
   auto hash = fingerprint(path, configuration);
   void *handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (!handle) throw std::runtime_error("cannot load plugin " + path + ": " + dlerror());
   auto close_handle = [](void *p) { dlclose(p); };
   auto close_on_error = std::unique_ptr<void, decltype(close_handle)>(handle, close_handle);
   dlerror();
-  auto entry = reinterpret_cast<detsim_plugin_entry_v1_fn>(dlsym(handle, "detsim_plugin_entry_v1"));
+  auto entry = reinterpret_cast<detsim_plugin_entry_v2_fn>(dlsym(handle, "detsim_plugin_entry_v2"));
   const char *error = dlerror();
-  if (error || !entry) throw std::runtime_error("plugin lacks detsim_plugin_entry_v1 (legacy plugins must be rebuilt): " + path);
+  if (error || !entry) throw std::runtime_error("plugin lacks detsim_plugin_entry_v2 (legacy plugins must be rebuilt): " + path);
   const auto *api = entry();
-  if (!api || api->abi_version != DETSIM_PLUGIN_ABI_V1 || api->struct_size != sizeof(detsim_plugin_v1) || !api->id || !*api->id || strlen(api->id) > 128)
+  if (!api || api->abi_version != DETSIM_PLUGIN_ABI_V2 || api->struct_size != sizeof(detsim_plugin_v2) || !api->id || !*api->id || strlen(api->id) > 128)
     throw std::runtime_error("invalid plugin ABI/descriptor: " + path);
   if (bool(api->init_monitor) != bool(api->advance_monitor))
     throw std::runtime_error("plugin requires both init_monitor and advance_monitor: " + path);
@@ -180,7 +180,7 @@ bool check_initial(sys_state &state) {
   if (!initialized) state.monitor_states = std::move(next);
   return violation;
 }
-bool check_transition(const sys_state &before, sys_state &after, const detsim_event_v1 &event) {
+bool check_transition(const sys_state &before, sys_state &after, const detsim_event_v2 &event) {
   if (before.property_failed) throw std::runtime_error("cannot advance a terminal property failure");
   bool violation = false;
   validate_context(before);
@@ -206,12 +206,12 @@ bool check_transition(const sys_state &before, sys_state &after, const detsim_ev
   after.monitor_states = std::move(next);
   return violation;
 }
-detsim_time_choice_v1 choose_time(const StateView &view, unsigned node, int choice, timeval now, unsigned budget) {
+detsim_time_choice_v2 choose_time(const StateView &view, unsigned node, int choice, timeval now, unsigned budget) {
   if (node >= view.process_count() || choice < 0) throw std::runtime_error("invalid time-choice process/choice");
   detsim_state_view v{&view};
   for (const auto &m : modules) if (m->api->choose_time) {
     auto module_host = host; module_host.configuration = m->configuration.c_str();
-    Diagnostic d; detsim_time_choice_v1 result{};
+    Diagnostic d; detsim_time_choice_v2 result{};
     if (require_pass(*m, m->api->choose_time(&module_host, &v, node, choice, {now.tv_sec, static_cast<int32_t>(now.tv_usec)}, budget, &result, d.argument()), d))
       throw std::runtime_error("time-choice policy returned a property violation");
     if (result.value.seconds < now.tv_sec || result.value.microseconds < 0 || result.value.microseconds >= 1000000 ||
