@@ -118,3 +118,5 @@
 
 !thread_altstack_integration.cpp
 !thread_altstack.mk
+
+!dfs_residency.py

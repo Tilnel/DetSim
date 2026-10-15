@@ -23,6 +23,7 @@ make help
 make check
 make check-storage       # storage faults/concurrency/reopen + read-only tools; NP=1
 make check-integration   # production DWARF/ELF fixtures; default NP=1
+make check-dfs-residency # NP=1 bounded ancestor memory, branching and replay
 make check-cases         # NP=1 healthy/mutant counterexamples and replay
 make audit-runtimes      # NP=1 language admission; reports unsupported cases as failures
 make check-scenarios     # build NP=1 tracer and run isolated native ptrace scenarios

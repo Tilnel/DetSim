@@ -1126,3 +1126,25 @@ iteration2-cases-final,iteration2-check}.log. Python allocation census:
 build/cases/python-memory-debug-qtd8mky7/gdb.log. Rootfs bytes59262067/1408 entries
 are fixed inputs; ~30 duplicate large buffers prove live-ownership growth. Next
 slice releases DFS ancestor resident state while preserving hashes/search order.
+
+## DFS ancestor residency (2026-10-16)
+
+Plan before edits: retain ancestor hash/search bookkeeping, release fully loaded
+payload ownership on descent, reload only for actual backtracking; preserve
+choice/state1/2/3 ordering and avoid new global interning. RED on actual CLI with
+64MiB VFS and2GiB cap; old small DFS and large BFS pass, old large DFS fails in
+both backends. GDB allocation census showed30 identical large-file buffers.
+
+Implementation: optional DFSFrame resident state, reset after successor capture
+and parent bookkeeping, lazy reconstruction in states1/2. Generic deserialize
+error includes original cause. Historical recursive DFS is unchanged and not the
+CLI execution path. No snapshot format or guest semantics change.
+
+GREEN: tests/dfs_residency.py against immutable production NP1 binary, eight
+full/pages×small/large×BFS/DFS searches; every graph81unique/80actualtransition
+multiset/fourbranches. Mutation and terminal predecessor each3x exacthash replay.
+Artifact build/dfs-residency-green/report.json; RED build/dfs-residency-red-full
+and build/dfs-residency-red2. Python full/pages now reach217 with same2GiB cap:
+build/cases/run-r0hsdkcb/results.json. make check passes, Python compile/diffcheck
+pass, production NP1 build passes; independent architect review approves. Scope
+is this finite NP1 equivalence and replay, not arbitrary scheduling completeness.

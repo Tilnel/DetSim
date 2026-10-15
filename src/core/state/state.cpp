@@ -332,6 +332,8 @@ tracee_state::tracee_state(hash_type hash)
     if (encoded.peek() != std::char_traits<char>::eof())
       throw std::runtime_error("Trailing tracee metadata bytes");
     validate_io_state();
+  } catch (const std::exception& error) {
+    throw std::runtime_error(std::string("Failed to deserialize tracee_state snapshot: ") + error.what());
   } catch (...) {
     throw std::runtime_error("Failed to deserialize tracee_state snapshot");
   }

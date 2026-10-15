@@ -53,7 +53,7 @@ runner 只依赖 Python 标准库及已有编译器。不会下载依赖、修�
 | C++ std | GCC14.2 | 通过 | 标记及退出0，搜索完成 |
 | Rust std | rustc1.51.0 | 通过 | full/pages 已完成输出检查及退出0 |
 | Go | gccgo14.2（非标准 gc） | 通过 | pages 推进到 `pselect6`；full 仍有内存分配失败 |
-| Python | CPython3.13.5，`-I -S` | 通过 | 已捕获标准库；DFS 祖先重复持有文件内容导致内存失败，正在修复 |
+| Python | CPython3.13.5，`-I -S` | 通过 | 已捕获标准库；DFS 内存回退已修复，下一阻塞为 getdents64(217) |
 | Java | OpenJDK21.0.12.1 | 通过 | 已越过 F_OK 查询，当前停在普通符号链接遍历；依用户取舍为条件目标 |
 
 这些版本是本机实测，不代表整个语言、其他版本或所有库已受支持。Java 保留正常 JVM/JIT，只显式限制 heap/code cache/class space；没有把 JVM 私有结构补丁放进框架。标准 gc Go 的单独准入目标尚待可用工具链；不能用 gccgo 结果代替它。
@@ -93,3 +93,9 @@ runner 只依赖 Python 标准库及已有编译器。不会下载依赖、修�
 当前格式flat27/pages28、kernelv13。runtime runner 为 Python/JDK 保存显式
 rootfs manifest及输入哈希；解释器性质使用协议观察，不假定DWARF能解释对象堆。
 Java若需要重大JVM私有机制工作，可以保留为明确未通过的研究目标；不可伪造通过。
+
+
+DFS 不再为每层祖先长期持有完整文件系统内容。64MiB VFS、44步前缀及晚分叉
+回归在不变的2GiB限额下完成八组BFS/DFS对照，均81个唯一状态、80条转换、
+四个终态，修改边与终端边均三次重放；未改 visited/选择策略。Python实际运行
+已越过旧内存失败，继续暴露目录枚举接口缺口。

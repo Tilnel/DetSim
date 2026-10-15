@@ -33,6 +33,7 @@ extern "C" detsim::ui::NCursesUI *get_ncurses_ui();
 #include <cstddef>
 #include <cstdlib>
 #include <fcntl.h>
+#include <optional>
 #include <random>
 #include <readline/readline.h>
 #include <signal.h>
@@ -755,7 +756,7 @@ struct DFSFrame
   int depth;
   int i;
   int state;
-  sys_state s;
+  std::optional<sys_state> s;
   std::vector<int> indexes;
   size_t index_pos;
   std::vector<int> choices;
@@ -958,12 +959,12 @@ int do_dfs_iterative(hash_type initial_ss_hash, int initial_depth)
         continue;
       }
 
-      frame.s = sys_state(frame.ss_hash);
+      frame.s.emplace(frame.ss_hash);
       for (int j = 0; j < NP; j++)
       {
-        ptmc_state.status[j] = frame.s.status[j];
+        ptmc_state.status[j] = frame.s->status[j];
         frame.indexes.push_back(j);
-        if (frame.s.ts_hash[j] == 0)
+        if (frame.s->ts_hash[j] == 0)
         {
           LOG_CRIT(
               "Child state hash is 0 for tracee %d. This should not happen if "
@@ -990,7 +991,9 @@ int do_dfs_iterative(hash_type initial_ss_hash, int initial_depth)
       int i = frame.indexes[frame.index_pos];
       frame.i = i;
 
-      if (DISDEAD(frame.s.status[i]))
+      if (!frame.s)
+        frame.s.emplace(frame.ss_hash);
+      if (DISDEAD(frame.s->status[i]))
       {
         frame.index_pos++;
         continue;
@@ -1010,10 +1013,12 @@ int do_dfs_iterative(hash_type initial_ss_hash, int initial_depth)
     if (frame.state == 2)
     {
       int i = frame.i;
+      if (!frame.s)
+        frame.s.emplace(frame.ss_hash);
 
       for (int j = 0; j < NP; j++)
       {
-        ptmc_state.status[j] = frame.s.status[j];
+        ptmc_state.status[j] = frame.s->status[j];
       }
       g_restore_count++;
       g_states_searched = states_searched_this_run;
@@ -1027,7 +1032,7 @@ int do_dfs_iterative(hash_type initial_ss_hash, int initial_depth)
         frame.choices.pop_back();
       }
 
-      TransitionResult result = state_transition(frame.s, i);
+      TransitionResult result = state_transition(*frame.s, i);
       poll_status_monitor();
       g_save_time_us += result.save_time.count();
       g_restore_time_us += result.restore_time.count();
@@ -1081,6 +1086,9 @@ int do_dfs_iterative(hash_type initial_ss_hash, int initial_depth)
         new_frame.i = 0;
         new_frame.state = 0;
         new_frame.index_pos = 0;
+        // Ancestors need only their identity and pending search choices while
+        // descendants run. Reopen persisted state when backtracking needs it.
+        frame.s.reset();
         stack.push_back(std::move(new_frame));
         continue;
       }

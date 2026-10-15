@@ -14,7 +14,7 @@ NP ?= 2
 endif
 
 # Integration fixtures use one node unless explicitly overridden.
-ifneq ($(filter check-integration check-dwarf check-elf check-scenarios check-cases audit-runtimes check-xstate check-exec check-state-io check-mappings check-futex-snapshot check-futex check-thread-control check-thread-identity check-thread-carrier check-thread-lifecycle check-thread-tid check-thread-signal-mask check-thread-robust check-pending-syscall check-storage check-store-cache check-store-packed check-store-metadata check-store-tools benchmark-storage check-soft-dirty check-page-snapshot check-vfs-content check-thread-altstack,$(MAKECMDGOALS)),)
+ifneq ($(filter check-integration check-dwarf check-elf check-scenarios check-cases audit-runtimes check-xstate check-exec check-state-io check-mappings check-futex-snapshot check-futex check-thread-control check-thread-identity check-thread-carrier check-thread-lifecycle check-thread-tid check-thread-signal-mask check-thread-robust check-pending-syscall check-storage check-store-cache check-store-packed check-store-metadata check-store-tools benchmark-storage check-soft-dirty check-page-snapshot check-vfs-content check-thread-altstack check-dfs-residency,$(MAKECMDGOALS)),)
 NP ?= 1
 endif
 
@@ -119,6 +119,11 @@ check: test check-build-contracts
 -include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk tests/futex_snapshot.mk tests/futex.mk tests/storage.mk tests/store_cache.mk tests/store_packed.mk tests/redisraft.mk tests/capture.mk tests/soft_dirty.mk tests/page_snapshot.mk tests/io_boundary.mk tests/framework.mk tests/runtime_profile.mk tests/syscall_policy.mk tests/process_state.mk tests/thread_control.mk tests/thread_identity.mk tests/thread_carrier.mk tests/thread_lifecycle.mk tests/thread_tid.mk tests/thread_signal_mask.mk tests/thread_robust.mk tests/pending_syscall.mk tests/pending_io.mk tests/pending_io_snapshot.mk tests/vfs_content.mk tests/thread_altstack.mk
 check-integration: check-dwarf check-elf
 
+.PHONY: check-dfs-residency
+check-dfs-residency: tracer
+	@test "$(NP)" = 1 || { echo 'check-dfs-residency requires NP=1' >&2; exit 1; }
+	CC="$(CC)" CXX="$(CXX)" python3 tests/dfs_residency.py --tracer ./tracer
+
 # Case-driven acceptance and explicitly non-green runtime admission audit.
 .PHONY: check-cases audit-runtimes
 check-cases: tracer
@@ -159,6 +164,7 @@ help:
 	@echo 'make check-soft-dirty      Experimental kernel soft-dirty byte oracle'
 	@echo 'make check-page-snapshot   v5/v6 page storage, reads, corruption and reopen'
 	@echo 'make check-state-view check-plugins check-runtime-profile  Generic framework regressions (NP=2)'
+	@echo 'make check-dfs-residency   NP=1 bounded DFS memory, backtracking and replay'
 	@echo 'make check-thread-altstack NP=1 per-task alternate-stack registration and restore'
 	@echo 'make check-vfs-content    Shared file payloads, references and cold reopen'
 	@echo 'make check-io-boundary     NP=2 virtual FD/socket/pipe/epoll and archive gates'

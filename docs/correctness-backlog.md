@@ -411,3 +411,20 @@ files and ~2.085GB in use; this is not merely fragmentation. Hash-only ancestor
 residency is the next bounded fix. Java stops at ordinary jvm.cfg symlink traversal;
 per user instruction, costly JVM-specific work may be deferred explicitly without
 blocking other cases, while keeping its status non-green.
+
+### Bounded DFS resident-state fix
+
+The actual CLI iterative DFS now drops an ancestor's resident sys_state before
+pushing its successor, retaining hash/actor/choice bookkeeping. It reloads the
+same saved identity only when backtracking needs another expansion. No search
+choice, visited rule or SIGINT ordering changes. Deserialize failures now retain
+the underlying exception rather than hiding allocation failure as generic corruption.
+
+Regression:44 syscall prefix,4x16MiB immutable files exceeding the32MiB hot cache,
+late four-way branching and file mutation, unchanged2GiB limit. Old full/pages
+large DFS fail while corresponding BFS passes. New full/pages×small/large×BFS/DFS
+all eight runs yield81 unique states,80 actual transition events and four final
+branches; file-mutation and terminal edges each replay three times with identical
+hash. Existing DFS searched82 vs BFS81 reporting discrepancy remains unchanged;
+actual event multisets match. Real Python now advances to getdents64(217) in both
+backends without the former allocation failure. C03/C25 remain open.
