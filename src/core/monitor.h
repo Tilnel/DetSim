@@ -12,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 enum
 {
@@ -68,7 +69,7 @@ struct PTMC_STATE
   {
     char *executable = nullptr;
     int argc = 0;
-    char *argv[5] = {};
+    std::vector<char *> argv;
   } tracee[NP];
 
   struct timeval time[NP] = {};

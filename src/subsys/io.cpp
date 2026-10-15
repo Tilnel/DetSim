@@ -2,6 +2,7 @@
 #include "pending_io.h"
 #include "guest.h"
 #include "monitor.h"
+#include "utils.h"
 #include "fs/fsstate.h"
 #include "net/sockstate.h"
 #include <algorithm>
@@ -177,4 +178,73 @@ int emu_ioctl(int fd, unsigned long request, void* argument) {
     return guest_write_exact(ptmc_state.pids[ptmc_state.cursor],argument,&value,sizeof(value))?0:-EFAULT;
   }
   throw std::runtime_error("Unsupported virtual ioctl request");
+}
+
+long emu_poll(struct pollfd* fds, uint32_t count, int timeout) {
+  if (timeout != 0) throw std::runtime_error("Blocking poll is not modeled");
+  // Explicit staging bound, not a fabricated guest resource-limit error.
+  if (count > 65536) throw std::runtime_error("poll descriptor count exceeds model limit");
+  std::vector<pollfd> entries(count);
+  const pid_t pid=ptmc_state.pids[ptmc_state.cursor];
+  if (count && !guest_read_exact(pid,fds,entries.data(),entries.size()*sizeof(pollfd))) return -EFAULT;
+  int result=0;
+  auto& manager=descriptors();
+  for (auto& entry:entries) {
+    entry.revents=0;
+    if (entry.fd<0) continue;
+    if (!manager.is_allocated(entry.fd)) entry.revents=POLLNVAL;
+    else {
+      uint32_t ready=0;
+      const auto type=manager.get_fd_type(entry.fd);
+      if (type==FdType::FILE || type==FdType::STDIO) {
+        require_file(entry.fd);
+        ready=POLLIN|POLLOUT|POLLRDNORM|POLLWRNORM;
+      } else if (type==FdType::EPOLL) {
+        if (network().epoll_ready(entry.fd,ptmc_state.cursor)) ready=POLLIN|POLLRDNORM;
+      } else {
+        ready=network().ready_events(entry.fd,ptmc_state.cursor);
+        if (type==FdType::SOCKET) {
+          const auto* socket=network().get_socket(entry.fd);
+          if (!socket) throw std::runtime_error("Socket descriptor has no payload");
+          if (socket->type==SOCK_STREAM && !socket->connected && !socket->listening)
+            ready|=POLLOUT|POLLHUP;
+        } else if (type==FdType::PIPE) {
+          const int key=files().pipe_fds_.at(entry.fd);
+          const auto& pipe=files().pipes_.at(std::abs(key));
+          if (key>0 && pipe.buffer.empty()) ready&=~POLLIN;
+          if (key<0 && pipe.buffer.size()<FileSystemState::pipe_capacity) ready|=POLLOUT;
+        } else throw std::runtime_error("Unsupported poll descriptor kind");
+        if (ready&POLLIN) ready|=POLLRDNORM;
+        if (ready&POLLOUT) ready|=POLLWRNORM;
+      }
+      entry.revents=static_cast<short>(ready & (static_cast<unsigned short>(entry.events)|POLLERR|POLLHUP));
+    }
+    if (entry.revents) ++result;
+  }
+  // Linux put_user(u16) cannot leave a prefix on a cross-page fault, whereas
+  // process_vm_writev can. Ordinary within-page stores need no maps lookup.
+  // All carriers are stopped; reuse one mapping read for every crossing scalar.
+  std::vector<maps_item> maps;
+  // Linux writes only revents, leaving fd/events untouched even for aliases.
+  for (size_t i=0;i<entries.size();++i) {
+    const auto address=reinterpret_cast<uintptr_t>(fds)+i*sizeof(pollfd)+offsetof(pollfd,revents);
+    if (address%4096==4095) {
+      if (maps.empty()) {
+        auto file=fileutils::open_cfile("/proc/"+std::to_string(pid)+"/maps","r");
+        if (!file) throw std::runtime_error("Cannot inspect poll scalar mappings");
+        get_maps_item(maps,file.get());
+        if (ferror(file.get()) || maps.empty()) throw std::runtime_error("Cannot read poll scalar mappings");
+      }
+      auto cursor=address;
+      for (const auto& map:maps) {
+        if (map.end<=cursor) continue;
+        if (map.start>cursor || map.flags[1]!='w') break;
+        cursor=std::min<uint64_t>(map.end,address+sizeof(short));
+        if (cursor==address+sizeof(short)) break;
+      }
+      if (cursor!=address+sizeof(short)) return -EFAULT;
+    }
+    if (!guest_write_exact(pid,reinterpret_cast<void*>(address),&entries[i].revents,sizeof(short))) return -EFAULT;
+  }
+  return result;
 }

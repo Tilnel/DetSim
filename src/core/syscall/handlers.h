@@ -42,6 +42,7 @@ int handle_setsockopt(pid_t pid, syscall_info &info);
 int handle_getsockopt(pid_t pid, syscall_info &info);
 int handle_getsockname(pid_t pid, syscall_info &info);
 int handle_getpeername(pid_t pid, syscall_info &info);
+int handle_poll(pid_t pid, syscall_info &info);
 int handle_epoll_create(pid_t pid, syscall_info &info);
 int handle_epoll_create1(pid_t pid, syscall_info &info);
 int handle_epoll_ctl(pid_t pid, syscall_info &info);

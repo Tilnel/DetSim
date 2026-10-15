@@ -110,3 +110,5 @@
 
 !pending_io_snapshot_integration.cpp
 !pending_io_snapshot.mk
+
+!case_runner_integration.py

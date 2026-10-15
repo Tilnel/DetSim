@@ -1,0 +1,81 @@
+{
+  "schema": 1,
+  "policy": "Evidence is per target/runtime/profile. Startup, execution, restore, search and counterexample replay are separate milestones.",
+  "implemented": [
+    {
+      "id": "two-debits",
+      "languages": [
+        "C",
+        "C++"
+      ],
+      "processes": 1,
+      "threads": 1,
+      "command": "make check-cases CC=/usr/bin/gcc CXX=/usr/bin/g++",
+      "input": "two independent gettimeofday choices, 0 or +1 microsecond",
+      "property": "one unit of credit cannot be debited twice",
+      "mutation": "omit the second debit's balance check",
+      "bad_inputs": [
+        "11"
+      ]
+    },
+    {
+      "id": "lost-notification",
+      "languages": [
+        "C/pthread"
+      ],
+      "processes": 1,
+      "threads": 2,
+      "command": "python3 examples/cases/run.py --mode threads --tracer ./tracer",
+      "property": "closed-world untimed futex waits cannot leave every live thread blocked",
+      "mutation": "omit pthread_cond_signal",
+      "scope": "bounded search under existing actor policy, not exhaustive thread interleavings"
+    },
+    {
+      "id": "runtime-admission",
+      "languages": [
+        "C",
+        "C++ std",
+        "Rust std",
+        "Go (actual compiler reported)",
+        "CPython",
+        "OpenJDK"
+      ],
+      "command": "make audit-runtimes CC=/usr/bin/gcc CXX=/usr/bin/g++",
+      "property": "saved stdout contains RUNTIME_OK before zero process exit",
+      "expectation": "Known unsupported runtimes remain non-green, with exact first blocker and control-replay evidence"
+    }
+  ],
+  "next_targets": [
+    {
+      "id": "willemt-raft",
+      "path": "examples/raft/raft/raft",
+      "processes": 3,
+      "property": "one leader per term and consistent committed prefix",
+      "mutation": "disable a vote/term guard in a copied build",
+      "status": "existing workload/plugins; paired mutant case and replay adapter not yet implemented"
+    },
+    {
+      "id": "redisraft-library",
+      "path": "examples/redisraft/raft/raft",
+      "processes": 3,
+      "command": "make benchmark-redisraft CC=/usr/bin/gcc CXX=/usr/bin/g++",
+      "status": "existing bounded library-driver exploration; not a claim about full Redis plus RedisRaft module"
+    },
+    {
+      "id": "redisraft-full",
+      "processes": 3,
+      "status": "planned real Redis+module target; do not conflate library smoke with this target"
+    },
+    {
+      "id": "runtime-concurrency",
+      "languages": [
+        "Rust std",
+        "Go gc",
+        "Go gccgo",
+        "CPython",
+        "OpenJDK"
+      ],
+      "status": "advance one actual runtime blocker at a time; any altered GC/JIT/preemption configuration belongs in evidence"
+    }
+  ]
+}

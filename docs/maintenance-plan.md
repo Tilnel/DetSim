@@ -958,3 +958,42 @@ fatal-crash teardown, partial-progress blocking writes, poll/select/vector IO,
 signals/cancellation and independent realtime/monotonic axes remain scoped gaps.
 Snapshot versions23/24 and kernel modelv10 encode the new semantic state; plugins
 must rebuild for detsim_plugin_entry_v2 and honor event phase/result_valid.
+
+## Case-driven acceptance (2026-10-16)
+
+Added examples/cases: independent native oracles, public-ABI property plugins,
+healthy/mutant input and pthread workloads, six installed-runtime probes, and a
+bounded runner retaining commands, profiles, hashes, transcripts and witnesses.
+Each search owns a fresh tracer/store. Explicit unsupported, bounded and missing
+compiler outcomes cannot become successful admission. No new dependencies or
+workload-specific product extraction were added.
+
+Cases drove three product fixes: dynamically sized argv (removes the five-slot
+limit and terminating-null overflow), ordinary anonymous zero-length mmap EINVAL
+without bypassing file-descriptor precedence or unsupported huge pages, and
+nonblocking poll over the existing descriptor/readiness models. Native oracles
+also caught epoll POLLRDNORM and partial cross-page revents writes on EFAULT.
+Blocking poll is still unsupported. Kernel modelv11; snapshot layouts23/24.
+
+Final verification with CC=/usr/bin/gcc CXX=/usr/bin/g++:
+- make NP=1 -j4 check-cases check-scenarios: 12 healthy/mutant/backend rows pass;
+  both bug classes found and search witnesses replayed three times; 18 native
+  scenarios pass. Runner regressions reject depth exhaustion and absent tools.
+- make NP=2 -j4 check-syscall-policy check-io-boundary: pass, including mmap
+  precedence/huge-page and native poll cross-page atomic scalar fault oracles.
+- make check: nine component cases and ten build-contract tests pass.
+- Production NP1 tracer builds; Python compile checks and git diff --check pass.
+- Runtime audit using the final NP1 binary and both backends: all six native
+  probes complete and all six controlled-step/restore probes pass. C/C++ checked
+  model execution completes; Rust stops at syscall131, gccgo at204, Python/JVM
+  at89. Audit correctly returns1. This is not full runtime admission.
+
+Final artifacts: build/cases/run-a6_xdkg5/results.json (cases),
+build/cases/run-q96si028/results.json (runtime audit). Logs:
+/tmp/detsim-cases-final{,-boundary,-check,-runtimes}.log.
+
+Remaining: standard gc Go, all four runtime blockers and their later successors,
+real distributed protocol mutations, complete actor/outcome enumeration and
+shared-memory atom boundaries. Same-process replay is not cross-ASLR portable
+replay; the pthread case establishes a concrete closed-world deadlock, not full
+interleaving coverage. Existing DFS completion text/visited reuse remains debt.

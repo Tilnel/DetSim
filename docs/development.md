@@ -23,6 +23,8 @@ make help
 make check
 make check-storage       # storage faults/concurrency/reopen + read-only tools; NP=1
 make check-integration   # production DWARF/ELF fixtures; default NP=1
+make check-cases         # NP=1 healthy/mutant counterexamples and replay
+make audit-runtimes      # NP=1 language admission; reports unsupported cases as failures
 make check-scenarios     # build NP=1 tracer and run isolated native ptrace scenarios
 make check-thread-control check-thread-identity check-thread-carrier # NP=1 thread gates
 make check-pending-syscall # NP=1 blocked/wake/completion/deadline replay
@@ -626,3 +628,18 @@ The default pending UDP retry consumes the first queued datagram; it does not
 preserve the optional ordinary-receive choice enumeration. Poll/select, vector
 I/O, cancellation, async delivery and full transport backpressure are not added.
 This change establishes execution/control states, not exhaustive scheduling.
+
+## Case-driven development
+
+The active work queue is now the [case corpus](../examples/cases/README.md), with
+an explicit [target catalog](../examples/cases/catalog.json). Feature additions
+should name a failing case, its expected native behavior and the property or
+admission boundary they enable. Healthy/mutant pairs and counterexample replay
+are separate from compiler success or initialization smoke tests.
+
+`check-cases` verifies finite C/C++ environmental input choices and a real pthread
+lost-notification mutant under the existing actor policy. `audit-runtimes` tests
+C, C++, Rust std, the actually installed Go compiler, CPython and OpenJDK, reporting
+native/control/replay/search stages separately. A bounded DFS completion string
+is never promoted to a safety proof or a successful guest exit. Current unsupported
+runtime cases intentionally keep this audit non-green.

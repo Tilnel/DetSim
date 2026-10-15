@@ -527,7 +527,7 @@ static void start_tracee(int id)
     fclose(log_fp);
   raise(SIGSTOP);
 
-  execv(ptmc_state.tracee[id].executable, ptmc_state.tracee[id].argv);
+  execv(ptmc_state.tracee[id].executable, ptmc_state.tracee[id].argv.data());
 
   perror("exec");
   _exit(127);

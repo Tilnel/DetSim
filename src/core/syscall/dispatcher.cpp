@@ -100,7 +100,8 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
                                SyscallAction::EMULATE,
                                "Network syscall - emulated");
 
-        // Epoll syscalls - emulated
+        // Readiness probes and epoll syscalls - emulated
+        case SYS_poll:
         case SYS_epoll_create:
         case SYS_epoll_create1:
         case SYS_epoll_ctl:
@@ -157,7 +158,7 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         case SYS_preadv: case SYS_pwritev: case SYS_preadv2: case SYS_pwritev2:
         case SYS_sendmsg: case SYS_recvmsg: case SYS_sendmmsg: case SYS_recvmmsg:
         case SYS_socketpair: case SYS_shutdown:
-        case SYS_poll: case SYS_ppoll: case SYS_select: case SYS_pselect6:
+        case SYS_ppoll: case SYS_select: case SYS_pselect6:
         case SYS_sendfile: case SYS_splice: case SYS_tee: case SYS_vmsplice: case SYS_copy_file_range:
         case SYS_getdents: case SYS_getdents64: case SYS_ftruncate:
         case SYS_fchdir: case SYS_flock: case SYS_sync: case SYS_syncfs:
@@ -351,6 +352,7 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
         case SYS_getsockopt:
         case SYS_getsockname:
         case SYS_getpeername:
+        case SYS_poll:
         case SYS_epoll_create:
         case SYS_epoll_create1:
         case SYS_epoll_ctl:
@@ -438,6 +440,16 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
 void SyscallDispatcher::handle_mmap_enter(pid_t pid, syscall_info& info)
 {
     vfs_mmap_state_ = {};
+    // Anonymous zero-length probes cannot create a mapping. File mappings
+    // must retain descriptor validation before EINVAL (a bad fd gives EBADF).
+    // Huge-page setup can fail before the length check; keep it unsupported.
+    // Do not execute a host syscall or touch the reserved injection mapping.
+    if (!info.args[1] && (info.args[3] & MAP_ANONYMOUS) && !(info.args[3] & MAP_HUGETLB)) {
+        vfs_mmap_state_.active = true;
+        vfs_mmap_state_.error = -EINVAL;
+        tracee_set_orig_rax(pid, -1);
+        return;
+    }
     const int flags=static_cast<int>(info.args[3]);
     constexpr int supported_flags=MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED|MAP_FIXED_NOREPLACE|MAP_STACK|MAP_NORESERVE;
     if (!(flags&MAP_PRIVATE) || (flags&~supported_flags) ||

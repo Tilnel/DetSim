@@ -61,6 +61,7 @@ int handle(pid_t pid, syscall_info &info) {
         case SYS_getsockopt:  return handle_getsockopt(pid, info);
         case SYS_getsockname: return handle_getsockname(pid, info);
         case SYS_getpeername: return handle_getpeername(pid, info);
+        case SYS_poll: return handle_poll(pid, info);
         case SYS_epoll_create: return handle_epoll_create(pid, info);
         case SYS_epoll_create1: return handle_epoll_create1(pid, info);
         case SYS_epoll_ctl:   return handle_epoll_ctl(pid, info);
@@ -137,6 +138,13 @@ int handle_getsockopt(pid_t pid, syscall_info &info) {
                               (void *)info.args[3], (socklen_t *)info.args[4]);
     tracee_set_rax(pid, ret);
     info.rval = ret;
+    return CKPT_YES;
+}
+
+int handle_poll(pid_t pid, syscall_info &info) {
+    info.rval = emu_poll(reinterpret_cast<pollfd*>(info.args[0]),
+                         static_cast<uint32_t>(info.args[1]), static_cast<int>(info.args[2]));
+    tracee_set_rax(pid, info.rval);
     return CKPT_YES;
 }
 

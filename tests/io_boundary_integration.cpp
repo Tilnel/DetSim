@@ -21,6 +21,7 @@
 #include <sys/uio.h>
 #include <sys/wait.h>
 
+static pollfd guest_pollfds[8]{};
 static sockaddr_in guest_address{};
 static char guest_bytes[32]="abc";
 static epoll_event guest_event{}, guest_events[4]{};
@@ -131,6 +132,84 @@ int main() {
         SyscallDispatcher dispatcher;
         check(dispatcher.get_route(SYS_fcntl).action==SyscallAction::EMULATE &&
               dispatcher.get_route(SYS_fsync).action==SyscallAction::EMULATE,"entry blocks FD control syscalls");
+        check(dispatcher.get_route(SYS_poll).action==SyscallAction::EMULATE,
+              "poll is suppressed and emulated");
+        pollfd probe[4]{{file,POLLIN|POLLOUT,123},{socket,POLLOUT,123},{-1,POLLIN,123},{99999,0,123}};
+        copy_to(children[0],guest_pollfds,probe,sizeof probe);
+        check(execute(dispatcher,children[0],SYS_poll,
+                      {reinterpret_cast<uint64_t>(guest_pollfds),(1ULL<<32)|4,1ULL<<32,0,0,0})==3 &&
+              guest_read_exact(children[0],guest_pollfds,probe,sizeof probe) &&
+              probe[0].revents==(POLLIN|POLLOUT) && probe[1].revents==POLLOUT &&
+              probe[2].revents==0 && probe[3].revents==POLLNVAL,
+              "poll typed readiness, negative/invalid descriptors and ABI truncation");
+        check(emu_poll(reinterpret_cast<pollfd*>(1),1,0)==-EFAULT && emu_poll(nullptr,0,0)==0,
+              "poll checked input and empty array");
+        const long readonly_poll=tracee_do_syscall(children[0],SYS_mmap,0,4096,
+            PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+        if (readonly_poll<0) throw std::runtime_error("poll copyout fixture mmap");
+        copy_to(children[0],reinterpret_cast<void*>(readonly_poll),probe,sizeof probe);
+        tracee_do_syscall(children[0],SYS_mprotect,readonly_poll,4096,PROT_READ,0,0,0);
+        check(emu_poll(reinterpret_cast<pollfd*>(readonly_poll),1,0)==-EFAULT,
+              "poll rejects inaccessible revents copyout");
+        tracee_do_syscall(children[0],SYS_munmap,readonly_poll,4096,0,0,0,0);
+        const pollfd fault_entry{-1,0,0x7f7f};
+        auto* native_pages=static_cast<char*>(mmap(nullptr,8192,PROT_READ|PROT_WRITE,
+            MAP_PRIVATE|MAP_ANONYMOUS,-1,0));
+        if (native_pages==MAP_FAILED) throw std::runtime_error("native poll fault mmap");
+        memcpy(native_pages+4096-7,&fault_entry,sizeof fault_entry);
+        if(mprotect(native_pages+4096,4096,PROT_READ)) throw std::runtime_error("native poll fault mprotect");
+        errno=0;
+        check(syscall(SYS_poll,native_pages+4096-7,1,0)==-1 && errno==EFAULT &&
+              native_pages[4095]==0x7f && native_pages[4096]==0x7f,
+              "native poll cross-page revents store is atomic on fault");
+        munmap(native_pages,8192);
+        const long guest_pages=tracee_do_syscall(children[0],SYS_mmap,0,8192,
+            PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+        if(guest_pages<0) throw std::runtime_error("guest poll fault mmap");
+        copy_to(children[0],reinterpret_cast<void*>(guest_pages+4096-7),&fault_entry,sizeof fault_entry);
+        tracee_do_syscall(children[0],SYS_mprotect,guest_pages+4096,4096,PROT_READ,0,0,0);
+        unsigned char scalar_bytes[2]{};
+        check(emu_poll(reinterpret_cast<pollfd*>(guest_pages+4096-7),1,0)==-EFAULT &&
+              guest_read_exact(children[0],reinterpret_cast<void*>(guest_pages+4095),scalar_bytes,2) &&
+              scalar_bytes[0]==0x7f && scalar_bytes[1]==0x7f,
+              "poll cross-page revents fault preserves both bytes like native");
+        tracee_do_syscall(children[0],SYS_mprotect,guest_pages+4096,4096,PROT_READ|PROT_WRITE,0,0,0);
+        check(emu_poll(reinterpret_cast<pollfd*>(guest_pages+4096-7),1,0)==0 &&
+              guest_read_exact(children[0],reinterpret_cast<void*>(guest_pages+4095),scalar_bytes,2) &&
+              scalar_bytes[0]==0 && scalar_bytes[1]==0,
+              "poll cross-page writable revents succeeds");
+        tracee_do_syscall(children[0],SYS_munmap,guest_pages,8192,0,0,0,0);
+        int unconnected=ptmc_state.sock_states[0].do_socket(AF_INET,SOCK_STREAM,0);
+        pollfd disconnected{unconnected,0,123};copy_to(children[0],guest_pollfds,&disconnected,sizeof disconnected);
+        check(emu_poll(guest_pollfds,1,0)==1 &&
+              guest_read_exact(children[0],guest_pollfds,&disconnected,sizeof disconnected) &&
+              disconnected.revents==POLLHUP,"poll unconnected TCP hangup");emu_close(unconnected);
+        bool blocking_poll_rejected=false;
+        try {emu_poll(nullptr,0,-1);} catch(const std::runtime_error&) {blocking_poll_rejected=true;}
+        check(blocking_poll_rejected,"blocking poll explicitly rejected");
+        int poll_pipe[2];check(fs.do_pipe(poll_pipe,0)==0,"poll pipe created");
+        pollfd ends[2]{{poll_pipe[0],0,123},{poll_pipe[1],POLLOUT,123}};
+        copy_to(children[0],guest_pollfds,ends,sizeof ends);
+        check(emu_poll(guest_pollfds,2,0)==1,"poll pipe writable");
+        check(emu_close(poll_pipe[1])==0,"poll writer closed");
+        copy_to(children[0],guest_pollfds,ends,sizeof ends);
+        check(emu_poll(guest_pollfds,1,0)==1 &&
+              guest_read_exact(children[0],guest_pollfds,ends,sizeof ends) && ends[0].revents==POLLHUP,
+              "poll HUP reported without requested events");
+        ends[0].events=POLLIN|POLLRDNORM;copy_to(children[0],guest_pollfds,ends,sizeof ends);
+        check(emu_poll(guest_pollfds,1,0)==1 &&
+              guest_read_exact(children[0],guest_pollfds,ends,sizeof ends) && ends[0].revents==POLLHUP,
+              "poll empty pipe EOF is HUP without readable data");
+        emu_close(poll_pipe[0]);
+        int native_pipe[2];check(pipe(native_pipe)==0,"native poll oracle pipe created");
+        close(native_pipe[0]);pollfd native_end{native_pipe[1],POLLOUT,0};
+        check(poll(&native_end,1,0)==1 && native_end.revents==(POLLOUT|POLLERR),
+              "native poll closed-reader oracle");close(native_pipe[1]);
+        fs.do_pipe(poll_pipe,0);emu_close(poll_pipe[0]);
+        pollfd broken{poll_pipe[1],POLLOUT,0};copy_to(children[0],guest_pollfds,&broken,sizeof broken);
+        check(emu_poll(guest_pollfds,1,0)==1 &&
+              guest_read_exact(children[0],guest_pollfds,&broken,sizeof broken) && broken.revents==(POLLOUT|POLLERR),
+              "poll closed-reader matches native oracle");emu_close(poll_pipe[1]);
         bool unsupported_rejected=true;
         for (int number:{SYS_dup,SYS_readv,SYS_unlink,SYS_fchdir,SYS_flock,SYS_sync,SYS_syncfs,SYS_readahead,SYS_fadvise64}) {
             syscall_info rejected{};rejected.nr=number;
@@ -349,6 +428,27 @@ int main() {
         emu_epoll_ctl(epoll,EPOLL_CTL_ADD,socket,&guest_event);
         check(emu_epoll_ctl(epoll,EPOLL_CTL_ADD,socket,&guest_event)==-EEXIST,"duplicate epoll ADD rejected");
         UdpDatagram datagram{};datagram.content="x";ptmc_state.sock_states[0].udp_recv_buffers()[socket].push_back(datagram);
+        pollfd epoll_probe{epoll,POLLIN,0};copy_to(children[0],guest_pollfds,&epoll_probe,sizeof epoll_probe);
+        const auto poll_net_before=archive(ptmc_state.sock_states[0]);
+        check(emu_poll(guest_pollfds,1,0)==1 &&
+              guest_read_exact(children[0],guest_pollfds,&epoll_probe,sizeof epoll_probe) &&
+              epoll_probe.revents==POLLIN && archive(ptmc_state.sock_states[0])==poll_net_before,
+              "poll epoll readiness does not consume events");
+        int native_poll_pipe[2];
+        check(pipe(native_poll_pipe)==0,"native eventpoll oracle pipe created");
+        int native_epoll=epoll_create1(0);epoll_event native_watch{};native_watch.events=EPOLLIN;
+        check(native_epoll>=0 && epoll_ctl(native_epoll,EPOLL_CTL_ADD,native_poll_pipe[0],&native_watch)==0 &&
+              write(native_poll_pipe[1],"x",1)==1,"native eventpoll oracle ready");
+        pollfd native_epoll_probe{native_epoll,POLLRDNORM,0};
+        check(poll(&native_epoll_probe,1,0)==1 && native_epoll_probe.revents==POLLRDNORM,
+              "native poll epoll POLLRDNORM oracle");
+        close(native_epoll);close(native_poll_pipe[0]);close(native_poll_pipe[1]);
+        epoll_probe.events=POLLRDNORM;epoll_probe.revents=0;
+        copy_to(children[0],guest_pollfds,&epoll_probe,sizeof epoll_probe);
+        check(emu_poll(guest_pollfds,1,0)==1 &&
+              guest_read_exact(children[0],guest_pollfds,&epoll_probe,sizeof epoll_probe) &&
+              epoll_probe.revents==POLLRDNORM && archive(ptmc_state.sock_states[0])==poll_net_before,
+              "poll epoll POLLRDNORM matches native oracle without consuming events");
         auto ready=emu_epoll_wait(epoll,guest_events,1,0);
         epoll_event received{};iovec local{&received,sizeof(received)},remote{guest_events,sizeof(received)};
         process_vm_readv(children[0],&local,1,&remote,1,0);

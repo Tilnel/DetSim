@@ -189,6 +189,40 @@ int main() {
         check(result.rejected,"unsupported clone flags reject before kernel");
         result = execute(dispatcher, child, SYS_brk);
         check(!result.rejected && result.value > 0, "brk query remains available");
+        for (const int flags : {MAP_ANONYMOUS, MAP_SHARED | MAP_ANONYMOUS,
+                                MAP_PRIVATE | MAP_ANONYMOUS}) {
+            const auto empty = execute(dispatcher, child, SYS_mmap,
+                {0, 0, PROT_READ, static_cast<uint64_t>(flags), uint64_t(-1), 0});
+            check(!empty.rejected && empty.value == -EINVAL,
+                  "zero-length mmap returns EINVAL before mapping policy");
+        }
+        result=execute(dispatcher,child,SYS_mmap,
+                       {0,0,PROT_READ,MAP_PRIVATE|MAP_ANONYMOUS|MAP_HUGETLB,uint64_t(-1),0});
+        check(result.rejected,"zero-length huge-page setup remains explicitly unsupported");
+        FILE* native_file = tmpfile();
+        if (!native_file) throw std::runtime_error("native mmap oracle file");
+        errno = 0;
+        const long native_bad_fd = syscall(SYS_mmap, 0, 0, PROT_READ, MAP_PRIVATE, -1, 0);
+        check(native_bad_fd == -1 && errno == EBADF,
+              "native zero-length file mmap checks bad descriptor first");
+        errno = 0;
+        const long native_valid_fd = syscall(SYS_mmap, 0, 0, PROT_READ, MAP_PRIVATE, fileno(native_file), 0);
+        check(native_valid_fd == -1 && errno == EINVAL,
+              "native zero-length file mmap with valid descriptor returns EINVAL");
+        errno = 0;
+        const long native_anon = syscall(SYS_mmap, 0, 0, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        check(native_anon == -1 && errno == EINVAL,
+              "native zero-length anonymous mmap ignores bad descriptor");
+        fclose(native_file);
+        if (!ptmc_state.fd_managers[0]) ptmc_state.fd_managers[0] = std::make_shared<FdManager>();
+        const int virtual_file = ptmc_state.fd_managers[0]->allocate_fd(FdType::FILE);
+        result = execute(dispatcher, child, SYS_mmap, {0, 0, PROT_READ, MAP_PRIVATE, uint64_t(-1), 0});
+        check(!result.rejected && result.value == -EBADF,
+              "zero-length file mmap preserves bad descriptor precedence");
+        result = execute(dispatcher, child, SYS_mmap, {0, 0, PROT_READ, MAP_PRIVATE, uint64_t(virtual_file), 0});
+        check(!result.rejected && result.value == -EINVAL,
+              "zero-length file mmap with valid descriptor returns EINVAL");
+        ptmc_state.fd_managers[0]->release_fd(virtual_file);
         const auto mapping = execute(dispatcher, child, SYS_mmap,
                                      {0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
                                       uint64_t(-1), 0});

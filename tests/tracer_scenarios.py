@@ -42,7 +42,7 @@ class TracerScenarios(unittest.TestCase):
 
     def run_tracer(self, commands, *, name="probe", batch=False, sibling=False,
                    terminate=False, assertions=(), verify_failure_cleanup=False,
-                   fail_storage_sync=False, extra_env=None, plugins=()):
+                   fail_storage_sync=False, extra_env=None, plugins=(), tracee_args=("0",)):
         work = self.root / (name + ("-batch" if batch else "-interactive"))
         work.mkdir()
         binary = work / name
@@ -50,7 +50,7 @@ class TracerScenarios(unittest.TestCase):
         binary.chmod(0o755)
         config = work / "config.json"
         config.write_text(json.dumps({
-            "Nodes": 1, "Loglevel": 4, "Tracee": [[str(binary), "0"]],
+            "Nodes": 1, "Loglevel": 4, "Tracee": [[str(binary), *tracee_args]],
             "Addr": ["192.168.0.1"],
             "Assertions": list(assertions),
             "Plugins": list(plugins),
@@ -170,6 +170,30 @@ finally:
                   f"{sum('ENOMEM' in line for line in sequential)} ENOMEM; "
                   f"{time.perf_counter() - started:.4f}s including strace/CLI", file=sys.stderr)
         return proc.returncode, (work / "output").read_text(errors="replace")
+
+    def test_tracee_argument_storage(self):
+        source = self.root / "arguments.c"
+        source.write_text(
+            '#include <string.h>\n'
+            'int main(int argc, char **argv) {\n'
+            ' if (argc != 5 && argc != 9) return 71;\n'
+            ' for (int i=1; i<argc; ++i)\n'
+            '  if (strcmp(argv[i], "argument with spaces")) return 72;\n'
+            ' return argv[argc] != 0; }\n'
+        )
+        subprocess.run(
+            shlex.split(os.environ.get("CC", "/usr/bin/gcc"))
+            + ["-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie",
+               str(source), "-o", str(self.root / "probe")], check=True,
+        )
+        for argc in (5, 9):
+            with self.subTest(argc=argc):
+                code, output = self.run_tracer(
+                    "sw 0\ndfs 30\nq\n", name=f"arguments-{argc}",
+                    tracee_args=["argument with spaces"] * (argc - 1))
+                self.assertEqual(code, 0, output)
+                self.assertIn("exit_group(0)", output)
+                self.assertIn("Complete explore all", output)
 
     def test_interactive_initial_state_and_clean_exit(self):
         code, output = self.run_tracer("sw 0\np counter\nq\n")

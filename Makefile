@@ -14,7 +14,7 @@ NP ?= 2
 endif
 
 # Integration fixtures use one node unless explicitly overridden.
-ifneq ($(filter check-integration check-dwarf check-elf check-scenarios check-xstate check-exec check-state-io check-mappings check-futex-snapshot check-futex check-thread-control check-thread-identity check-thread-carrier check-thread-lifecycle check-thread-tid check-thread-signal-mask check-thread-robust check-pending-syscall check-storage check-store-cache check-store-packed check-store-metadata check-store-tools benchmark-storage check-soft-dirty check-page-snapshot,$(MAKECMDGOALS)),)
+ifneq ($(filter check-integration check-dwarf check-elf check-scenarios check-cases audit-runtimes check-xstate check-exec check-state-io check-mappings check-futex-snapshot check-futex check-thread-control check-thread-identity check-thread-carrier check-thread-lifecycle check-thread-tid check-thread-signal-mask check-thread-robust check-pending-syscall check-storage check-store-cache check-store-packed check-store-metadata check-store-tools benchmark-storage check-soft-dirty check-page-snapshot,$(MAKECMDGOALS)),)
 NP ?= 1
 endif
 
@@ -119,6 +119,17 @@ check: test check-build-contracts
 -include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk tests/futex_snapshot.mk tests/futex.mk tests/storage.mk tests/store_cache.mk tests/store_packed.mk tests/redisraft.mk tests/capture.mk tests/soft_dirty.mk tests/page_snapshot.mk tests/io_boundary.mk tests/framework.mk tests/runtime_profile.mk tests/syscall_policy.mk tests/process_state.mk tests/thread_control.mk tests/thread_identity.mk tests/thread_carrier.mk tests/thread_lifecycle.mk tests/thread_tid.mk tests/thread_signal_mask.mk tests/thread_robust.mk tests/pending_syscall.mk tests/pending_io.mk tests/pending_io_snapshot.mk
 check-integration: check-dwarf check-elf
 
+# Case-driven acceptance and explicitly non-green runtime admission audit.
+.PHONY: check-cases audit-runtimes
+check-cases: tracer
+	@test "$(NP)" = 1 || { echo 'check-cases requires NP=1' >&2; exit 1; }
+	CC="$(CC)" CXX="$(CXX)" python3 examples/cases/run.py --tracer ./tracer --mode checks
+	CC="$(CC)" CXX="$(CXX)" python3 tests/case_runner_integration.py --tracer ./tracer
+
+audit-runtimes: tracer
+	@test "$(NP)" = 1 || { echo 'audit-runtimes requires NP=1' >&2; exit 1; }
+	CC="$(CC)" CXX="$(CXX)" python3 examples/cases/run.py --tracer ./tracer --mode runtimes
+
 # This gate executes native programs via ptrace; keep it separate from make check.
 check-scenarios: tracer
 	@test "$(NP)" = 1 || { echo 'check-scenarios requires NP=1' >&2; exit 1; }
@@ -132,6 +143,8 @@ help:
 	@echo 'make NP=N [release|debug]   Build tracer for N processes'
 	@echo 'make check                  Component tests + build regression tests (no ptrace)'
 	@echo 'make check-integration      Production DWARF/ELF fixtures (default NP=1; no ptrace)'
+	@echo 'make check-cases           NP=1 healthy/mutant cases and replay evidence'
+	@echo 'make audit-runtimes        NP=1 language admission matrix (non-green until supported)'
 	@echo 'make check-scenarios        Build NP=1 tracer and run isolated ptrace scenarios'
 	@echo 'make check-accept           NP=2 remote-memory accept regression'
 	@echo 'make check-xstate           FP/SIMD capture, restore and archive regression'

@@ -302,3 +302,30 @@ partial-progress blocking writes; poll/select/vector I/O; transport backpressure
 TCP reset and fatal-crash resource teardown; independent realtime/monotonic axes;
 signals/cancellation and shared-memory instruction boundaries. None is silently
 covered by the successful controlled executions above.
+
+## Case-driven admission follow-up (2026-10-16)
+
+The case corpus now tests healthy/seeded-bug C and C++ input protocols plus a
+closed-world pthread lost notification. Search-found witnesses are restored and
+replayed three times with identical local state identity, in full and pages.
+This establishes those concrete counterexamples, not C03/C25 exhaustive coverage.
+
+Runtime probes exposed and drove fixes for argv storage (argc5 null terminator
+out of bounds; argc9 rejected), ordinary anonymous zero-length mmap probes, and
+poll(timeout0). Native regressions preserve file-backed zero-length EBADF before
+EINVAL, explicitly reject huge-page setup, and verify poll invalid/negative FDs,
+pipe HUP/ERR, epoll POLLRDNORM and cross-page revents EFAULT without a partial
+scalar store. Kernel modelv11 records the expanded contract;
+snapshot byte layouts remain23/24.
+
+The six installed toolchains all pass native probe execution and two modeled
+state transitions with same-process restore/replay. Only C/C++ currently complete
+the checked runtime probe and search; Rust std stops at sigaltstack, gccgo at
+sched_getaffinity, and CPython/OpenJDK at readlink. These are explicit next nails,
+not supported-language claims. Standard gc Go remains separate from gccgo.
+
+Known search-reporting caveat remains: depth-limited DFS prints 'Complete explore
+all' and visited state is shared across CLI searches. The new runner uses fresh
+tracers per search and labels bounded results conservatively. Future core search
+work should fix reporting/coverage directly rather than treating this runner
+boundary as closure of C03/C25.

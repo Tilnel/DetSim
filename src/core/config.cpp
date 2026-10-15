@@ -14,6 +14,8 @@
 #include "plugins.h"
 #include "runtime_profile.h"
 #include <filesystem>
+#include <limits>
+#include <new>
 #include <fstream>
 #include <array>
 #include <algorithm>
@@ -98,8 +100,11 @@ static void parse_tracees(const json &cfg, const fs::path &cfg_dir)
   for (int i = 0; i < nodes; i++)
   {
     auto argv_json = tracees[i];
-    Assert(argv_json.is_array() && !argv_json.empty() && argv_json.size() <= 5,
-           "Tracee %d: invalid arguments (max 5 supported)", i);
+    if (!argv_json.is_array() || argv_json.empty() ||
+        argv_json.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+      throw std::runtime_error("Tracee " + std::to_string(i) + ": invalid arguments");
+
+    ptmc_state.tracee[i].argv.assign(argv_json.size() + 1, nullptr);
 
     ptmc_state.tracee[i].argc = static_cast<int>(argv_json.size());
 
@@ -115,6 +120,7 @@ static void parse_tracees(const json &cfg, const fs::path &cfg_dir)
 
       // Store the string persistently
       char *stored = static_cast<char *>(malloc(arg_str.length() + 1));
+      if (!stored) throw std::bad_alloc();
       strcpy(stored, arg_str.c_str());
       ptmc_state.tracee[i].argv[j] = stored;
     }
@@ -425,6 +431,7 @@ void cleanup_config()
         ptmc_state.tracee[i].argv[j] = nullptr;
       }
     }
+    ptmc_state.tracee[i].argv.clear();
     ptmc_state.tracee[i].argc = 0;
     ptmc_state.tracee[i].executable = nullptr;
   }
