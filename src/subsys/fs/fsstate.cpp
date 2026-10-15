@@ -10,6 +10,8 @@
 #include "monitor.h"
 #include "guest.h"
 #include "io.h"
+#include "state_store.h"
+#include <mutex>
 #include <algorithm>
 #include <cstring>
 #include <ctime>
@@ -32,6 +34,102 @@ static time_t modeled_fs_time()
   return node>=0 && node<NP ? ptmc_state.time[node].tv_sec : 0;
 }
 #endif
+
+namespace {
+thread_local bool external_file_content = false;
+constexpr size_t external_file_content_threshold = 4096;
+}
+
+FileContentSnapshotScope::FileContentSnapshotScope() : previous_(external_file_content) {
+  external_file_content = true;
+}
+FileContentSnapshotScope::~FileContentSnapshotScope() { external_file_content = previous_; }
+
+struct FileContent::Payload {
+  std::vector<uint8_t> owned;
+  std::shared_ptr<const std::vector<uint8_t>> restored;
+  std::mutex registration_mutex;
+  hash_type key = 0;
+  uint64_t generation = 0;
+};
+const std::vector<uint8_t>& FileContent::bytes() const {
+  static const std::vector<uint8_t> empty;
+  return !payload_ ? empty : payload_->restored ? *payload_->restored : payload_->owned;
+}
+void FileContent::replace(std::vector<uint8_t> bytes) {
+  auto next = std::make_shared<Payload>();
+  next->owned = std::move(bytes);
+  payload_ = std::move(next);
+}
+std::vector<uint8_t>& FileContent::writable() {
+  if (!payload_ || !payload_.unique() || payload_->restored)
+    replace(bytes());
+  payload_->key = 0;
+  payload_->generation = 0;
+  return payload_->owned;
+}
+void FileContent::write(size_t offset, const void* source, size_t count) {
+  if (!count) return;
+  if (count > std::numeric_limits<size_t>::max() - offset)
+    throw std::length_error("Virtual file write extent overflow");
+  if (!source) throw std::invalid_argument("Null virtual file write source");
+  // Keep an aliased read view alive if the source came from this payload.
+  const auto* start = static_cast<const char*>(source);
+  const bool aliases = std::less_equal<const char*>{}(data(), start) &&
+      std::less<const char*>{}(start, end());
+  auto retained = aliases ? payload_ : nullptr;
+  auto& destination = writable();
+  if (offset + count > destination.size()) destination.resize(offset + count);
+  memcpy(destination.data() + offset, source, count);
+}
+template<class Archive> void FileContent::save(Archive& ar) const {
+  const uint8_t tag = external_file_content && size() >= external_file_content_threshold ? 1 : 0;
+  ar(tag);
+  if (!tag) { ar(bytes()); return; }
+  auto& store = StateStore::instance();
+  std::lock_guard lock(payload_->registration_mutex);
+  // Readiness must be checked even when an immutable registration is cached.
+  const uint64_t generation = store.snapshot_generation();
+  if (payload_->generation != generation || !payload_->key) {
+    const hash_type key = store.save(data(), size());
+    if (store.snapshot_generation() != generation)
+      throw std::runtime_error("Store changed while saving virtual file content");
+    payload_->key = key;
+    payload_->generation = generation;
+  }
+  const uint64_t length = size();
+  ar(length, payload_->key);
+}
+template<class Archive> void FileContent::load(Archive& ar) {
+  uint8_t tag;
+  ar(tag);
+  if (!tag) {
+    std::vector<uint8_t> value;
+    ar(value);
+    replace(std::move(value));
+    return;
+  }
+  if (tag != 1) throw std::runtime_error("Invalid virtual file content tag");
+  uint64_t length;
+  hash_type key;
+  ar(length, key);
+  if (length < external_file_content_threshold || !key)
+    throw std::runtime_error("Invalid virtual file content reference");
+  auto& store = StateStore::instance();
+  const uint64_t generation = store.snapshot_generation();
+  auto value = store.load_shared(key);
+  if (!value || value->size() != length)
+    throw std::runtime_error("Missing or invalid virtual file content");
+  if (store.snapshot_generation() != generation)
+    throw std::runtime_error("Store changed while loading virtual file content");
+  auto next = std::make_shared<Payload>();
+  next->restored = std::move(value);
+  next->key = key;
+  next->generation = generation;
+  payload_ = std::move(next);
+}
+template void FileContent::save<cereal::BinaryOutputArchive>(cereal::BinaryOutputArchive&) const;
+template void FileContent::load<cereal::BinaryInputArchive>(cereal::BinaryInputArchive&);
 
 /* --- Serialization Implementations --- */
 
@@ -545,13 +643,7 @@ ssize_t FileSystemState::do_write(int fd, const void *buf, size_t count)
 
   if (count > static_cast<size_t>(std::numeric_limits<off_t>::max() - write_offset))
     return -EFBIG;
-  size_t new_size = static_cast<size_t>(write_offset) + count;
-  if (new_size > node.content.size())
-  {
-    node.content.resize(new_size);
-  }
-
-  memcpy(node.content.data() + write_offset, buf, count);
+  node.content.write(static_cast<size_t>(write_offset), buf, count);
   ofd.offset = write_offset + count;
   node.metadata.st_size = node.content.size();
 #ifdef FSSTATE_DETAILED_METADATA
@@ -1014,11 +1106,11 @@ void FileSystemState::capture_executable(const std::string& executable)
     VFSNode node{};
     node.metadata.st_mode = metadata.st_mode;
     if (S_ISLNK(metadata.st_mode)) {
-      node.content.resize(4096);
-      const ssize_t length = readlink(path.c_str(), node.content.data(), node.content.size());
-      if (length < 0 || static_cast<size_t>(length) == node.content.size())
+      char target[4096];
+      const ssize_t length = readlink(path.c_str(), target, sizeof(target));
+      if (length < 0 || static_cast<size_t>(length) == sizeof(target))
         throw std::runtime_error("Cannot capture executable symlink: " + path);
-      node.content.resize(length);
+      node.content.assign(target, target + length);
     } else {
       if (!S_ISREG(metadata.st_mode)) throw std::runtime_error("Executable is not a regular file");
       std::ifstream input(path, std::ios::binary);
@@ -1040,11 +1132,11 @@ void FileSystemState::capture_executable(const std::string& executable)
       VFSNode directory{};
       directory.metadata.st_mode = ancestor.st_mode;
       if (S_ISLNK(ancestor.st_mode)) {
-        directory.content.resize(4096);
-        const ssize_t length = readlink(name.c_str(), directory.content.data(), directory.content.size());
-        if (length < 0 || static_cast<size_t>(length) == directory.content.size())
+        char target[4096];
+        const ssize_t length = readlink(name.c_str(), target, sizeof(target));
+        if (length < 0 || static_cast<size_t>(length) == sizeof(target))
           throw std::runtime_error("Cannot capture executable ancestor link: " + name);
-        directory.content.resize(length);
+        directory.content.assign(target, target + length);
       }
       directory.metadata.st_size = directory.content.size();
       const auto existing = filesystem.find(name);

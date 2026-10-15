@@ -362,3 +362,27 @@ byte decompression. This does not bound transient raw capture, queued work and
 save-side decompression. Executable capture separately regressed the Redis
 SET/GET single-run time from7.691s to26.012s; prioritize immutable VFS payloads
 without weakening byte equality or branch isolation.
+
+### Shared VFS payload evidence
+
+The executable-import performance regression is addressed by immutable shared
+contents and >=4096-byte StateStore references in production metadata. Mutations
+have no writable aliases and detach branches; standalone archives remain inline.
+Flat25/pages26 distinguish the wire format. Registration memo is generation-bound
+and checks store readiness even on hits; first registration still verifies bytes.
+No global intern table or host-file fallback is introduced.
+
+check-vfs-content covers sharing, file write/truncate isolation, registered-key
+invalidation, restored-buffer detachment, inline archive without store, nested
+scope exception recovery, reference identity independent of object sharing,
+zero-cache fresh-process/read-only reopen, new store generation, wrong tag/key/
+length, first-registration collision and poisoned-store memo rejection. Native
+full/pages repeatedly restore an8192-byte file before modification and verify
+its original bytes before replaying the mutation. Existing IO/capture/state-view/
+plugin/identity/pending-IO/snapshot/storage gates remain green. C08 remains scoped;
+these checks do not establish arbitrary exploration equivalence.
+
+Three fixed-schedule Redis SET/GET runs per mode preserve208 server and58 client
+steps: full median26.845→7.553s, pages19.506→1.980s. Median stored bytes fall from
+2158.6→599.7MiB/full and1577.6→17.3MiB/pages. Full-file COW on first mutation and
+raw snapshot transient-memory peaks remain separate limitations.

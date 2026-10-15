@@ -943,6 +943,7 @@ hash_type tracee_state::capture_stopped(pid_t pid, hash_type comparison_hash)
   {
     std::ostringstream oss;
     {
+      FileContentSnapshotScope file_content_scope;
       cereal::BinaryOutputArchive ar(oss);
       ar(*this);
     }

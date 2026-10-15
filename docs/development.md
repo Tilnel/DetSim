@@ -38,6 +38,7 @@ make check-xstate check-exec check-state-io check-mappings # NP=1 state/atom gat
 make check-identity check-port # NP=2 identity and deterministic network state
 make check-capture       # NP=2 full/hinted snapshot byte-equivalence oracle
 make check-soft-dirty    # opt-in experiment: real kernel dirty tracking + byte oracle
+make check-vfs-content   # immutable file payloads, cold references and branch isolation
 make check-page-snapshot # flat/page readers, missing/corrupt pages, reopen and poison gates
 make check-syscall-policy check-process-state # NP=2 closed syscall/model gates
 make check-state-view check-plugins check-runtime-profile # NP=2 generic framework gates
@@ -137,8 +138,8 @@ enter snapshot state. Loader CPU-feature normalization still logs an unresolved
 symbol (C17). Passing counter/replay tests does not close that gap,
 nor does it prove multithread, cross-process-run or eviction correctness.
 
-Default snapshot format is version 23; older formats are rejected without migration.
-This branch additionally reads opt-in version 24 page manifests, selected with
+Default snapshot format is version 25; older formats are rejected without migration.
+This branch additionally reads opt-in version 26 page manifests, selected with
 `DETSIM_SNAPSHOT_BACKEND=pages`; `verify-pages` adds a full memory oracle.
 See [page snapshots and whole-exploration measurements](page-snapshots.md).
 Private readable mappings and unnamed anonymous PROT_NONE guards are captured;
@@ -229,7 +230,7 @@ successor. Pure predecessor/target comparisons need no monitor state.
 
 Plugin binaries/schema/configuration, target executable contents and semantic
 execution configuration form the model compatibility fingerprint. Executables must remain immutable during a run. Changing cache
-sizes or loading a decoder does not change it. Flat23/page24 and the versioned
+sizes or loading a decoder does not change it. Flat25/page26 and the versioned
 system metadata reject older archives without deleting or migrating stores.
 Changes to kernel-model or inspection semantics require an explicit compatibility
 version bump; fingerprints do not prove equivalence between different implementations.
@@ -300,7 +301,7 @@ closure within an explicit environment, not compatibility with all Linux program
 
 ## Logical thread archives
 
-Flat23/page24 archive explicit thread liveness and logical parent IDs; physical
+Flat25/page26 archive explicit thread liveness and logical parent IDs; physical
 TIDs are transient bindings. Same-run captured hashes retain compact runtime
 provenance tied to an owned process pidfd, which is required on the host kernel.
 Disk reload may inspect any valid snapshot, but execution restore requires local
@@ -615,7 +616,7 @@ COMPLETED, STOPPED or THREAD_EXITED events. Only COMPLETED has a valid return
 value. Fatal stops clear stale syscall metadata. StateView exposes nullable
 pending result/deadline; CLI history labels pending calls without printing a
 fictional return. ABI1 shared objects must be rebuilt and adapted to phases.
-Flat23/page24 and kernel modelv10 reject incompatible execution contexts.
+Flat25/page26 and kernel modelv12 reject incompatible execution contexts.
 
 Pending I/O keeps its numeric descriptor stable: close, F_SETFL and FIONBIO on a
 referenced FD reject before mutation, pending a true pinned-open-resource model.
@@ -643,3 +644,20 @@ C, C++, Rust std, the actually installed Go compiler, CPython and OpenJDK, repor
 native/control/replay/search stages separately. A bounded DFS completion string
 is never promoted to a safety proof or a successful guest exit. Current unsupported
 runtime cases intentionally keep this audit non-green.
+
+## Shared VFS payloads
+
+`VFSNode::content` now shares immutable bytes across captured/restored branches.
+Only completed assign/write/clear operations mutate a node; no writable pointer
+or iterator escapes. Writes detach shared or store-backed content. Production
+snapshot metadata stores content of at least4096 bytes as StateStore references,
+while smaller contents remain inline. Standalone cereal archives remain complete
+and do not require a store. Reference records are self-describing, so loading does
+not depend on an ambient archive mode. Layouts25/26 reject older snapshot roots.
+
+One payload remembers registration only within a checked store generation; store
+reopen or failure cannot be bypassed by this memo. First registration retains
+existing byte-level collision checks. Missing/corrupt references fail explicitly.
+Durability uses the existing StateStore completion barrier, including payloads.
+No global payload intern table is added. First modification of a shared large
+file still copies and re-registers the whole file; file chunking is not implemented.

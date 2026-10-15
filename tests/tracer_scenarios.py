@@ -250,6 +250,58 @@ int main(int argc, char **argv) {
                 extra_env={"DETSIM_SNAPSHOT_BACKEND": backend})
             self.assertEqual(code, 0, output)
 
+    def test_large_virtual_file_branch_replay(self):
+        source = self.root / "file_branches.c"
+        source.write_text(r"""
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+volatile int observed;
+static char contents[8192];
+static char byte;
+int main(void) {
+    memset(contents, 'A', sizeof(contents));
+    int fd = open("/branch-data", O_CREAT|O_RDWR, 0600);
+    if (fd < 0 || write(fd, contents, sizeof(contents)) != sizeof(contents)) return 70;
+    if (lseek(fd, 0, SEEK_SET) != 0 || read(fd, &byte, 1) != 1 || byte != 'A') return 71;
+    if (lseek(fd, 0, SEEK_SET) != 0 || write(fd, "B", 1) != 1) return 72;
+    if (lseek(fd, 0, SEEK_SET) != 0 || read(fd, &byte, 1) != 1 || byte != 'B') return 73;
+    observed = byte;
+    write(1, "verified", 8);
+    close(fd);
+    return 0;
+}
+""")
+        subprocess.run(shlex.split(os.environ.get("CC", "/usr/bin/gcc")) +
+            ["-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie", str(source),
+             "-o", str(self.root / "probe")], check=True)
+
+        def scenario(send):
+            send("sw 0")
+            send("si")  # open
+            self.assertIn("8192) = 8192", send("si"))
+            saved = re.findall(r"=> ([0-9a-f]{16})", send("info"))[-1]
+            successor = None
+            for iteration in range(4):
+                if iteration:
+                    self.assertIn("Loaded state", send("load " + saved))
+                    self.assertIn("observed = 0", send("p observed"))
+                for _ in range(7):
+                    send("si")
+                self.assertIn("observed = 66", send("p observed"))
+                actual = re.findall(r"=> ([0-9a-f]{16})", send("info"))[-1]
+                if successor is None:
+                    successor = actual
+                self.assertEqual(actual, successor)
+            send("si")  # close
+            send("si")  # exit_group
+            self.assertIn("has exited with status 0", send("si"))
+
+        for backend in ("full", "pages"):
+            code, output = self.run_tracer(scenario, name="file_branch_" + backend,
+                extra_env={"DETSIM_SNAPSHOT_BACKEND": backend})
+            self.assertEqual(code, 0, output)
+
     def test_interactive_initial_state_and_clean_exit(self):
         code, output = self.run_tracer("sw 0\np counter\nq\n")
         self.assertRegex(output, r"(?m)^counter = 0\r?$", output)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run read-only metadata tools against legacy-format, index-free logs."""
+"""Run read-only tools against index-free logs with current metadata archives."""
 import ctypes
 import pathlib
 import struct
@@ -12,8 +12,9 @@ nodes = int(sys.argv[3]) if len(sys.argv) > 3 else 1
 xxhash = ctypes.CDLL("libxxhash.so.0")
 xxhash.XXH3_64bits.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
 xxhash.XXH3_64bits.restype = ctypes.c_uint64
-payload = struct.pack("<" + "Q" * nodes + "i" * (nodes + 1), *range(1, nodes + 1), *([1] * nodes), 4)
-identity = struct.pack("<II", 0x44535334, nodes) + payload
+legacy_payload = struct.pack("<" + "Q" * nodes + "i" * (nodes + 1), *range(1, nodes + 1), *([1] * nodes), 4)
+payload = struct.pack("<III", 0x4453534d, 2, nodes) + legacy_payload + struct.pack("<?QI", False, 0, 0)
+identity = struct.pack("<II", 0x44535335, nodes) + payload
 key = xxhash.XXH3_64bits(identity, len(identity))
 checksum = 0
 for byte in payload:
@@ -45,6 +46,14 @@ with tempfile.TemporaryDirectory(prefix="detsim-metadata-tools-") as tmp:
         data.write_bytes(broken)
         run(query, "verify", ok=False)
         run(verify, ok=False)
+    legacy_checksum = 0
+    for byte in legacy_payload:
+        legacy_checksum = (legacy_checksum * 31 + byte) & 0xffffffff
+    legacy_identity = struct.pack("<II", 0x44535334, nodes) + legacy_payload
+    legacy_key = xxhash.XXH3_64bits(legacy_identity, len(legacy_identity))
+    data.write_bytes(struct.pack("<IQII", 0x53534545, legacy_key, len(legacy_payload), legacy_checksum) + legacy_payload)
+    run(query, "verify", ok=False)
+    run(verify, ok=False)
     data.write_bytes(b"")
     run(query, "list")
     run(verify)

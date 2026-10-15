@@ -3,6 +3,8 @@
 
 #include "common.h"
 #include "fd_manager.h"
+#include <algorithm>
+#include <cstdint>
 #include <deque>
 #include <map>
 #include <memory>
@@ -28,11 +30,59 @@ long emu_chdir(const char *path);
 long emu_pipe(int pipefd[2], int flags);
 long emu_pipe2(int pipefd[2], int flags);
 
+// Only production snapshot metadata uses store references. Standalone archives
+// remain self-contained. Nested scopes restore the previous policy on exit.
+class FileContentSnapshotScope {
+  bool previous_;
+public:
+  FileContentSnapshotScope();
+  ~FileContentSnapshotScope();
+  FileContentSnapshotScope(const FileContentSnapshotScope&) = delete;
+  FileContentSnapshotScope& operator=(const FileContentSnapshotScope&) = delete;
+};
+
+// Copies share immutable bytes; mutations cannot leak writable aliases into a
+// sibling snapshot. Restored content retains StateStore's immutable buffer.
+class FileContent {
+  struct Payload;
+  std::shared_ptr<Payload> payload_;
+  const std::vector<uint8_t>& bytes() const;
+  std::vector<uint8_t>& writable();
+  void replace(std::vector<uint8_t> bytes);
+public:
+  size_t size() const { return bytes().size(); }
+  bool empty() const { return bytes().empty(); }
+  const char* data() const { return empty() ? "" : reinterpret_cast<const char*>(bytes().data()); }
+  const char* begin() const { return data(); }
+  const char* end() const { return data() + size(); }
+  char operator[](size_t offset) const { return data()[offset]; }
+  void clear() { payload_.reset(); }
+  template<class Iterator> void assign(Iterator first, Iterator last) {
+    replace(std::vector<uint8_t>(first, last));
+  }
+  void assign(size_t count, char value) { replace(std::vector<uint8_t>(count, value)); }
+  FileContent& operator=(const std::vector<char>& value) {
+    assign(value.begin(), value.end()); return *this;
+  }
+  FileContent& operator=(std::initializer_list<char> value) {
+    assign(value.begin(), value.end()); return *this;
+  }
+  void write(size_t offset, const void* source, size_t count);
+  bool operator==(const FileContent& other) const {
+    return payload_ == other.payload_ || bytes() == other.bytes();
+  }
+  bool operator==(const std::vector<char>& other) const {
+    return size() == other.size() && std::equal(begin(), end(), other.begin());
+  }
+  template<class Archive> void save(Archive& ar) const;
+  template<class Archive> void load(Archive& ar);
+};
+
 // Represents a regular file, directory, captured stream, or symbolic link.
 struct VFSNode
 {
   // Complete file content or symlink target bytes. Directories have no content.
-  std::vector<char> content;
+  FileContent content;
 
   // File metadata.
   // When FSSTATE_DETAILED_METADATA is defined, full struct stat is stored.

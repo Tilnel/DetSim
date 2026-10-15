@@ -1041,3 +1041,53 @@ Current failed probes: Rust/gccgo-pages sigaltstack131, gccgo-full allocation,
 Python missing standard-library mapping and exit1, Java access21. All retain
 non-green status. Generic symlink traversal, complete procfs, CPU-input coherence,
 standard gc Go and exhaustive scheduling remain outside this slice.
+
+## VFS payload optimization plan (2026-10-16)
+
+Invariant: snapshots own a semantic byte sequence, never a mutable buffer alias.
+Remove repeated copying and inline serialization of large unchanged VFS contents;
+retain existing file behavior and exact collision checks. First retain existing
+filesystem regression coverage and record a same-binary Redis baseline. Replace
+owned vectors with shared private payloads and completed write/assign operations;
+never expose mutable pointers. Persist large payloads through existing StateStore
+objects, with explicit tagged reference encoding only in production capture.
+Standalone archives remain self-contained. Registration memo is transient and
+store-generation scoped; cached hits still validate store health. Missing,
+corrupt and mismatched references fail, without live-host fallback.
+
+Acceptance: shared copies and branch writes/truncation isolate; inline archives
+work with no store; reference bytes are independent of registration/cache order;
+repeat saves avoid re-registering unchanged content; zero-cache/read-only reopen,
+new store generation and poisoned store behave correctly. Actual full/pages
+restore must recover file bytes across writes. Run existing IO, snapshot, plugin,
+storage and native gates, then compare repeated Redis scenarios and case outcomes.
+Snapshot layouts bump to25/26 for the new wire representation; no guest semantic
+change or new dependency. Immutable payload ownership remains scoped to reachable
+states/readers; no global unbounded interning table.
+
+VFS plan completion evidence:
+- Original HEAD1MiB node-copy sharing assertion RED; same pointer sharing plus
+  explicit write/clear isolation GREEN. No mutable content pointer is exposed.
+- check-vfs-content passes all new reference/identity/generation/corruption/poison
+  oracles, including a fresh exec reader with zero caches. Default make target
+  selectsNP1; NP2 explicit run also passes.
+- NP1: check-state-io, check-page-snapshot, check-mappings, check-storage and
+  check-integration pass. Storage-tools fixture was stale DSS4 rather than
+  production DSS5/v2; updated valid fixture and added explicit legacy rejection.
+- NP2: check-io-boundary, check-state-view, check-plugins, check-capture,
+  check-identity, check-pending-io-snapshot pass (full/pages/cache variants).
+-20 native scenarios and12 healthy/mutant case rows pass; make check9 component
+  cases/10build contracts pass. Changed C++ files/new integration fixture pass
+  strict compiler diagnostics; Python compile/diffcheck pass; independent
+  architect review approves. Production NP1/NP2 builds pass.
+- Redis comparison records12 successful fixed-schedule runs in
+  build/vfs-comparison/results.json,3each before/after × full/pages. Identical
+  server208/client58 steps. Full before[27.114,26.592,26.845]s after[7.553,7.318,
+  7.659]s; pages before[19.514,19.281,19.506]s after[2.024,1.980,1.891]s.
+  Median wall speedups3.55x/9.85x; GNU-time maxRSS medians471.9→319.0MiB/full,
+  510.9→168.1MiB/pages; stored memory+sstate bytes2158.6→599.7MiB/full,
+  1577.6→17.3MiB/pages. This is not an exhaustive-search performance guarantee.
+
+Logs: /tmp/detsim-vfs-{reference-final,gates,native,cases,snapshot-gates,
+system-gates,final-gates,check,comparison}.log. Cases artifact
+build/cases/run-uj0r661q/results.json. Format25/26; unchanged kernel modelv12.

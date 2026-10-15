@@ -112,3 +112,6 @@
 !pending_io_snapshot.mk
 
 !case_runner_integration.py
+
+!vfs_content_integration.cpp
+!vfs_content.mk

@@ -98,7 +98,7 @@ int main()
     FileSystemState link_restore;
     { cereal::BinaryInputArchive ar(link_bytes); ar(link_restore); }
     CHECK(link_restore.do_readlink("/fixture/link", target) == 0 && target == "regular");
-    link_restore.filesystem.at("/fixture/link").content[0] = 'X';
+    link_restore.filesystem.at("/fixture/link").content.write(0, "X", 1);
     CHECK(imported.do_readlink("/fixture/link", target) == 0 && target == "regular");
     // Remove host inputs: all later reads must come from the archived namespace.
     CHECK(unlink((root / "link").c_str()) == 0);

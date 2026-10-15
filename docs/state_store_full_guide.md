@@ -12,9 +12,9 @@
 | `SysStateStore` | 系统状态元数据的追加日志、索引与有界缓存 | `sysstate_store.{h,cpp}` |
 
 源文件均在 `src/core/state/`。`state.cpp` 负责捕获、恢复和语义身份，
-存储层负责保留给定字节。默认程序快照格式是v23；本分支另支持显式选择的v24页
-manifest，两者通过SnapshotView读取。v24页和manifest都用同一个StateStore保存，
-完整图的持久化以completion barrier为界；v23/v24的root hash不同。更旧格式拒绝。
+存储层负责保留给定字节。默认程序快照格式是v25；本分支另支持显式选择的v26页
+manifest，两者通过SnapshotView读取。v26页和manifest都用同一个StateStore保存，
+完整图的持久化以completion barrier为界；v25/v26的root hash不同。更旧格式拒绝。
 详见[页快照契约与测量](page-snapshots.md)。
 
 ## 保存、完成与失败
@@ -115,3 +115,17 @@ python3 tests/storage_benchmark.py build/release/np1/tests/storage_benchmark --t
 读取都比较完整字节。元数据负载为 10,000 × 32 字节。每个进程使用全新目录，
 结果和日志保存在 `build/storage-benchmark/`。实测与限制见
 [维护记录](maintenance-plan.md)，不能把这组微基准等同于所有搜索负载。
+
+
+## VFS 文件内容引用
+
+flat25/pages26 的生产 metadata 对 ≥4096 字节的 VFS 内容保存长度和 StateStore
+内容 key，小内容内联；普通独立 cereal 归档仍携带完整字节。文件内容对象只提供
+只读视图，分支复制共享内容，写入时分离。首次保存走现有逐字节碰撞校验；同一
+不可变对象在同一 store generation 内复用注册结果，每次仍检查 store 健康状态。
+重开存储必须重新注册，引用恢复检查 key/长度，缺失或损坏不回退宿主文件。
+
+文件对象与页对象共用存储和 completion barrier，不新增旁路 blob store 或全局
+驻留索引。活跃状态可能持有不可变内容，其生命周期不同于可淘汰 LRU 条目；这
+不代表全进程内存受 LRU budget 硬限制。共享大文件第一次修改仍整文件复制，
+尚未实现分块或写覆盖层。
