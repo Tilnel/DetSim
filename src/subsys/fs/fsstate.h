@@ -24,6 +24,7 @@ long emu_vfs_openat(int dirfd, const char *path, int flags, mode_t mode);
 long emu_vfs_lseek(int fd, off_t offset, int whence);
 long emu_vfs_stat(const char *path, struct stat *statbuf);
 long emu_vfs_statat(int dirfd, const char* path, struct stat* statbuf, int flags);
+long emu_vfs_accessat(int dirfd, const char* path, int mode, int flags);
 long emu_vfs_readlinkat(int dirfd, const char* path, char* buffer, size_t size);
 long emu_getcwd(char* destination, size_t size);
 long emu_chdir(const char *path);
@@ -137,7 +138,7 @@ class FileSystemState
   // Current working directory for the tracee (in VFS namespace)
   std::string cwd;
 
-  // Mappings from host directories into the VFS. Each pair is (host_base,
+  // Mappings from host files/directories/symlinks into the VFS. Each pair is (host_base,
   // target_base)
   std::vector<std::pair<std::string, std::string>> mappings;
 
@@ -176,6 +177,7 @@ class FileSystemState
   int do_close(int fd);
   off_t do_lseek(int fd, off_t offset, int whence);
   int do_stat(const std::string &path, struct stat *statbuf, bool follow = true);
+  long do_access(int dirfd, const std::string& path, int mode, int flags);
   long do_readlink(const std::string& path, std::string& target);
   void capture_executable(const std::string& path);
   int do_fstat(int fd, struct stat *statbuf);
@@ -187,7 +189,7 @@ class FileSystemState
   // Resolve a pathname according to dirfd and cwd. Returns an absolute VFS
   // path.
   std::string resolve_path(int dirfd, const std::string &path);
-  int resolve_path_checked(int dirfd, const std::string& path, std::string& result, bool follow_final = true);
+  int resolve_path_checked(int dirfd, const std::string& path, std::string& result, bool follow_final = true, bool check_search = false);
 
   // Set/get cwd
   void set_cwd(const std::string &path);

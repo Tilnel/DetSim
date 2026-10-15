@@ -76,6 +76,7 @@ void capture_process_kernel_state(int pid,int node) {
     if(threads!=1) throw std::runtime_error("Cannot inspect startup process thread set");
     adopt_thread_signal_mask(node,pid);
     ProcessKernelState captured;
+    uint32_t inherited_altstack_flags=SS_DISABLE;
     const uintptr_t address=scratch_page+0x800;
     std::array<unsigned char,128> original{};
     if(!guest_read_exact(pid,reinterpret_cast<void*>(address),original.data(),original.size()))
@@ -112,6 +113,7 @@ void capture_process_kernel_state(int pid,int node) {
         query(SYS_sigaltstack,0,address,0,0);
         stack_t stack{};read(stack);
         if(!(stack.ss_flags&SS_DISABLE)) throw std::runtime_error("Inherited alternate signal stacks are unsupported");
+        inherited_altstack_flags=SS_DISABLE | (static_cast<uint32_t>(stack.ss_flags)&0x80000000u);
     } catch(...) {
         if(!guest_write_exact(pid,reinterpret_cast<void*>(address),original.data(),original.size()))
             throw std::runtime_error("Cannot restore kernel capture scratch bytes after failure");
@@ -130,6 +132,9 @@ void capture_process_kernel_state(int pid,int node) {
     }
     if(!found) throw std::runtime_error("Cannot read inherited process umask");
     require_no_pending_signals(pid);
+    auto& task=ptmc_state.running_state.child[node].threads.front();
+    task.altstack_sp=task.altstack_size=0;
+    task.altstack_flags=inherited_altstack_flags;
     ptmc_state.process_states[node]=std::move(captured);
     ptmc_state.fs_states[node].set_creation_mask(creation_mask);
 }

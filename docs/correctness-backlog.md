@@ -386,3 +386,28 @@ Three fixed-schedule Redis SET/GET runs per mode preserve208 server and58 client
 steps: full median26.845→7.553s, pages19.506→1.980s. Median stored bytes fall from
 2158.6→599.7MiB/full and1577.6→17.3MiB/pages. Full-file COW on first mutation and
 raw snapshot transient-memory peaks remain separate limitations.
+
+### Runtime admission iteration: alternate stacks and rootfs
+
+Per-task virtual sigaltstack now archives sp/size/normalized flags, uses active
+RSP for ONSTACK, and matches native commit-before-old-copyout/error behavior.
+Clone disables child registration; exit clears it; disabled AUTODISARM from the
+trusted prelude is imported. Full/pages×normal/tiny replay, carrier reuse, native
+partial fault oracles and malformed capture/restore guards pass. Virtual minimum
+2048 is explicit kernel profilev13; layout27/28. Physical carriers stay disabled,
+inherited enabled stacks and handler delivery remain unsupported.
+
+FSMap now captures actual root file/directory/link type, hidden names and exact
+bytes, rejects missing/unreadable/unsupported inputs and invalid ancestor/root
+overlays. F_OK access family uses saved paths and rejects credential-dependent
+search; R/W/X and generic symlink following remain unsupported. Runtime workloads
+provide explicit Python/JDK roots and input manifests, outside generic product.
+
+Rust std probe completes full/pages. gccgo pages now stops at pselect6(270).
+Python rootfs exposed a separate DFS ownership defect: ~30 ancestor frames each
+retain independently decompressed identical VFS payloads when the files exceed
+hot-cache capacity. GDB confirmed30 byte-identical allocations per several large
+files and ~2.085GB in use; this is not merely fragmentation. Hash-only ancestor
+residency is the next bounded fix. Java stops at ordinary jvm.cfg symlink traversal;
+per user instruction, costly JVM-specific work may be deferred explicitly without
+blocking other cases, while keeping its status non-green.

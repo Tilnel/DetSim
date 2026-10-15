@@ -51,10 +51,10 @@ runner 只依赖 Python 标准库及已有编译器。不会下载依赖、修�
 | --- | --- | --- | --- |
 | C | GCC14.2 | 通过 | 标记及退出0，搜索完成 |
 | C++ std | GCC14.2 | 通过 | 标记及退出0，搜索完成 |
-| Rust std | rustc1.51.0 | 通过 | 仍阻塞于 `sigaltstack`，syscall131 |
-| Go | gccgo14.2（非标准 gc） | 通过 | pages 推进到 `sigaltstack`；full 捕获发生 `bad_alloc` |
-| Python | CPython3.13.5，`-I -S` | 通过 | 已越过 `readlink`；缺少映射的标准库，退出1，验收失败 |
-| Java | OpenJDK21.0.12.1 | 通过 | 已越过 `readlink`，下一阻塞为 `access`，syscall21 |
+| Rust std | rustc1.51.0 | 通过 | full/pages 已完成输出检查及退出0 |
+| Go | gccgo14.2（非标准 gc） | 通过 | pages 推进到 `pselect6`；full 仍有内存分配失败 |
+| Python | CPython3.13.5，`-I -S` | 通过 | 已捕获标准库；DFS 祖先重复持有文件内容导致内存失败，正在修复 |
+| Java | OpenJDK21.0.12.1 | 通过 | 已越过 F_OK 查询，当前停在普通符号链接遍历；依用户取舍为条件目标 |
 
 这些版本是本机实测，不代表整个语言、其他版本或所有库已受支持。Java 保留正常 JVM/JIT，只显式限制 heap/code cache/class space；没有把 JVM 私有结构补丁放进框架。标准 gc Go 的单独准入目标尚待可用工具链；不能用 gccgo 结果代替它。
 
@@ -85,3 +85,11 @@ runner 只依赖 Python 标准库及已有编译器。不会下载依赖、修�
 4. 再推进完整 RedisRaft、真实多线程/多进程系统。只有具体案例要求时再扩展 actor/timeout/outcome 枚举和共享内存切换边界。
 
 候选目标与状态见 [catalog.json](catalog.json)。已知限制必须保持为 unsupported、bounded、timeout 或 failed，不能统计成已验证安全。`case_runner_integration.py` 专门验证深度不足和缺失工具链不会变绿。
+
+
+准入迭代补充：sigaltstack 注册/查询为每逻辑线程状态，物理 carrier 保持禁用，
+固定虚拟最小栈2048；不声称支持 handler delivery。FSMap 现在能导入单文件、
+目录和链接，并显式报告输入失败；F_OK 查保存的命名空间，凭据相关模式仍拒绝。
+当前格式flat27/pages28、kernelv13。runtime runner 为 Python/JDK 保存显式
+rootfs manifest及输入哈希；解释器性质使用协议观察，不假定DWARF能解释对象堆。
+Java若需要重大JVM私有机制工作，可以保留为明确未通过的研究目标；不可伪造通过。

@@ -25,14 +25,14 @@ void clear_snapshot_thread_bindings();
  * State Data Format (shared with StateStore)
  * ====================================================================== */
 
-inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 25;
-inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 26;
+inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 27;
+inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 28;
 
 /* Packed to avoid alignment padding */
 struct __attribute__((packed)) StateDataHeader
 {
   uint32_t magic;         // 'DSTM' = 0x4453544D
-  uint32_t version;       // 25: flat; 26: pages (shared VFS content references)
+  uint32_t version;       // 27: flat; 28: pages (per-task alternate signal stack)
   uint32_t num_regions;   // number of memory regions
   uint64_t tstate_offset; // offset to serialized tracee_state
   uint64_t tstate_size;   // size of serialized tracee_state
@@ -97,6 +97,8 @@ struct thread_state
   bool is_main;                   // Whether this is the main thread
   std::optional<PendingSyscall> pending_syscall; // Logical unfinished call
   uint64_t robust_list_head = 0;   // Logical native robust-list registration
+  uint64_t altstack_sp = 0, altstack_size = 0; // Virtual native alternate stack
+  uint32_t altstack_flags = 2;     // SS_DISABLE; SS_AUTODISARM retained
   uint64_t signal_mask = 0;        // Linux native 64-signal blocked mask
   uint64_t clear_child_tid = 0;    // Logical set_tid_address / CLONE_CHILD_CLEARTID
   uint64_t pending_child_settid = 0;
@@ -115,7 +117,8 @@ struct thread_state
        regs.rsi, regs.rdi, regs.orig_rax, regs.rip, regs.cs, regs.eflags,
        regs.rsp, regs.ss, regs.fs_base, regs.gs_base, regs.ds, regs.es,
        regs.fs, regs.gs, clone_flags, stack_addr, ptid, is_main, xstate,
-       clear_child_tid, pending_child_settid, child_settid_pending, signal_mask, robust_list_head);
+       clear_child_tid, pending_child_settid, child_settid_pending, signal_mask, robust_list_head,
+       altstack_sp, altstack_size, altstack_flags);
     bool pending = pending_syscall.has_value();
     ar(pending);
     if constexpr (Archive::is_loading::value) {

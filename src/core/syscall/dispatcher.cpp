@@ -151,6 +151,9 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         case SYS_lstat:
         case SYS_readlink:
         case SYS_readlinkat:
+        case SYS_access:
+        case SYS_faccessat:
+        case SYS_faccessat2:
             return SyscallRoute(SyscallCategory::EMULATED,
                                SyscallAction::EMULATE,
                                "VFS syscall - emulated");
@@ -183,7 +186,6 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         case SYS_setxattr: case SYS_lsetxattr: case SYS_fsetxattr:
         case SYS_removexattr: case SYS_lremovexattr: case SYS_fremovexattr:
         case SYS_mount: case SYS_umount2: case SYS_pivot_root: case SYS_chroot:
-        case SYS_access: case SYS_faccessat: case SYS_faccessat2:
         case SYS_statx:
         case SYS_getxattr: case SYS_lgetxattr: case SYS_fgetxattr:
         case SYS_listxattr: case SYS_llistxattr: case SYS_flistxattr:
@@ -196,7 +198,7 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
                                 "rseq syscall unavailable in this execution environment");
 
         case SYS_set_robust_list: case SYS_get_robust_list:
-        case SYS_clone: case SYS_clone3: case SYS_set_tid_address: case SYS_rt_sigprocmask:
+        case SYS_clone: case SYS_clone3: case SYS_set_tid_address: case SYS_rt_sigprocmask: case SYS_sigaltstack:
         case SYS_exit: case SYS_getpid: case SYS_gettid:
             return SyscallRoute(SyscallCategory::EMULATED, SyscallAction::EMULATE,
                                 "Modeled logical thread lifecycle or identity");
@@ -387,6 +389,9 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
         case SYS_lstat:
         case SYS_readlink:
         case SYS_readlinkat:
+        case SYS_access:
+        case SYS_faccessat:
+        case SYS_faccessat2:
             return handle_fs_exit(pid, info);
 
         case SYS_getpid:
@@ -401,6 +406,7 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
         case SYS_set_robust_list:
         case SYS_get_robust_list:
         case SYS_rt_sigprocmask:
+        case SYS_sigaltstack:
         case SYS_exit:
         case SYS_exit_group:
             return handle_thread_exit(pid, info);

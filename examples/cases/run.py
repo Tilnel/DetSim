@@ -11,6 +11,7 @@ import resource
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import time
 
@@ -326,6 +327,53 @@ def admission_controls(tracer, argv, plugin, directory, backend, timeout, fsmap)
         if row["tracer_exit"] and row.get("status")=="pass":row.update(status="failed",diagnostic="cleanup failed")
 
 
+def runtime_files(language, tool, source, out):
+    """Explicit workload inputs; never discover host files during exploration."""
+    roots = [source]
+    if language == "py":
+        probe = command(tool + ["-I", "-S", "-c",
+            "import json,sysconfig; print(json.dumps(sorted(set(sysconfig.get_path(k) for k in ('stdlib','platstdlib')))))"], out)
+        require(probe.returncode == 0, probe.stdout)
+        roots += [Path(path) for path in json.loads(probe.stdout)]
+    elif language == "java":
+        home = Path(tool[0]).resolve().parent.parent
+        roots += [home / "lib", home / "conf", home / "release", out / "RuntimeProbe.class"]
+    # Retain external symlink referents as explicit mappings too; do not flatten
+    # symlinks in the input namespace. Missing referents remain genuinely absent.
+    entries = {}
+    mappings = []
+    seen_roots = set()
+    while roots:
+        root = Path(os.path.abspath(roots.pop(0)))
+        if root in seen_roots:
+            continue
+        seen_roots.add(root)
+        mappings.append({"Host": str(root), "Target": str(root)})
+        paths = [root]
+        if root.is_dir() and not root.is_symlink():
+            for current, dirs, files in os.walk(root, followlinks=False):
+                paths += [Path(current) / name for name in sorted(dirs + files)]
+        for path in paths:
+            if str(path) in entries:
+                continue
+            mode = path.lstat().st_mode
+            entry = {"path": str(path), "mode": mode}
+            if stat.S_ISLNK(mode):
+                target = os.readlink(path)
+                entry["link"] = target
+                referent = Path(os.path.abspath(path.parent / target))
+                if (referent.exists() or referent.is_symlink()) and not referent.is_relative_to(root):
+                    roots.append(referent)
+            elif stat.S_ISREG(mode):
+                entry.update(size=path.stat().st_size, sha256=digest(path))
+            elif not stat.S_ISDIR(mode):
+                raise CaseFailure("unsupported runtime input type: " + str(path))
+            entries[str(path)] = entry
+    manifest = out / ("rootfs-" + language + ".json")
+    manifest.write_text(json.dumps({"mappings": mappings, "entries": sorted(entries.values(), key=lambda row: row["path"])}, indent=2))
+    return mappings, manifest
+
+
 def runtimes(args, out, cc, cxx):
     plugin = out / "admission_checker.so"
     build_plugin(HERE / "admission_checker.cpp", plugin, cxx)
@@ -369,8 +417,8 @@ def runtimes(args, out, cc, cxx):
                        native_exit=native.returncode, native_output=native.stdout[-2000:])
             require(row["native"] == "pass", "native runtime probe failed")
             row["binary_sha256"] = digest(argv[0])
-            mappings = [{"Host": str(source), "Target": str(source)}]
-            if language == "java": mappings.append({"Host": str(out / "RuntimeProbe.class"), "Target": str(out / "RuntimeProbe.class")})
+            mappings, manifest = runtime_files(language, tool, source, out)
+            row.update(rootfs_manifest=str(manifest), rootfs_sha256=digest(manifest))
             for backend in args.backends:
                 result = dict(row, backend=backend)
                 result["control"] = admission_controls(args.tracer, argv, plugin,

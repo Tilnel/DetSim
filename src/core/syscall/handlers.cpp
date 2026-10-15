@@ -232,6 +232,15 @@ int handle(pid_t pid, syscall_info &info) {
         case SYS_newfstatat:return handle_statat(pid,info);
         case SYS_getcwd:    return handle_getcwd(pid,info);
         case SYS_lstat:     return handle_stat(pid,info);
+        case SYS_access:
+        case SYS_faccessat:
+        case SYS_faccessat2: {
+            const bool at = info.nr != SYS_access;
+            const long result = emu_vfs_accessat(at ? static_cast<int>(info.args[0]) : AT_FDCWD,
+                (const char*)info.args[at ? 1 : 0], static_cast<int>(info.args[at ? 2 : 1]),
+                info.nr == SYS_faccessat2 ? static_cast<int>(info.args[3]) : 0);
+            tracee_set_rax(pid,result); info.rval=result; return CKPT_YES;
+        }
         case SYS_readlink:
         case SYS_readlinkat: {
             const bool at = info.nr == SYS_readlinkat;
@@ -393,6 +402,9 @@ int handle(pid_t pid, syscall_info &info) {
             tracee_set_rax(pid,info.rval);return CKPT_YES;
         case SYS_rt_sigprocmask:
             info.rval=emulate_thread_sigprocmask(ptmc_state.cursor,pid,info.args[0],info.args[1],info.args[2],info.args[3]);
+            tracee_set_rax(pid,info.rval);return CKPT_YES;
+        case SYS_sigaltstack:
+            info.rval=emulate_thread_sigaltstack(ptmc_state.cursor,pid,info.args[0],info.args[1]);
             tracee_set_rax(pid,info.rval);return CKPT_YES;
         case SYS_set_tid_address:
             info.rval=record_logical_clear_tid(ptmc_state.cursor,pid,info.args[0]);

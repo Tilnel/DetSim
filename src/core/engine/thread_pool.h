@@ -28,6 +28,7 @@ long emulate_get_robust_list(int node, pid_t caller, int32_t target,
                             uint64_t head_out, uint64_t length_out);
 long emulate_thread_sigprocmask(int node, pid_t physical_tid, uint64_t how,
                                uint64_t new_mask, uint64_t old_mask, uint64_t size);
+long emulate_thread_sigaltstack(int node, pid_t physical_tid, uint64_t new_stack, uint64_t old_stack);
 void restore_thread_signal_masks(int node, const tracee_state& state);
 void validate_logical_clone(uint64_t flags);
 pid_t create_logical_thread(int node, pid_t parent, uint64_t flags,

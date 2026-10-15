@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <iostream>
 #include <limits>
+#include <climits>
 #include <libgen.h>
 #include <string.h>
 #include <sys/types.h>
@@ -270,14 +271,19 @@ static std::string join_paths(const std::string &base, const std::string &rel)
 
 void FileSystemState::ensure_dir_exists(const std::string &path)
 {
-  if (filesystem.find(path) != filesystem.end())
-    return;
-
   const size_t slash = path.find_last_of('/');
   if (slash != std::string::npos && slash > 0)
     ensure_dir_exists(path.substr(0, slash));
   else if (path != "/")
     ensure_dir_exists("/");
+  // Ordered overlays can leave an existing directory below a replaced parent.
+  // Validate the whole chain before trusting or creating this directory.
+  if (const auto existing = filesystem.find(path); existing != filesystem.end()) {
+    if (!S_ISDIR(existing->second.metadata.st_mode))
+      throw std::runtime_error("VFS ancestor is not a directory: " + path);
+    return;
+  }
+
   VFSNode dir{};
   dir.metadata.st_mode = S_IFDIR | 0755;
   dir.metadata.st_size = 0;
@@ -291,99 +297,93 @@ void FileSystemState::init_from_mappings(
 
   ensure_dir_exists("/");
 
-  for (const auto &m : mappings)
-  {
-    const std::string &host_base = m.first;
-    const std::string &target_base = m.second;
-
-    ensure_dir_exists(target_base);
-
-    DIR *d = opendir(host_base.c_str());
-    if (!d)
-      continue;
-    struct dirent *de;
-    std::vector<std::string> stack;
-    stack.push_back(host_base);
-    while (!stack.empty())
-    {
-      std::string cur = stack.back();
-      stack.pop_back();
-      DIR *cd = opendir(cur.c_str());
-      if (!cd)
-        continue;
-      while ((de = readdir(cd)) != NULL)
-      {
-        if (de->d_name[0] == '.')
-          continue;
-        std::string host_p = cur + "/" + de->d_name;
-        struct stat st;
-        if (lstat(host_p.c_str(), &st) < 0)
-          continue;
-
-        std::string rel = host_p.substr(host_base.size());
-        if (!rel.empty() && rel[0] == '/')
-          rel = rel.substr(1);
-        std::string target_p = target_base;
-        if (target_p.back() != '/')
-          target_p += '/';
-        target_p += rel;
-
-        if (S_ISDIR(st.st_mode))
-        {
-          ensure_dir_exists(target_p);
-          stack.push_back(host_p);
-          continue;
-        }
-
-        // Create parent directories for the file
-        size_t last_slash = target_p.find_last_of('/');
-        if (last_slash != std::string::npos && last_slash > 0)
-        {
-          std::string parent = target_p.substr(0, last_slash);
-          ensure_dir_exists(parent);
-        }
-
-        if (S_ISLNK(st.st_mode)) {
-          std::vector<char> target(4096);
-          const ssize_t length = readlink(host_p.c_str(), target.data(), target.size());
-          if (length < 0 || static_cast<size_t>(length) == target.size())
-            throw std::runtime_error("Cannot capture VFS symlink: " + host_p);
-          target.resize(length);
-          VFSNode node{};
-          node.content = std::move(target);
-          node.metadata.st_mode = st.st_mode;
-          node.metadata.st_size = length;
-          filesystem[target_p] = std::move(node);
-          continue;
-        }
-        std::ifstream ifs(host_p, std::ios::binary);
-        std::vector<char> content;
-        if (ifs)
-        {
-          ifs.seekg(0, std::ios::end);
-          std::streamsize sz = ifs.tellg();
-          ifs.seekg(0, std::ios::beg);
-          if (sz > 0)
-          {
-            content.resize((size_t)sz);
-            ifs.read(content.data(), sz);
-          }
-        }
-
-        VFSNode node;
-        node.content = std::move(content);
+  // Capture objects in mapping order. Never follow a captured final symlink or
+  // turn an unreadable/unsupported object into a successful empty file.
+  for (const auto& [host_base, target_base] : mappings) {
+    if (target_base.empty() || target_base.front() != '/')
+      throw std::runtime_error("VFS mapping target must be absolute: " + target_base);
+    std::vector<std::pair<std::string, std::string>> pending{
+        {host_base, resolve_path(AT_FDCWD, target_base)}};
+    while (!pending.empty()) {
+      auto [host, target] = std::move(pending.back());
+      pending.pop_back();
+      const auto fail = [&host](const char* operation) {
+        throw std::runtime_error(std::string("Cannot capture VFS ") + operation + ": " + host);
+      };
+      struct stat st{};
+      if (lstat(host.c_str(), &st) < 0) fail("metadata");
+      if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode))
+        fail("unsupported object");
+      if (target == "/" && !S_ISDIR(st.st_mode)) fail("non-directory root");
+      if (target != "/") {
+        const size_t slash = target.find_last_of('/');
+        ensure_dir_exists(slash == 0 ? "/" : target.substr(0, slash));
+      }
+      VFSNode node{};
 #ifdef FSSTATE_DETAILED_METADATA
-        memset(&node.metadata, 0, sizeof(struct stat));
+      if (S_ISREG(st.st_mode)) {
         node.metadata.st_nlink = 1;
         node.metadata.st_mtime = st.st_mtime;
-#endif
-        node.metadata.st_mode = st.st_mode;
-        node.metadata.st_size = node.content.size();
-        filesystem[target_p] = std::move(node);
       }
-      closedir(cd);
+#endif
+      node.metadata.st_mode = st.st_mode;
+      node.metadata.st_size = 0;
+      if (S_ISLNK(st.st_mode)) {
+        std::vector<char> bytes(4096);
+        const ssize_t length = readlink(host.c_str(), bytes.data(), bytes.size());
+        if (length < 0 || static_cast<size_t>(length) == bytes.size()) fail("symlink");
+        bytes.resize(length);
+        node.content = bytes;
+        node.metadata.st_size = length;
+      } else {
+        const int raw = open(host.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW |
+            (S_ISDIR(st.st_mode) ? O_DIRECTORY : O_NONBLOCK));
+        if (raw < 0) fail("open");
+        struct Descriptor { int fd; ~Descriptor() { if (fd >= 0) close(fd); } } descriptor{raw};
+        struct stat opened{};
+        if (fstat(raw, &opened) < 0 || opened.st_dev != st.st_dev ||
+            opened.st_ino != st.st_ino || opened.st_mode != st.st_mode ||
+            opened.st_size != st.st_size) fail("changed object");
+        if (S_ISDIR(st.st_mode)) {
+          DIR* directory = fdopendir(raw);
+          if (!directory) fail("directory");
+          descriptor.fd = -1;
+          struct Directory { DIR* value; ~Directory() { closedir(value); } } owner{directory};
+          while (true) {
+            errno = 0;
+            const auto* entry = readdir(directory);
+            if (!entry) {
+              if (errno) fail("directory entries");
+              break;
+            }
+            const std::string name(entry->d_name);
+            if (name == "." || name == "..") continue;
+            pending.emplace_back(join_paths(host, name), join_paths(target, name));
+          }
+        } else {
+          if (st.st_size < 0 || static_cast<uintmax_t>(st.st_size) >
+              std::numeric_limits<size_t>::max()) fail("file size");
+          std::vector<char> bytes(static_cast<size_t>(st.st_size));
+          size_t offset = 0;
+          while (offset < bytes.size()) {
+            const ssize_t count = read(raw, bytes.data() + offset,
+                std::min(bytes.size() - offset, static_cast<size_t>(SSIZE_MAX)));
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) fail("file bytes");
+            offset += count;
+          }
+          char extra;
+          ssize_t count;
+          do { count = read(raw, &extra, 1); } while (count < 0 && errno == EINTR);
+          if (count != 0) fail("file extent");
+          node.content = bytes;
+          node.metadata.st_size = bytes.size();
+        }
+      }
+      // A later mapping may replace the object at exactly the same path. Its
+      // descendants retain the established ordered overlay behavior.
+      filesystem[target] = std::move(node);
     }
-    closedir(d);
   }
 }
 
@@ -448,7 +448,7 @@ std::string FileSystemState::resolve_path(int dirfd, const std::string &path)
   return out;
 }
 
-int FileSystemState::resolve_path_checked(int dirfd, const std::string& path, std::string& result, bool follow_final)
+int FileSystemState::resolve_path_checked(int dirfd, const std::string& path, std::string& result, bool follow_final, bool check_search)
 {
   if (path.empty()) return -ENOENT;
   if (path[0]!='/' && dirfd!=AT_FDCWD) {
@@ -469,6 +469,13 @@ int FileSystemState::resolve_path_checked(int dirfd, const std::string& path, st
     const size_t end = path.find('/', position);
     const std::string part = path.substr(position, end-position);
     if (part.empty()) break;
+    if (check_search) {
+      const auto parent = filesystem.find(current);
+      if (parent == filesystem.end()) return -ENOENT;
+      if (!S_ISDIR(parent->second.metadata.st_mode)) return -ENOTDIR;
+      if ((parent->second.metadata.st_mode & 0111) != 0111)
+        throw std::runtime_error("VFS search permission requires captured credentials: " + current);
+    }
     current = resolve_path(AT_FDCWD, join_paths(current, part));
     const auto node = filesystem.find(current);
     const bool final = end == std::string::npos;
@@ -1047,6 +1054,38 @@ long emu_vfs_statat(int dirfd,const char* path_ptr,struct stat* destination,int 
   if (result) return result;
   return guest_write_exact(ptmc_state.pids[ptmc_state.cursor],destination,&value,sizeof(value))?0:-EFAULT;
 }
+long FileSystemState::do_access(int dirfd, const std::string& input, int mode, int flags)
+{
+  if ((mode & ~(R_OK | W_OK | X_OK)) ||
+      (flags & ~(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))) return -EINVAL;
+  if (mode != F_OK)
+    throw std::runtime_error("VFS access permissions require captured credentials");
+  std::string path = input;
+  if (path.empty() && (flags & AT_EMPTY_PATH)) {
+    if (dirfd == AT_FDCWD) return filesystem.contains(cwd.empty() ? "/" : cwd) ? 0 : -ENOENT;
+    if (!fd_manager_ || !fd_manager_->is_allocated(dirfd)) return -EBADF;
+    const auto opened = open_files.find(dirfd);
+    if (opened == open_files.end())
+      throw std::runtime_error("VFS empty access on non-file descriptor is not modeled");
+    return filesystem.contains(opened->second.path) ? 0 : -ENOENT;
+  }
+  std::string resolved;
+  const int error = resolve_path_checked(dirfd, path, resolved,
+      !(flags & AT_SYMLINK_NOFOLLOW), true);
+  if (error) return error;
+  return filesystem.contains(resolved) ? 0 : -ENOENT;
+}
+
+long emu_vfs_accessat(int dirfd, const char* path_ptr, int mode, int flags)
+{
+  if ((mode & ~(R_OK | W_OK | X_OK)) ||
+      (flags & ~(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))) return -EINVAL;
+  std::string path;
+  const long copied = read_guest_string(path_ptr, path);
+  if (copied) return copied;
+  return ptmc_state.fs_states[ptmc_state.cursor].do_access(dirfd, path, mode, flags);
+}
+
 long emu_getcwd(char* destination,size_t size)
 {
   if (!size) return -EINVAL;

@@ -163,6 +163,8 @@ int main() {
     const pid_t child=fork();
     if(child==0) {
         signal(SIGINT,SIG_IGN);umask(0077);
+        stack_t disabled{};disabled.ss_flags=static_cast<int>(0x80000002u);
+        if(syscall(SYS_sigaltstack,&disabled,nullptr))_exit(4);
         if(mmap(reinterpret_cast<void*>(scratch_page),4096,PROT_READ|PROT_WRITE|PROT_EXEC,
                 MAP_FIXED_NOREPLACE|MAP_PRIVATE|MAP_ANONYMOUS,-1,0)==MAP_FAILED) _exit(2);
         auto* code=reinterpret_cast<unsigned char*>(scratch_page+0xff0);code[0]=0x0f;code[1]=0x05;
@@ -170,6 +172,7 @@ int main() {
         asm volatile("int3");_exit(0);
     }
     bool bootstrap_ok=false,mask_adopted=false,pending_rejected=false;
+    bool altstack_adopted=false,enabled_altstack_rejected=false;
     if(child>0) {
         int status=0;
         if(waitpid(child,&status,0)==child && WIFSTOPPED(status) &&
@@ -179,6 +182,20 @@ int main() {
                 capture_process_kernel_state(child,0);
                 bootstrap_ok=ptmc_state.process_states[0].signal_actions.at(SIGINT).handler==1 &&
                     ptmc_state.fs_states[0].creation_mask()==0077;
+                const auto& bootstrap_task=ptmc_state.running_state.child[0].threads.front();
+                altstack_adopted=bootstrap_task.altstack_sp==0 && bootstrap_task.altstack_size==0 &&
+                    bootstrap_task.altstack_flags==0x80000002u;
+                stack_t enabled{};enabled.ss_sp=reinterpret_cast<void*>(0x100000);enabled.ss_size=8192;
+                guest_write_exact(child,reinterpret_cast<void*>(scratch_page+0x900),&enabled,sizeof(enabled));
+                if(static_cast<int64_t>(tracee_do_syscall(child,SYS_sigaltstack,scratch_page+0x900,0,0,0,0,0))==0) {
+                    try {capture_process_kernel_state(child,0);}
+                    catch(const std::runtime_error& e) {
+                        enabled_altstack_rejected=std::string(e.what()).find("Inherited alternate signal stacks")!=std::string::npos;
+                    }
+                }
+                stack_t disabled{};disabled.ss_flags=static_cast<int>(0x80000002u);
+                guest_write_exact(child,reinterpret_cast<void*>(scratch_page+0x900),&disabled,sizeof(disabled));
+                tracee_do_syscall(child,SYS_sigaltstack,scratch_page+0x900,0,0,0,0,0);
                 const uint64_t mask=1ULL<<(SIGUSR1-1);
                 guest_write_exact(child,reinterpret_cast<void*>(scratch_page+0x900),&mask,sizeof(mask));
                 tracee_do_syscall(child,SYS_rt_sigprocmask,SIG_BLOCK,scratch_page+0x900,0,8,0,0);
@@ -191,6 +208,8 @@ int main() {
         kill(child,SIGKILL);waitpid(child,&status,0);
     }
     check(bootstrap_ok,"native bootstrap imports inherited dispositions and umask");
+    check(altstack_adopted,"native bootstrap imports disabled AUTODISARM alternate stack flags");
+    check(enabled_altstack_rejected,"native bootstrap rejects enabled alternate stack");
     check(mask_adopted,"native bootstrap adopts inherited blocked mask");
     check(pending_rejected,"native bootstrap rejects inherited pending signals");
     printf("process kernel model: %d failures\n",failures);return failures?1:0;

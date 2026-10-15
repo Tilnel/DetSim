@@ -12,9 +12,9 @@
 | `SysStateStore` | 系统状态元数据的追加日志、索引与有界缓存 | `sysstate_store.{h,cpp}` |
 
 源文件均在 `src/core/state/`。`state.cpp` 负责捕获、恢复和语义身份，
-存储层负责保留给定字节。默认程序快照格式是v25；本分支另支持显式选择的v26页
-manifest，两者通过SnapshotView读取。v26页和manifest都用同一个StateStore保存，
-完整图的持久化以completion barrier为界；v25/v26的root hash不同。更旧格式拒绝。
+存储层负责保留给定字节。默认程序快照格式是v27；本分支另支持显式选择的v28页
+manifest，两者通过SnapshotView读取。v28页和manifest都用同一个StateStore保存，
+完整图的持久化以completion barrier为界；v27/v28的root hash不同。更旧格式拒绝。
 详见[页快照契约与测量](page-snapshots.md)。
 
 ## 保存、完成与失败
@@ -119,7 +119,7 @@ python3 tests/storage_benchmark.py build/release/np1/tests/storage_benchmark --t
 
 ## VFS 文件内容引用
 
-flat25/pages26 的生产 metadata 对 ≥4096 字节的 VFS 内容保存长度和 StateStore
+flat27/pages28 的生产 metadata 对 ≥4096 字节的 VFS 内容保存长度和 StateStore
 内容 key，小内容内联；普通独立 cereal 归档仍携带完整字节。文件内容对象只提供
 只读视图，分支复制共享内容，写入时分离。首次保存走现有逐字节碰撞校验；同一
 不可变对象在同一 store generation 内复用注册结果，每次仍检查 store 健康状态。

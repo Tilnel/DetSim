@@ -302,6 +302,34 @@ int main(void) {
                 extra_env={"DETSIM_SNAPSHOT_BACKEND": backend})
             self.assertEqual(code, 0, output)
 
+    def test_access_syscall_abi(self):
+        source = self.root / "access_probe.c"
+        source.write_text(r"""
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+int main(void) {
+    int fd = open("access-file", O_CREAT|O_RDWR, 0600);
+    if (fd < 0 || close(fd)) return 70;
+    if (syscall(SYS_access, "access-file", F_OK)) return 71;
+    if (syscall(SYS_faccessat, AT_FDCWD, "access-file", F_OK, ~0UL)) return 72;
+    if (syscall(SYS_faccessat2, AT_FDCWD, "access-file", F_OK, 0)) return 73;
+    if (syscall(SYS_faccessat2, AT_FDCWD, (void*)0, 8, 0) != -1 || errno != EINVAL) return 74;
+    if (syscall(SYS_access, "missing-file", F_OK) != -1 || errno != ENOENT) return 75;
+    return 0;
+}
+""")
+        subprocess.run(shlex.split(os.environ.get("CC", "/usr/bin/gcc")) +
+            ["-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie", str(source),
+             "-o", str(self.root / "probe")], check=True)
+        subprocess.run([str(self.root / "probe")], cwd=self.root, check=True, timeout=5)
+        for backend in ("full", "pages"):
+            code, output = self.run_tracer("sw 0\nbfs\nsi\nq\n", name="access_" + backend,
+                extra_env={"DETSIM_SNAPSHOT_BACKEND": backend})
+            self.assertEqual(code, 0, output)
+            self.assertIn("has exited with status 0", output)
+
     def test_interactive_initial_state_and_clean_exit(self):
         code, output = self.run_tracer("sw 0\np counter\nq\n")
         self.assertRegex(output, r"(?m)^counter = 0\r?$", output)

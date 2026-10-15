@@ -7,6 +7,9 @@
 #include <filesystem>
 #include <fstream>
 #include <unistd.h>
+#include <sys/syscall.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -21,6 +24,7 @@ int main()
   {
     char temporary[] = "/tmp/detsim-readlink-XXXXXX";
     CHECK(mkdtemp(temporary));
+    CHECK(chmod(temporary, 0755) == 0);
     const std::filesystem::path root(temporary);
     struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{root};
     std::ofstream(root / "regular") << "payload";
@@ -36,12 +40,69 @@ int main()
       ambiguous.capture_executable((root / "directory_alias/../regular").string());
     } catch (const std::runtime_error&) { dotdot_rejected = true; }
     CHECK(dotdot_rejected);
+    // A mapping root is an object, not an implicitly manufactured directory.
+    std::ofstream(root / ".hidden", std::ios::binary) << std::string("a\0b", 3);
+    CHECK(chmod((root / "real").c_str(), 0711) == 0);
+    FileSystemState single(std::make_shared<FdManager>());
+    single.init_from_mappings({{(root / ".hidden").string(), "/nested/file"},
+                               {(root / "dangling").string(), "/nested/link"}});
+    CHECK(S_ISREG(single.filesystem.at("/nested/file").metadata.st_mode));
+    CHECK(single.filesystem.at("/nested/file").content == std::vector<char>({'a', '\0', 'b'}));
+    CHECK(S_ISLNK(single.filesystem.at("/nested/link").metadata.st_mode));
+    for (const auto& maps : std::vector<std::vector<std::pair<std::string, std::string>>>{
+        {{(root / "missing").string(), "/missing"}},
+        {{(root / "regular").string(), "/"}},
+        {{(root / "dangling").string(), "/"}},
+        {{(root / "real").string(), "/tree"}, {(root / "regular").string(), "/tree"},
+         {(root / "regular").string(), "/tree/deep/new"}},
+        {{(root / "regular").string(), "/parent"}, {(root / "regular").string(), "/parent/child"}}}) {
+      bool rejected = false;
+      try { FileSystemState invalid; invalid.init_from_mappings(maps); }
+      catch (const std::runtime_error&) { rejected = true; }
+      CHECK(rejected);
+    }
+    CHECK(mkfifo((root / "fifo").c_str(), 0600) == 0);
+    bool fifo_rejected = false;
+    try { FileSystemState invalid; invalid.init_from_mappings({{(root / "fifo").string(), "/fifo"}}); }
+    catch (const std::runtime_error&) { fifo_rejected = true; }
+    CHECK(fifo_rejected);
+    CHECK(unlink((root / "fifo").c_str()) == 0);
+    const int socket_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(socket_fd >= 0);
+    sockaddr_un address{}; address.sun_family = AF_UNIX;
+    const std::string socket_path = (root / "socket").string();
+    CHECK(socket_path.size() < sizeof(address.sun_path));
+    strcpy(address.sun_path, socket_path.c_str());
+    CHECK(bind(socket_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    bool socket_rejected = false;
+    try { FileSystemState invalid; invalid.init_from_mappings({{socket_path, "/socket"}}); }
+    catch (const std::runtime_error&) { socket_rejected = true; }
+    CHECK(socket_rejected);
+    CHECK(close(socket_fd) == 0 && unlink(socket_path.c_str()) == 0);
+    std::ofstream(root / "unreadable") << "must not become empty";
+    CHECK(chmod((root / "unreadable").c_str(), 0) == 0);
+    // Root can read mode000 files; exercise the error where host credentials deny it.
+    if (geteuid() != 0) {
+      bool unreadable_rejected = false;
+      try { FileSystemState invalid; invalid.init_from_mappings({{(root / "unreadable").string(), "/unreadable"}}); }
+      catch (const std::runtime_error&) { unreadable_rejected = true; }
+      CHECK(unreadable_rejected);
+    }
+    CHECK(unlink((root / "unreadable").c_str()) == 0);
+    FileSystemState overlay;
+    overlay.init_from_mappings({{(root / "regular").string(), "/same"},
+                                {(root / ".hidden").string(), "/same"}});
+    CHECK(overlay.filesystem.at("/same").content == std::vector<char>({'a', '\0', 'b'}));
     FileSystemState imported(std::make_shared<FdManager>());
     imported.init_from_mappings({{root.string(), "/fixture"}});
+    CHECK(imported.filesystem.at("/fixture/.hidden").content == std::vector<char>({'a', '\0', 'b'}));
+    CHECK((imported.filesystem.at("/fixture/real").metadata.st_mode & 0777) == 0711);
     CHECK(S_ISLNK(imported.filesystem.at("/fixture/link").metadata.st_mode));
     CHECK(imported.filesystem.at("/fixture/link").content == std::vector<char>({'r','e','g','u','l','a','r'}));
     CHECK(S_ISLNK(imported.filesystem.at("/fixture/dangling").metadata.st_mode));
     CHECK(S_ISLNK(imported.filesystem.at("/fixture/loop").metadata.st_mode));
+    CHECK(S_ISLNK(imported.filesystem.at("/fixture/directory_alias").metadata.st_mode));
+    CHECK(!imported.filesystem.contains("/fixture/directory_alias/regular"));
     std::string target;
     CHECK(imported.do_readlink("/fixture/link", target) == 0 && target == "regular");
     CHECK(imported.do_readlink("/fixture/dangling", target) == 0 && target == "missing");
@@ -123,6 +184,87 @@ int main()
     CHECK(directory >= 0);
     CHECK(emu_vfs_readlinkat(directory, "link", actual, sizeof(actual)) == 7);
     CHECK(emu_vfs_readlinkat(directory, "", actual, sizeof(actual)) == -ENOENT);
+    // Compare raw x86-64 access ABI results, including error ordering.
+    auto native_access = [](int dirfd, const char* path, int mode, int flags) {
+      errno = 0;
+      const long value = syscall(SYS_faccessat2, dirfd, path, mode, flags);
+      return value < 0 ? -long(errno) : value;
+    };
+    const int host_directory = open(root.c_str(), O_DIRECTORY | O_RDONLY);
+    CHECK(host_directory >= 0);
+    auto& access_fs = ptmc_state.fs_states[0];
+    for (const auto& relative : {"regular", "missing", "regular/child", "missing/../regular", "real/../regular", ""}) {
+      CHECK(native_access(host_directory, relative, F_OK, 0) ==
+            emu_vfs_accessat(directory, relative, F_OK, 0));
+    }
+    CHECK(native_access(-7, (root / "regular").c_str(), F_OK, 0) ==
+          emu_vfs_accessat(-7, "/fixture/regular", F_OK, 0));
+    CHECK(native_access(-7, "regular", F_OK, 0) == emu_vfs_accessat(-7, "regular", F_OK, 0));
+    CHECK(native_access(host_directory, "dangling", F_OK, AT_SYMLINK_NOFOLLOW) ==
+          emu_vfs_accessat(directory, "dangling", F_OK, AT_SYMLINK_NOFOLLOW));
+    for (int flags : {0, AT_EACCESS, AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH}) {
+      CHECK(native_access(host_directory, "regular", F_OK, flags) ==
+            emu_vfs_accessat(directory, "regular", F_OK, flags));
+    }
+    CHECK(native_access(host_directory, "", F_OK, AT_EMPTY_PATH) ==
+          emu_vfs_accessat(directory, "", F_OK, AT_EMPTY_PATH));
+    CHECK(native_access(-7, "", F_OK, AT_EMPTY_PATH) ==
+          emu_vfs_accessat(-7, "", F_OK, AT_EMPTY_PATH));
+    for (int mode : {-1, 8}) {
+      CHECK(native_access(-7, nullptr, mode, 0) == emu_vfs_accessat(-7, nullptr, mode, 0));
+    }
+    CHECK(native_access(-7, nullptr, F_OK, 0x40000000) ==
+          emu_vfs_accessat(-7, nullptr, F_OK, 0x40000000));
+    CHECK(native_access(host_directory, nullptr, F_OK, 0) ==
+          emu_vfs_accessat(directory, nullptr, F_OK, 0));
+    for (const auto& path : {"/fixture/link", "/fixture/dangling", "/fixture/link/../regular"}) {
+      bool rejected = false;
+      try { emu_vfs_accessat(AT_FDCWD, path, F_OK, 0); }
+      catch (const std::runtime_error&) { rejected = true; }
+      CHECK(rejected);
+    }
+    for (int mode : {R_OK, W_OK, X_OK, R_OK | W_OK | X_OK}) {
+      bool rejected = false;
+      try { emu_vfs_accessat(AT_FDCWD, "/fixture/regular", mode, 0); }
+      catch (const std::runtime_error&) { rejected = true; }
+      CHECK(rejected);
+    }
+    access_fs.set_cwd("/fixture");
+    CHECK(emu_vfs_accessat(AT_FDCWD, "regular", F_OK, 0) == 0);
+    CHECK(emu_vfs_accessat(AT_FDCWD, "", F_OK, AT_EMPTY_PATH) == 0);
+    access_fs.filesystem.at("/fixture/real").metadata.st_mode = S_IFDIR | 0700;
+    bool search_rejected = false;
+    try { emu_vfs_accessat(AT_FDCWD, "/fixture/real/../regular", F_OK, 0); }
+    catch (const std::runtime_error&) { search_rejected = true; }
+    CHECK(search_rejected);
+    CHECK(emu_vfs_accessat(AT_FDCWD, "/fixture/real", F_OK, 0) == 0);
+    const int host_regular = open((root / "regular").c_str(), O_RDONLY);
+    const int guest_regular = access_fs.do_open("/fixture/regular", O_RDONLY, 0);
+    CHECK(host_regular >= 0 && guest_regular >= 0);
+    CHECK(native_access(host_regular, "child", F_OK, 0) ==
+          emu_vfs_accessat(guest_regular, "child", F_OK, 0));
+    CHECK(native_access(host_regular, "", F_OK, AT_EMPTY_PATH) ==
+          emu_vfs_accessat(guest_regular, "", F_OK, AT_EMPTY_PATH));
+    CHECK(syscall(SYS_access, (root / "regular").c_str(), F_OK) ==
+          emu_vfs_accessat(AT_FDCWD, "/fixture/regular", F_OK, 0));
+    CHECK(syscall(SYS_faccessat, host_directory, "regular", F_OK) ==
+          emu_vfs_accessat(directory, "regular", F_OK, 0));
+    CHECK(close(host_regular) == 0 && close(host_directory) == 0);
+    // All queries and bytes remain independent of host deletion and branch edits.
+    std::stringstream saved;
+    { cereal::BinaryOutputArchive ar(saved); ar(single); }
+    FileSystemState archived;
+    { cereal::BinaryInputArchive ar(saved); ar(archived); }
+    CHECK(unlink((root / ".hidden").c_str()) == 0);
+    CHECK(unlink((root / "dangling").c_str()) == 0);
+    CHECK(archived.do_access(AT_FDCWD, "/nested/file", F_OK, 0) == 0);
+    CHECK(archived.filesystem.at("/nested/file").content == std::vector<char>({'a', '\0', 'b'}));
+    FileSystemState branch = archived;
+    branch.filesystem.at("/nested/file").content.write(0, "x", 1);
+    branch.filesystem.erase("/nested/link");
+    CHECK(archived.do_access(AT_FDCWD, "/nested/link", F_OK, AT_SYMLINK_NOFOLLOW) == 0);
+    CHECK(branch.do_access(AT_FDCWD, "/nested/link", F_OK, AT_SYMLINK_NOFOLLOW) == -ENOENT);
+    CHECK(archived.filesystem.at("/nested/file").content[0] == 'a');
     auto manager = std::make_shared<FdManager>();
     FileSystemState fs(manager);
     char buffer[8]{};

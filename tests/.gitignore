@@ -115,3 +115,6 @@
 
 !vfs_content_integration.cpp
 !vfs_content.mk
+
+!thread_altstack_integration.cpp
+!thread_altstack.mk

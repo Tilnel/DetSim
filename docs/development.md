@@ -30,6 +30,7 @@ make check-thread-control check-thread-identity check-thread-carrier # NP=1 thre
 make check-pending-syscall # NP=1 blocked/wake/completion/deadline replay
 make check-pending-io check-pending-io-snapshot # NP=2 IO wait/retry/EOF and persisted replay
 make check-thread-robust # NP=1 native owner-death oracle, group exit, persisted replay
+make check-thread-altstack # NP=1 virtual per-task sigaltstack and carrier replay
 make check-thread-signal-mask # NP=1 per-task masks, inheritance, restore and pending rejection
 make check-thread-tid # NP=1 clone/clone3 TID, clear-tid/join and restore
 make check-thread-lifecycle # NP=1 raw clone/exit, TLS, full/pages + cache pressure
@@ -138,8 +139,8 @@ enter snapshot state. Loader CPU-feature normalization still logs an unresolved
 symbol (C17). Passing counter/replay tests does not close that gap,
 nor does it prove multithread, cross-process-run or eviction correctness.
 
-Default snapshot format is version 25; older formats are rejected without migration.
-This branch additionally reads opt-in version 26 page manifests, selected with
+Default snapshot format is version 27; older formats are rejected without migration.
+This branch additionally reads opt-in version 28 page manifests, selected with
 `DETSIM_SNAPSHOT_BACKEND=pages`; `verify-pages` adds a full memory oracle.
 See [page snapshots and whole-exploration measurements](page-snapshots.md).
 Private readable mappings and unnamed anonymous PROT_NONE guards are captured;
@@ -230,7 +231,7 @@ successor. Pure predecessor/target comparisons need no monitor state.
 
 Plugin binaries/schema/configuration, target executable contents and semantic
 execution configuration form the model compatibility fingerprint. Executables must remain immutable during a run. Changing cache
-sizes or loading a decoder does not change it. Flat25/page26 and the versioned
+sizes or loading a decoder does not change it. Flat27/page28 and the versioned
 system metadata reject older archives without deleting or migrating stores.
 Changes to kernel-model or inspection semantics require an explicit compatibility
 version bump; fingerprints do not prove equivalence between different implementations.
@@ -301,7 +302,7 @@ closure within an explicit environment, not compatibility with all Linux program
 
 ## Logical thread archives
 
-Flat25/page26 archive explicit thread liveness and logical parent IDs; physical
+Flat27/page28 archive explicit thread liveness and logical parent IDs; physical
 TIDs are transient bindings. Same-run captured hashes retain compact runtime
 provenance tied to an owned process pidfd, which is required on the host kernel.
 Disk reload may inspect any valid snapshot, but execution restore requires local
@@ -616,7 +617,7 @@ COMPLETED, STOPPED or THREAD_EXITED events. Only COMPLETED has a valid return
 value. Fatal stops clear stale syscall metadata. StateView exposes nullable
 pending result/deadline; CLI history labels pending calls without printing a
 fictional return. ABI1 shared objects must be rebuilt and adapted to phases.
-Flat25/page26 and kernel modelv12 reject incompatible execution contexts.
+Flat27/page28 and kernel modelv13 reject incompatible execution contexts.
 
 Pending I/O keeps its numeric descriptor stable: close, F_SETFL and FIONBIO on a
 referenced FD reject before mutation, pending a true pinned-open-resource model.
@@ -653,7 +654,7 @@ or iterator escapes. Writes detach shared or store-backed content. Production
 snapshot metadata stores content of at least4096 bytes as StateStore references,
 while smaller contents remain inline. Standalone cereal archives remain complete
 and do not require a store. Reference records are self-describing, so loading does
-not depend on an ambient archive mode. Layouts25/26 reject older snapshot roots.
+not depend on an ambient archive mode. Layouts27/28 reject older snapshot roots.
 
 One payload remembers registration only within a checked store generation; store
 reopen or failure cannot be bypassed by this memo. First registration retains
@@ -661,3 +662,25 @@ existing byte-level collision checks. Missing/corrupt references fail explicitly
 Durability uses the existing StateStore completion barrier, including payloads.
 No global payload intern table is added. First modification of a shared large
 file still copies and re-registers the whole file; file chunking is not implemented.
+
+
+## Runtime environment admission
+
+FSMap imports root files, directories and symbolic links as their actual types;
+missing/unreadable/unsupported inputs are initialization errors. It preserves
+hidden names and directory modes, and never follows links during import. Explicit
+mapping order remains meaningful; non-directory ancestors and root replacement
+are rejected. access/faccessat/faccessat2 currently support F_OK only. Nonzero
+permission modes and credential-dependent directory search are explicit gaps.
+
+Virtual per-task sigaltstack registration/query uses fixed x86-64 minimum2048,
+with raw flags/error/partial-copy behavior checked against native oracles. The
+physical carrier remains disabled; handler delivery and inherited enabled stacks
+remain unsupported. Disabled AUTODISARM bootstrap state is imported. Clone resets
+child registration, exit clears it, and snapshots preserve per-task registration.
+This does not certify dynamic strict-signal-frame or JVM signal delivery behavior.
+
+Runtime cases explicitly capture Python stdlib and JDK lib/conf/release plus link
+referents, recording input hashes. They check protocol outputs, not interpreter
+heap extraction. Java is conditional per user tradeoff: JVM-specific major work
+may remain a non-green research target instead of blocking other runtime cases.

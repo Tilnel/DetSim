@@ -1091,3 +1091,38 @@ VFS plan completion evidence:
 Logs: /tmp/detsim-vfs-{reference-final,gates,native,cases,snapshot-gates,
 system-gates,final-gates,check,comparison}.log. Cases artifact
 build/cases/run-uj0r661q/results.json. Format25/26; unchanged kernel modelv12.
+
+## Runtime admission iteration2 evidence (2026-10-16)
+
+Changes: per-task virtual alternate-stack registration/query and bootstrap flags;
+correct FSMap root file/directory/symlink import; F_OK access family; explicit
+Python/JDK workload input manifests. No private interpreter/JVM state extraction.
+Kernelv13 fixed altstack minimum2048; snapshot layouts27/28.
+
+- RED real sigaltstack transition unsupported131; native oracle covers accepted
+  ONSTACK normalization, AUTO, min size, alias, EPERM/errors and partial copyout.
+  check-thread-altstack full/pages×default/tiny passes persisted replay, logical
+  clone/exit/carrier reuse and physical-disabled invariant. Five malformed states
+  fail capture and serialized restore without publication/live-state drift.
+- Review caught disabled AUTODISARM bootstrap loss; RED/green native regression
+  now preserves it. Enabled inherited stacks remain explicit unsupported.
+- FS root-file regression RED; root/ancestor overlays separately RED→GREEN.
+  NP2 check-io-boundary/check-syscall-policy/check-process-state/check-runtime-profile
+  pass. Native F_OK ABI, exact import, failures, host-unlink/archive and branch
+  isolation covered. Permission modes needing credentials remain unsupported.
+- NP1 signal-mask/lifecycle/altstack gates pass;21 native scenarios including real
+  access/faccessat/faccessat2 (old faccessat ignores arg4) pass;12 case rows and
+  runner negative gates pass; make check9 components/10build contracts pass.
+  Changed core/tests compile warning-clean; independent review approved after
+  the bootstrap and ancestor fixes. Production NP1 build passes.
+- Runtime audit depth1000/90s still non-green: Rust full/pages pass, gccgo pages
+  reaches270 and full remains allocation-limited; Python rootfs reveals retained
+  DFS ancestor content copies; Java reaches jvm.cfg symlink traversal. Evidence
+  build/cases/run-2j44plxy/results.json, /tmp/detsim-runtime-iteration2-audit.log.
+  Not all languages are admitted yet. User permits conditional Java tradeoff.
+
+Logs: /tmp/detsim-{altstack-red,iteration2-thread-final,iteration2-fs-final,
+iteration2-cases-final,iteration2-check}.log. Python allocation census:
+build/cases/python-memory-debug-qtd8mky7/gdb.log. Rootfs bytes59262067/1408 entries
+are fixed inputs; ~30 duplicate large buffers prove live-ownership growth. Next
+slice releases DFS ancestor resident state while preserving hashes/search order.

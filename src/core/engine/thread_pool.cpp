@@ -249,6 +249,8 @@ void clear_logical_tid(int node, tracee_state& state, thread_state& thread)
   }
   write_thread_signal_mask(thread.physical_tid, 0);
   thread.signal_mask = 0;
+  thread.altstack_sp = thread.altstack_size = 0;
+  thread.altstack_flags = SS_DISABLE;
   thread.pending_syscall.reset();
   thread.robust_list_head = 0;
   thread.clear_child_tid = 0;
@@ -273,6 +275,12 @@ void validate_bound_slots(const CarrierPool& pool, const tracee_state& state)
     constexpr uint64_t unblockable = (uint64_t(1) << (SIGKILL - 1)) | (uint64_t(1) << (SIGSTOP - 1));
     if ((thread.signal_mask & unblockable) || (!thread.alive && thread.signal_mask))
       throw std::runtime_error("Invalid logical thread signal mask");
+    constexpr uint32_t autodisarm = 0x80000000u;
+    if ((thread.altstack_flags & ~(autodisarm | SS_DISABLE)) ||
+        ((thread.altstack_flags & SS_DISABLE) && (thread.altstack_sp || thread.altstack_size)) ||
+        (!(thread.altstack_flags & SS_DISABLE) && thread.altstack_size < 2048) ||
+        (!thread.alive && (thread.altstack_sp || thread.altstack_size || thread.altstack_flags != SS_DISABLE)))
+      throw std::runtime_error("Invalid logical alternate signal stack");
     if (!thread.alive && thread.robust_list_head)
       throw std::runtime_error("Exited logical thread retains robust-list registration");
     if (!thread.alive) continue;
@@ -446,6 +454,50 @@ long emulate_thread_sigprocmask(int node, pid_t physical_tid, uint64_t how,
   // Linux commits the new mask before copying oldset out, including EFAULT.
   if (old_mask && !guest_write_exact(physical_tid, reinterpret_cast<void*>(old_mask),
                                     &previous, sizeof(previous))) return -EFAULT;
+  return 0;
+}
+
+long emulate_thread_sigaltstack(int node, pid_t physical_tid, uint64_t new_stack, uint64_t old_stack)
+{
+  // Fixed Linux x86-64 profile: 24-byte stack_t and a 2048-byte minimum.
+  // Registration is virtual; custom signal delivery remains unsupported and
+  // no physical carrier ever installs this stack.
+  struct NativeStack { uint64_t sp; uint32_t flags; uint32_t padding; uint64_t size; };
+  static_assert(sizeof(NativeStack) == 24);
+  constexpr uint32_t autodisarm = 0x80000000u;
+  if (node < 0 || node >= NP) throw std::runtime_error("Thread pool node out of range");
+  auto& state = ptmc_state.running_state.child[node];
+  auto found = std::find_if(state.threads.begin(), state.threads.end(),
+      [physical_tid](const thread_state& thread) { return thread.alive && thread.physical_tid == physical_tid; });
+  if (found == state.threads.end()) throw std::runtime_error("sigaltstack has no live owned thread");
+  for (uint64_t address : {new_stack, old_stack})
+    if (address < scratch_page + 4096 && address > scratch_page - sizeof(NativeStack))
+      throw std::runtime_error("Alternate stack pointer overlaps reserved control memory");
+  user_regs_struct registers{};
+  if (ptrace(PTRACE_GETREGS, physical_tid, nullptr, &registers) == -1)
+    throw std::runtime_error("Cannot inspect alternate stack caller registers");
+  const bool on_stack = !(found->altstack_flags & autodisarm) &&
+      registers.rsp > found->altstack_sp && registers.rsp - found->altstack_sp <= found->altstack_size;
+  NativeStack previous{found->altstack_sp,
+      found->altstack_flags | (on_stack ? uint32_t(SS_ONSTACK) : 0u), 0, found->altstack_size};
+  if (new_stack) {
+    NativeStack replacement{};
+    if (!guest_read_exact(physical_tid, reinterpret_cast<void*>(new_stack), &replacement, sizeof(replacement)))
+      return -EFAULT;
+    if (on_stack) return -EPERM;
+    const uint32_t mode = replacement.flags & ~autodisarm;
+    if (mode != 0 && mode != SS_DISABLE && mode != SS_ONSTACK) return -EINVAL;
+    if (mode == SS_DISABLE) {
+      replacement.sp = replacement.size = 0;
+    } else if (replacement.size < 2048) return -ENOMEM;
+    found->altstack_sp = replacement.sp;
+    found->altstack_size = replacement.size;
+    found->altstack_flags = (replacement.flags & autodisarm) | (mode == SS_DISABLE ? uint32_t(SS_DISABLE) : 0u);
+  }
+  // Linux commits registration before old_ss copyout. The entire native
+  // structure (including zero padding) is copied and EFAULT can leave a prefix.
+  if (old_stack && !guest_write_exact(physical_tid, reinterpret_cast<void*>(old_stack),
+                                     &previous, sizeof(previous))) return -EFAULT;
   return 0;
 }
 
