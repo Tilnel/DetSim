@@ -12,6 +12,7 @@
 #include <array>
 #include <arpa/inet.h>
 #include <cstring>
+#include <climits>
 #include <fcntl.h>
 #include <sstream>
 #include <sys/mman.h>
@@ -102,6 +103,72 @@ static bool mapping_entry_rejected(SyscallDispatcher& dispatcher,pid_t pid,int n
     if(ptrace(PTRACE_GETREGS,pid,nullptr,&after)) throw std::runtime_error("read rejected registers");
     if(memcmp(&before,&after,sizeof before)) throw std::runtime_error("mapping admission changed registers");
     return rejected;
+}
+static void check_cloexec_ioctls(SyscallDispatcher& dispatcher, pid_t child, int file, int socket, int real_fd) {
+    char path[]="/tmp/detsim-ioctl-cloexec-XXXXXX";
+    const int native=mkstemp(path);
+    if(native<0) throw std::runtime_error("native cloexec file");
+    unlink(path);
+    struct Close {int fd; ~Close() {close(fd);}} owner{native};
+    check(fcntl(native,F_SETFL,O_APPEND|O_NONBLOCK)==0,"native ioctl status flags fixture");
+    const int native_status=fcntl(native,F_GETFL);
+    const unsigned long commands[]={FIOCLEX,FIONCLEX,
+        0x100000000UL|FIOCLEX,0x100000000UL|FIONCLEX,
+        0xffffffff00000000UL|FIOCLEX,0xffffffff00000000UL|FIONCLEX};
+    for(unsigned long request:commands) {
+        const int expected=uint32_t(request)==FIOCLEX?FD_CLOEXEC:0;
+        for(uint64_t argument:{0ULL,1ULL,~0ULL})
+            check(syscall(SYS_ioctl,native,request,argument)==0 &&
+                  fcntl(native,F_GETFD)==expected && fcntl(native,F_GETFL)==native_status,
+                  "native uint32 close-on-exec ioctl ignores argument and preserves status flags");
+        for(int bad:{-1,INT_MAX}) {
+            errno=0;
+            check(syscall(SYS_ioctl,bad,request,1)==-1 && errno==EBADF,
+                  "native close-on-exec ioctl EBADF precedes argument handling");
+            check(emu_ioctl(bad,request,reinterpret_cast<void*>(1))==-EBADF,
+                  "virtual close-on-exec ioctl EBADF precedes argument handling");
+        }
+    }
+    int pipefd[2];
+    check(ptmc_state.fs_states[0].do_pipe(pipefd,O_NONBLOCK)==0,"cloexec ioctl pipe fixture");
+    const int epoll=emu_epoll_create(1);
+    check(epoll>=0,"cloexec ioctl epoll fixture");
+    auto manager=ptmc_state.fd_managers[0];
+    for(int fd:{file,socket,pipefd[0],pipefd[1],epoll,1}) {
+        const int status=emu_fcntl(fd,F_GETFL,0);
+        for(unsigned long request:commands) {
+            const int expected=uint32_t(request)==FIOCLEX?FD_CLOEXEC:0;
+            for(uint64_t argument:{0ULL,1ULL,~0ULL})
+                check(execute(dispatcher,child,SYS_ioctl,{uint64_t(fd),request,argument,0,0,0})==0 &&
+                      emu_fcntl(fd,F_GETFD,0)==expected && emu_fcntl(fd,F_GETFL,0)==status,
+                      "virtual uint32 close-on-exec ioctl supports each descriptor kind without reading argument");
+        }
+    }
+    const auto before_unsupported=archive(*manager);
+    bool unsupported=false;
+    try {emu_ioctl(file,0x1deadbeefUL,reinterpret_cast<void*>(1));}
+    catch(const std::runtime_error&) {unsupported=true;}
+    check(unsupported && archive(*manager)==before_unsupported,
+          "normalized unsupported ioctl remains strict without changing flags");
+    const long physical_flags=tracee_do_syscall(child,SYS_fcntl,real_fd,F_GETFD,0,0,0,0);
+    check(execute(dispatcher,child,SYS_ioctl,{uint64_t(file),FIOCLEX,1,0,0,0})==0 &&
+          emu_fcntl(file,F_GETFD,0)==FD_CLOEXEC &&
+          tracee_do_syscall(child,SYS_fcntl,real_fd,F_GETFD,0,0,0,0)==physical_flags,
+          "actual ioctl entry blocks host descriptor flag mutation");
+    const FdManager saved=*manager;
+    const auto encoded=archive(*manager);
+    check(emu_ioctl(file,FIONCLEX,nullptr)==0 && *manager!=saved &&
+          saved.get_descriptor_flags(file)==FD_CLOEXEC && archive(*manager)!=encoded,
+          "close-on-exec ioctl branch mutation leaves copied descriptor state unchanged");
+    FdManager restored;
+    {std::istringstream input(encoded);cereal::BinaryInputArchive a(input);a(restored);}
+    check(restored==saved && restored.get_descriptor_flags(file)==FD_CLOEXEC,
+          "close-on-exec descriptor flags survive archive restore");
+    *manager=restored;
+    check(emu_ioctl(file,FIONCLEX,reinterpret_cast<void*>(1))==0 &&
+          emu_fcntl(file,F_GETFD,0)==0 && restored==saved,
+          "restored close-on-exec state replays with branch isolation");
+    emu_close(pipefd[0]);emu_close(pipefd[1]);emu_close(epoll);
 }
 int main() {
     pid_t children[NP]{};
@@ -228,6 +295,7 @@ int main() {
               emu_fcntl(file,F_GETFD,0)==FD_CLOEXEC &&
               tracee_do_syscall(children[0],SYS_fcntl,real_fd,F_GETFD,0,0,0,0)==physical_flags,
               "actual entry blocks host descriptor mutation");
+        check_cloexec_ioctls(dispatcher,children[0],file,socket,real_fd);
         check(execute(dispatcher,children[0],SYS_pipe,{reinterpret_cast<uint64_t>(guest_pipefds),0xdeadbeef,0,0,0,0})==0,
               "pipe ignores nonexistent second argument");
         const int mapped=fs.do_open("/mapped",O_CREAT|O_RDWR,0600);

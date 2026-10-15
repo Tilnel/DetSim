@@ -77,5 +77,16 @@
       ],
       "status": "advance one actual runtime blocker at a time; any altered GC/JIT/preemption configuration belongs in evidence"
     }
+  ],
+  "conditional_targets": [
+    {
+      "id": "openjdk",
+      "reason": "User permits deferring disproportionate JVM work. Current blocker: SIGBUS-backed file mappings.",
+      "acceptance": "Output/protocol semantics; keep unsupported non-green, never infer success from startup.",
+      "affects": [
+        "runtime-admission/OpenJDK",
+        "runtime-concurrency/OpenJDK"
+      ]
+    }
   ]
 }

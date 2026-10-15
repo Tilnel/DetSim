@@ -522,3 +522,25 @@ entry layouts. Unit and sanitizer evidence is component-level: full/pages actual
 workload exploration and replay are separate pending acceptance. Legacy willemt
 main has shallow-copied command payload lifetime errors; the owned bounded driver
 must retain payload ownership rather than weaken the stronger oracle.
+
+
+### Generic close-on-exec ioctls and runtime evidence
+
+FIOCLEX/FIONCLEX now reuse saved per-descriptor F_SETFD state, without guest
+argument access or host mutation. ioctl commands normalize to unsigned32,
+including high-register-bit aliases. Unknown commands still reject. Native RED
+then GREEN covers18 oracle cases and108 modeled dispatch calls; copy/archive
+isolation and flags remain checked. Independent review approves. Kernelv17,
+unchanged layouts29/30. NP2 IO gate and make check pass; production NP1 rebuilt.
+
+Python actual full/pages admission now passes273visited, public output property,
+exit0 and terminal predecessor3x replay: build/cases/run-l3jl43u3/results.json.
+gccgo full controlled admission passes237visited, terminal3x and cleanup0 with
+explicit4096MiB/600s profile (actual entire driver222s):
+build/cases/run-yucgcv9q/results.json. This complements earlier pages evidence.
+
+Separately acquired official SHA-verified isolated gc Go1.23.12. Native passes;
+munmap startup boundary correctly rejects because it follows thread creation.
+An explicit mmap startup boundary admits control/replay, then actual exploration
+rejects MADV_NOHUGEPAGE: build/cases/run-wgjcc09h/results.json. This is not gccgo
+admission and is not yet green; no GC/preemption flags were disabled.

@@ -97,10 +97,10 @@ class Session:
             time.sleep(.005)
         raise TimeoutError(f"command deadline: {text}")
 
-    def close(self):
+    def close(self, timeout=5):
         try:
             if self.proc.poll() is None:
-                self.proc.communicate(b"q\n", timeout=5)
+                self.proc.communicate(b"q\n", timeout=timeout)
         except subprocess.TimeoutExpired:
             pass
         finally:

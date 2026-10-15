@@ -134,8 +134,11 @@ int emu_fsync(int fd) {
 }
 int emu_fdatasync(int fd) {return emu_fsync(fd);}
 int emu_ioctl(int fd, unsigned long request, void* argument) {
+  request=static_cast<uint32_t>(request);
   auto& manager=descriptors();
   if (!manager.is_allocated(fd)) return -EBADF;
+  if (request==FIOCLEX || request==FIONCLEX)
+    return manager.do_fcntl(fd,F_SETFD,request==FIOCLEX?FD_CLOEXEC:0);
   // The profile's standard streams are captured non-terminal streams.
   if (request==TCGETS || request==TIOCGWINSZ) return -ENOTTY;
   if (request==FIONBIO) {

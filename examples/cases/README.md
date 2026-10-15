@@ -52,9 +52,9 @@ runner 只依赖 Python 标准库及已有编译器。不会下载依赖、修�
 | C | GCC14.2 | 通过 | 标记及退出0，搜索完成 |
 | C++ std | GCC14.2 | 通过 | 标记及退出0，搜索完成 |
 | Rust std | rustc1.51.0 | 通过 | full/pages 已完成输出检查及退出0 |
-| Go | gccgo14.2（非标准 gc） | 通过 | pages 已完成输出/退出及3x重放；full 探索完成但全链路验收仍待完成 |
-| Python | CPython3.13.5，`-I -S` | 通过 | 已越过 getdents64；当前因字节码缓存刷新请求 rename(82) |
-| Java | OpenJDK21.0.12.1 | 通过 | 文件身份已修复；当前需补捕获的系统动态库依赖；条件目标 |
+| Go | gccgo14.2（非标准 gc） | 通过 | full/pages 均完成输出/退出及3x重放；full 显式4GiB限额 |
+| Python | CPython3.13.5，`-I -S` | 通过 | full/pages 各273状态，输出/退出0及3x重放通过 |
+| Java | OpenJDK21.0.12.1 | 通过 | 文件身份和系统动态库输入已补；SIGBUS-backed 映射尚不支持；条件目标 |
 
 这些版本是本机实测，不代表整个语言、其他版本或所有库已受支持。Java 保留正常 JVM/JIT，只显式限制 heap/code cache/class space；没有把 JVM 私有结构补丁放进框架。标准 gc Go 的单独准入目标尚待可用工具链；不能用 gccgo 结果代替它。
 
@@ -112,3 +112,25 @@ Linux已忽略的两个历史mmap标志。getdents原生故障/填充矩阵、�
 两份最小共享库分别加载及默认/零/自定义时钟测试通过。gccgo pages已到正常终点
 并3x恢复重放；full原始探索也到exit0，但原试验驱动丢失，不能据此补造完整验收。
 Python下一步先修输入文件mtime被抹成0的问题，再判断是否仍需rename语义。
+
+
+当前保存格式为flat29/pages30。`info current`只读标量边元数据，runner以
+`bfs --quiet`/`dfs N --quiet`搜索，避免自动历史反复读回完整大快照。
+独立24组full/pages正常/静默搜索测试保留相同转移与三次重放。
+
+Python/Java的语义性质优先观察显式输出、消息协议和外部可见状态，不依赖
+DWARF解释解释器/JVM对象。Java继续保留为条件目标：当前真实阻塞是SIGBUS-backed
+文件映射，需要映射、快照和故障语义的共同改造，不能仅放开mmap标志。
+它仍报告未通过，不阻塞其他案例；不以关闭JIT/GC冒充常规JVM支持。
+
+
+kernelv17复用已有FD_CLOEXEC状态支持FIOCLEX/FIONCLEX，并按Linux ABI截取命令
+低32位，忽略参数但保持EBADF优先级。原生/实际模型调用覆盖状态标志、宿主
+隔离及复制/归档恢复。Python full/pages准入均通过（273状态），不代表所有
+Python程序已可检验。gccgo full也已完成控制、探索、退出和终点3x重放（237状态，
+显式4GiB，整轮约222秒）；pages独立通过，不能据此替代标准Go gc。
+
+标准gc独立试验使用官方SHA256校验的Go1.23.12工具链，隔离在忽略的build目录。
+其默认munmap启动边界晚于线程创建；显式改为mmap边界后控制/恢复通过，
+实际搜索停在MADV_NOHUGEPAGE，尚不计绿色。官方工具链清单及校验依据：
+https://go.dev/dl/?mode=json&include=all 。
