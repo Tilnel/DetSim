@@ -51,19 +51,6 @@ void read_regions(pid_t pid, const std::vector<detsim::experiment::Region>& rang
         if (got<0 || size_t(got)!=expected) throw std::runtime_error("Page capture read failed or short");
     }
 }
-
-void normalize(std::vector<uint8_t>& bytes, const std::vector<RegionInfo>& regions,
-               uintptr_t address, int length) {
-    if (length<0) throw std::runtime_error("Invalid rseq size");
-    size_t offset=0;
-    for (const auto& r:regions) {
-        if (address>=r.start && address<r.end) {
-            if (size_t(length)>r.end-address) throw std::runtime_error("rseq extends beyond captured region");
-            memset(bytes.data()+offset+address-r.start,0x55,size_t(length));
-        }
-        offset+=r.end-r.start;
-    }
-}
 }
 
 bool page_capture_enabled() {
@@ -76,7 +63,7 @@ bool page_capture_enabled() {
 
 hash_type save_paged_snapshot(pid_t pid, const std::vector<RegionInfo>& regions,
     std::span<const uint8_t> metadata, std::string_view maps,
-    const user_regs_struct& regs, uintptr_t rseq_address, int rseq_length,
+    const user_regs_struct& regs,
     hash_type reference_hash) {
     if (sysconf(_SC_PAGESIZE)!=4096) throw std::runtime_error("Page backend requires 4KiB host pages");
     auto& store=StateStore::instance();
@@ -105,7 +92,6 @@ hash_type save_paged_snapshot(pid_t pid, const std::vector<RegionInfo>& regions,
         read_regions(pid,reads,regions);
         stats.read_bytes+=total;
     }
-    normalize(work.memory,regions,rseq_address,rseq_length);
 
     std::vector<RegionInfo> descriptors=regions;
     std::vector<PageRef> refs;
@@ -141,7 +127,6 @@ hash_type save_paged_snapshot(pid_t pid, const std::vector<RegionInfo>& regions,
         offset=0;
         for (auto& read:reads) {read.data=oracle.data()+offset;offset+=read.size;}
         read_regions(pid,reads,regions);stats.oracle_bytes+=total;
-        normalize(oracle,regions,rseq_address,rseq_length);
         const auto view=SnapshotView::open(root);
         if (view->maps_text()!=maps || view->metadata().size()!=metadata.size() ||
             memcmp(view->metadata().data(),metadata.data(),metadata.size()) ||

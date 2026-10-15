@@ -10,6 +10,8 @@ extern "C" detsim::ui::NCursesUI* get_ncurses_ui() { return nullptr; }
 #include "engine/thread_control.h"
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/rseq.h>
+#include <array>
 #include <elf.h>
 #include <sys/wait.h>
 #include <sys/ptrace.h>
@@ -104,6 +106,7 @@ static void check_startup_exit_diagnostic() {
   } catch (...) { cleanup(); throw; }
   cleanup();
 }
+alignas(32) static std::array<unsigned char,32> startup_rseq_area{};
 static uint32_t startup_tid_word=0xaabbccdd;
 static volatile long startup_tid_result=0;
 static uint64_t startup_new_mask=uint64_t{1}<<(SIGUSR2-1),startup_old_mask=0;
@@ -112,6 +115,9 @@ static void check_startup_tid_contract() {
   const int old_pid=ptmc_state.pids[0],old_cursor=ptmc_state.cursor;
   pid_t pid=fork();require(pid>=0,"fork TID prelude fixture");
   if (!pid) {
+    if (__rseq_size && syscall(SYS_rseq,
+            static_cast<char*>(__builtin_thread_pointer()) + __rseq_offset,
+            32, RSEQ_FLAG_UNREGISTER, RSEQ_SIG)) _exit(107);
     if (mmap(reinterpret_cast<void*>(scratch_page),4096,PROT_READ|PROT_WRITE|PROT_EXEC,
              MAP_FIXED_NOREPLACE|MAP_PRIVATE|MAP_ANONYMOUS,-1,0)==MAP_FAILED) _exit(104);
     auto* code=reinterpret_cast<unsigned char*>(scratch_page+0xff0);code[0]=0x0f;code[1]=0x05;
@@ -119,6 +125,8 @@ static void check_startup_tid_contract() {
     if (syscall(SYS_rt_sigprocmask,SIG_SETMASK,&inherited,nullptr,8)) _exit(106);
     if (ptrace(PTRACE_TRACEME,0,nullptr,nullptr)) _exit(105);
     asm volatile("int3");
+    syscall(SYS_rseq,startup_rseq_area.data(),32,0,RSEQ_SIG);
+    syscall(SYS_rseq,reinterpret_cast<void*>(1),UINT32_MAX,UINT32_MAX,0);
     startup_tid_result=syscall(SYS_set_tid_address,&startup_tid_word);
     syscall(SYS_gettid);syscall(SYS_getpid);
     syscall(SYS_rt_sigprocmask,SIG_BLOCK,&startup_new_mask,&startup_old_mask,8);_exit(0);
@@ -130,6 +138,18 @@ static void check_startup_tid_contract() {
     require(ptrace(PTRACE_SETOPTIONS,pid,nullptr,PTRACE_O_TRACESYSGOOD|PTRACE_O_EXITKILL)==0,"TID prelude options");
     ptmc_state.pids[0]=pid;ptmc_state.cursor=0;ptmc_state.running_state.child[0]=tracee_state{};
     adopt_thread_signal_mask(0,pid);
+    for (int attempt=0;attempt<2;++attempt) {
+      const auto call=extract_one_syscall(pid);
+      require(call.nr==SYS_rseq && static_cast<int64_t>(call.rval)==-ENOSYS,
+              "prelude rseq did not return ENOSYS for all arguments");
+    }
+    std::array<unsigned char,32> observed_rseq{};
+    require(guest_read_exact(pid,startup_rseq_area.data(),observed_rseq.data(),observed_rseq.size()) &&
+            observed_rseq==startup_rseq_area,"prelude rseq changed user memory");
+    __ptrace_rseq_configuration rseq_configuration{};
+    require(ptrace(PTRACE_GET_RSEQ_CONFIGURATION,pid,reinterpret_cast<void*>(sizeof(rseq_configuration)),
+                   &rseq_configuration)==sizeof(rseq_configuration) && !rseq_configuration.rseq_abi_pointer,
+            "prelude leaked a native rseq registration");
     auto registration=extract_one_syscall(pid);
     require(registration.nr==SYS_set_tid_address && registration.rval==uint64_t(logical_process_id(0)),
             "prelude set_tid_address returned a fabricated or physical TID");
@@ -165,6 +185,8 @@ int main(int argc, char** argv) {
   detsim::configure_runtime_profile(json::object());
   require(detsim::runtime_profile().startup_syscall == SYS_munmap, "declared dynamic-loader boundary");
   std::string default_identity = detsim::runtime_profile_identity();
+  require(json::parse(default_identity).at("rseq")=="unavailable-enosys",
+          "runtime identity omits rseq availability contract");
   std::vector<int> boundaries(NP, SYS_mprotect);
   detsim::configure_runtime_profile({{"startup_syscalls", boundaries}});
   require(detsim::startup_syscall_for_node(0) == SYS_mprotect, "per-node startup boundary");

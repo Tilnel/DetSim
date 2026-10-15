@@ -817,3 +817,35 @@ An intermittent identity failure in the old mapping fixture was traced to exactl
 rseq cpu_id_start/cpu_id at FS_BASE+__rseq_offset. The fixture now unregisters the
 inherited registration, matching existing raw-memory fixtures. No product rseq
 normalization or thread-runtime-specific patch was added.
+
+## rseq-unavailable verification (2026-10-16)
+
+The chosen fixed syscall-unavailable environment is reflected in kernel modelv8
+and RuntimeProfile identity. Deletes the old globals, 0x55 normalization and live
+byte restoration instead of adding a runtime-specific state extractor.
+
+Using CC=/usr/bin/gcc and CXX=/usr/bin/g++:
+- RED: lifecycle native registration allowed snapshot publication on HEAD;
+  `/tmp/rseq-red.log`. GREEN: four full/pages x normal/tiny lifecycle variants,
+  including main/worker/spare capture, same/different state restore and all three
+  directly callable carrier/memory restore entry points rejecting without mutation.
+- NP1 thread-control/carrier/identity/TID/signal-mask/futex/futex-snapshot/exec/
+  state-io/mappings/page-snapshot gates pass, plus 14 native tracer scenarios.
+- NP2 runtime-profile/syscall-policy/process-state/capture/io-boundary/Redis pass.
+  Valid, invalid and unregister rseq arguments return ENOSYS; user buffers and
+  actual kernel registration are unchanged.
+- `make check`: nine components and ten build-contract tests pass. Strict GCC14
+  syntax checks pass on changed capture/control/lifecycle sources and startup/
+  policy fixtures; combined dispatcher check suppresses only its existing unused
+  parameter warnings. Independent read-only review and diff check pass.
+- NP1/NP2/NP3 production builds pass. Raft depth8 full/pages both visit2,582 states
+  with1,347new; single-run throughput387/516 states/s. Artifacts
+  build/rseq-unavailable-raft{,-pages}; no statistical performance claim.
+- Native seccomp filter returning ENOSYS for rseq from exec permits the unmodified
+  pthread probe to exit0 (build/rseq-contract). DetSim advances to unsupported
+  syscall273/set_robust_list (build/tid-pthread-probe/rseq-unavailable-transcript.log).
+
+Full rseq critical-section semantics are explicitly outside this environment.
+Auxv size/alignment hints are retained; the model is syscall-unavailable, not a
+claim to reproduce every property of CONFIG_RSEQ=n. Full pthread support remains
+blocked by additional generic Linux task/futex/signal lifecycle work.

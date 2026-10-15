@@ -314,9 +314,6 @@ static void exit_all(void)
   if (failed) _Exit(EXIT_FAILURE);
 }
 
-extern std::unordered_map<int, void *> rseq_struct;
-extern std::unordered_map<int, int> rseq_len;
-
 static int resume_startup_syscall(pid_t pid)
 {
   ptrace_right(PTRACE_SYSCALL, pid, nullptr, nullptr);
@@ -370,6 +367,11 @@ syscall_info extract_one_syscall(pid_t pid)
   if (ret.nr == SYS_clone || ret.nr == SYS_clone3)
     throw std::runtime_error("RuntimeProfile startup boundary must precede thread creation");
   if (ret.nr == SYS_set_tid_address) tracee_set_rdi(pid,0);
+  // The execution environment exposes no rseq syscall, including the loader.
+  // A successful initial registration followed by child ENOSYS breaks libc.
+  if (ret.nr == SYS_rseq) {
+    tracee_set_orig_rax(pid,-1);tracee_set_rax(pid,-1);
+  }
   if (ret.nr == SYS_rt_sigprocmask) {
     if (ptmc_state.running_state.child[ptmc_state.cursor].threads.empty())
       adopt_thread_signal_mask(ptmc_state.cursor,pid);
@@ -384,7 +386,10 @@ syscall_info extract_one_syscall(pid_t pid)
     throw std::runtime_error("Unexpected syscall phase before configured RuntimeProfile startup boundary");
   ret.rval = info.exit.rval;
 
-  if (ret.nr == SYS_rt_sigprocmask) {
+  if (ret.nr == SYS_rseq) {
+    ret.rval = -ENOSYS;
+    tracee_set_rax(pid,ret.rval);
+  } else if (ret.nr == SYS_rt_sigprocmask) {
     ret.rval=emulate_thread_sigprocmask(ptmc_state.cursor,pid,ret.args[0],ret.args[1],ret.args[2],ret.args[3]);
     tracee_set_rax(pid,ret.rval);
   } else if (ret.nr == SYS_set_tid_address) {
@@ -413,14 +418,6 @@ syscall_info extract_one_syscall(pid_t pid)
       remaining -= length;
     }
   }
-  /* rseq mask */
-  if (ret.nr == SYS_rseq)
-  {
-    rseq_struct[pid] = (void *)ret.args[0];
-    rseq_len[pid] = ret.args[1];
-    LOG_INFO("Record rseq(%p, %d)", (void *)ret.args[0], ret.args[1]);
-  }
-
   if (ret.nr == SYS_getcpu && ret.rval == 0)
   {
     const unsigned int zero = 0;

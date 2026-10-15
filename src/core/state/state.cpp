@@ -71,9 +71,6 @@ PTMC_STATE ptmc_state;
 TSS state_tree;
 SSS state_set;
 
-std::unordered_map<int, void *> rseq_struct;
-std::unordered_map<int, int> rseq_len;
-
 // Note: membuf removed - was never used, caused double free bug
 
 /* ======================================================================
@@ -384,9 +381,19 @@ static bool same_backing(const maps_item& saved, const maps_item& live, uint64_t
                           uint64_t(live.offset) + address - live.start;
 }
 
+// Public low-level restore APIs may bypass the owned-carrier barrier. Their
+// caller must keep all tasks stopped; never write memory with native rseq active.
+static void require_no_process_rseq(pid_t pid)
+{
+  const auto threads = get_thread_list(pid);
+  if (threads.empty()) throw std::runtime_error("Cannot inspect restore process threads");
+  for (pid_t tid : threads) require_no_rseq(tid);
+}
+
 void tracee_state::restore_memory_mappings(
     hash_type ts_hash, int pid, std::vector<maps_item> &maps_out) const
 {
+  require_no_process_rseq(pid);
   const auto snapshot = SnapshotView::open(ts_hash);
   std::vector<maps_item> maps_saved;
   std::istringstream encoded(std::string(snapshot->maps_text()));
@@ -468,15 +475,9 @@ void tracee_state::restore_memory_mappings(
 void tracee_state::recover_mem_reg_snapshot(std::vector<maps_item> &maps,
                                             hash_type ts_hash, int pid) const
 {
+  require_no_process_rseq(pid);
   const auto snapshot = SnapshotView::open(ts_hash);
   const auto& regions = snapshot->regions();
-
-  // Kernel-maintained rseq fields belong to the live process, not the branch.
-  if (rseq_len[pid] < 0) throw std::runtime_error("Invalid rseq size");
-  std::vector<uint8_t> rseq(rseq_len[pid]);
-  iovec rseq_local{rseq.data(), rseq.size()}, rseq_remote{rseq_struct[pid], rseq.size()};
-  checked_memory_io(false, pid, &rseq_local, &rseq_remote, 1);
-  detsim::page_restore::read_bytes.fetch_add(rseq.size(), std::memory_order_relaxed);
 
   constexpr size_t MAX_IOV_BATCH = 256;
   iovec local_iov[MAX_IOV_BATCH], remote_iov[MAX_IOV_BATCH];
@@ -559,8 +560,6 @@ void tracee_state::recover_mem_reg_snapshot(std::vector<maps_item> &maps,
   }
   flush();
 
-  checked_memory_io(true, pid, &rseq_local, &rseq_remote, 1);
-  detsim::page_restore::write_bytes.fetch_add(rseq.size(), std::memory_order_relaxed);
   for (size_t i : protected_regions)
     restore_protection(pid, regions[i].start, regions[i].end, regions[i].prot);
 
@@ -940,7 +939,6 @@ hash_type tracee_state::capture_stopped(pid_t pid, hash_type comparison_hash)
   if (page_capture_enabled())
   {
     const auto hash = save_paged_snapshot(pid, regions, tstate_data, maps_text, regs,
-                              reinterpret_cast<uintptr_t>(rseq_struct[pid]), rseq_len[pid],
                               comparison_hash);
     remember_thread_bindings(pid, hash, *this);
     return hash;
@@ -987,7 +985,7 @@ hash_type tracee_state::capture_stopped(pid_t pid, hash_type comparison_hash)
                              regions_to_capture[i].size,
                              all_data + region_infos[i].offset});
     }
-    // The helper keeps unnormalized bytes and deliberately tracks restore writes.
+    // The helper keeps raw bytes and deliberately tracks restore writes.
     soft_dirty->capture(pid, raw_regions, maps_text);
   }
 
@@ -1023,21 +1021,6 @@ hash_type tracee_state::capture_stopped(pid_t pid, hash_type comparison_hash)
 
     if (!soft_dirty)
       checked_memory_io(false, pid, local_iov, remote_iov, readable_count);
-
-    for (size_t i = 0; i < batch_count; i++)
-    {
-      size_t idx = batch_start + i;
-      auto &src = regions_to_capture[idx];
-      if ((uintptr_t)rseq_struct[pid] >= src.start &&
-          (uintptr_t)rseq_struct[pid] < src.end)
-      {
-        uintptr_t rseq_offset = (uintptr_t)rseq_struct[pid] - src.start;
-        uint8_t *dest = all_data + region_infos[idx].offset;
-        if (rseq_len[pid] < 0 || size_t(rseq_len[pid]) > src.size - rseq_offset)
-          throw std::runtime_error("rseq extends beyond captured memory region");
-        memset(dest + rseq_offset, 0x55, rseq_len[pid]);
-      }
-    }
   }
 
   memcpy(all_data + header->tstate_offset, tstate_data.data(), tstate_size);
@@ -1390,16 +1373,6 @@ void cleanup_all()
   detsim::ui::ui_printf("[DEBUG] Clearing global containers...\n");
   state_tree.clear();
   state_set.clear();
-
-  /* 5. Free rseq structures */
-  /*
-  detsim::ui::ui_printf("[DEBUG] Freeing rseq structures...\n");
-  for (auto& pair : rseq_struct) {
-    free(pair.second);
-  }
-  rseq_struct.clear();
-  rseq_len.clear();
-  */
 
   /* 6. Cleanup readline resources */
   detsim::ui::ui_printf("[DEBUG] Cleaning up readline...\n");

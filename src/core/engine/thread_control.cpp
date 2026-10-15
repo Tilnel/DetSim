@@ -31,7 +31,10 @@ void verify_stopped_thread_set(pid_t main_pid, std::span<const pid_t> expected)
                                      std::to_string(tid) + ": " + std::strerror(error));
         }
     }
-    for (pid_t tid : threads) require_no_pending_signals(tid);
+    for (pid_t tid : threads) {
+        require_no_pending_signals(tid);
+        require_no_rseq(tid);
+    }
     // Detect a concurrent clone/exit between enumeration and register checks.
     if (get_thread_list(main_pid) != threads)
         throw std::runtime_error("Thread stop barrier thread set changed during verification");
@@ -73,4 +76,15 @@ void require_no_pending_signals(pid_t tid)
     }
     if (status.bad() || !thread_seen || !shared_seen)
         throw std::runtime_error("Cannot read complete pending thread signal state");
+}
+
+void require_no_rseq(pid_t tid)
+{
+  __ptrace_rseq_configuration configuration{};
+  const auto size = ptrace(PTRACE_GET_RSEQ_CONFIGURATION, tid,
+      reinterpret_cast<void*>(sizeof(configuration)), &configuration);
+  if (size != sizeof(configuration))
+    throw std::runtime_error("Cannot inspect thread rseq registration: PTRACE_GET_RSEQ_CONFIGURATION is required");
+  if (configuration.rseq_abi_pointer || configuration.rseq_abi_size)
+    throw std::runtime_error("Unsupported active rseq registration in rseq-unavailable model");
 }

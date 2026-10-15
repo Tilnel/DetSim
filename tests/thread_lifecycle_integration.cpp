@@ -9,6 +9,7 @@
 #include "state/state_store.h"
 #include "state/sysstate_store.h"
 #include "engine/exec_engine.h"
+#include "engine/thread_carrier.h"
 #include "engine/thread_manager.h"
 #include "syscall/dispatcher.h"
 
@@ -40,6 +41,8 @@ static volatile long parent_tids[3]{};
 static int main_exit_flag = 0;
 static int clear_tid_word = 123;
 static robust_list_head pending_robust{};
+alignas(32) static std::array<unsigned char, 32> rseq_shaped_memory{};
+alignas(32) static struct rseq registered_rseq{};
 
 // Raw clone cannot return through libc/C on a new child stack. Only the parent
 // pops its saved r12; the child executes this assembly until virtual SYS_exit.
@@ -172,6 +175,100 @@ static void assert_worker(pid_t pid, int index, unsigned long logical_tid)
     require(job.pid == 1, "worker getpid differs from logical main thread");
 }
 
+// Registration is deliberately installed through the host-only injection path:
+// guests in the unavailable-rseq model cannot create it through the dispatcher.
+static void reject_active_rseq(pid_t carrier, const sys_state& current,
+                               const sys_state& other)
+{
+    current.recover_running_state();
+    const pid_t main = ptmc_state.pids[0];
+    require(tracee_do_syscall(carrier, SYS_rseq,
+            reinterpret_cast<uintptr_t>(&registered_rseq), sizeof registered_rseq,
+            0, RSEQ_SIG, 0, 0) == 0, "register carrier rseq fixture");
+    const auto tasks = get_thread_list(main);
+    const auto saved_bytes = read_guest(main, &registered_rseq);
+    const auto saved_job = read_guest(main, &jobs[0]);
+    const auto saved_hash = ptmc_state.running_state.ss_hash;
+    const auto saves = StateStore::instance().get_stats().save_calls;
+    user_regs_struct before_main{}, before_carrier{};
+    require(ptrace(PTRACE_GETREGS, main, nullptr, &before_main) == 0 &&
+            ptrace(PTRACE_GETREGS, carrier, nullptr, &before_carrier) == 0,
+            "read registered carrier registers");
+    auto rejected_without_mutation = [&](auto operation) {
+        bool rejected = false;
+        try { operation(); }
+        catch (const std::runtime_error& error) {
+            rejected = std::string(error.what()).find("active rseq registration") != std::string::npos;
+        }
+        user_regs_struct after_main{}, after_carrier{};
+        require(ptrace(PTRACE_GETREGS, main, nullptr, &after_main) == 0 &&
+                ptrace(PTRACE_GETREGS, carrier, nullptr, &after_carrier) == 0,
+                "read rejected operation registers");
+        const auto bytes = read_guest(main, &registered_rseq);
+        const auto job = read_guest(main, &jobs[0]);
+        require(rejected && get_thread_list(main) == tasks &&
+                StateStore::instance().get_stats().save_calls == saves &&
+                ptmc_state.running_state.ss_hash == saved_hash &&
+                std::memcmp(&before_main, &after_main, sizeof before_main) == 0 &&
+                std::memcmp(&before_carrier, &after_carrier, sizeof before_carrier) == 0 &&
+                std::memcmp(&saved_bytes, &bytes, sizeof bytes) == 0 &&
+                std::memcmp(&saved_job, &job, sizeof job) == 0,
+                "active carrier rseq was accepted or rejection mutated state");
+    };
+    rejected_without_mutation([&] { (void)capture_current(current); });
+    rejected_without_mutation([&] { current.recover_running_state(); });
+    rejected_without_mutation([&] { other.recover_running_state(); });
+    rejected_without_mutation([&] { (void)create_thread_carrier(carrier); });
+    std::vector<maps_item> maps;
+    rejected_without_mutation([&] {
+        other.child[0].restore_memory_mappings(other.ts_hash[0], main, maps);
+    });
+    require(maps.empty(), "rejected mapping restore changed output mappings");
+    rejected_without_mutation([&] {
+        other.child[0].recover_mem_reg_snapshot(maps, other.ts_hash[0], main);
+    });
+    require(maps.empty(), "rejected memory restore changed input mappings");
+    require(tracee_do_syscall(carrier, SYS_rseq,
+            reinterpret_cast<uintptr_t>(&registered_rseq), sizeof registered_rseq,
+            RSEQ_FLAG_UNREGISTER, RSEQ_SIG, 0, 0) == 0, "unregister carrier rseq fixture");
+    ptmc_state.tracee_image_dirty[0] = true;
+    current.recover_running_state();
+}
+
+static void roundtrip_unregistered_rseq_bytes(pid_t child, const sys_state& initial)
+{
+    // Every byte is ordinary branch memory when rseq is unavailable, including
+    // cpu_id, rseq_cs, flags and extension/padding bytes. No live substitution.
+    std::array<unsigned char, 32> first{}, second{};
+    for (size_t i = 0; i < first.size(); ++i) {
+        first[i] = static_cast<unsigned char>(0x20 + i);
+        second[i] = static_cast<unsigned char>(0xe0 - i);
+    }
+    require(guest_write_exact(child, &rseq_shaped_memory, first.data(), first.size()),
+            "write first rseq-shaped memory");
+    auto a = capture_current(initial);
+    auto copied_a = a;
+    require(guest_write_exact(child, &rseq_shaped_memory, second.data(), second.size()),
+            "write second rseq-shaped memory");
+    auto b = capture_current(a);
+    require(a.ss_hash != b.ss_hash && a.ts_hash[0] != b.ts_hash[0],
+            "unregistered rseq bytes did not contribute to state identity");
+    for (int iteration = 0; iteration < 2; ++iteration) {
+        sys_state loaded(a.ss_hash);
+        loaded.recover_running_state();
+        require(read_guest(child, &rseq_shaped_memory) == first,
+                "persisted restore substituted live rseq-shaped bytes");
+        restore_roundtrip(loaded);
+        b.recover_running_state();
+        require(read_guest(child, &rseq_shaped_memory) == second,
+                "second rseq-shaped branch did not restore exactly");
+        copied_a.recover_running_state();
+        require(read_guest(child, &rseq_shaped_memory) == first,
+                "snapshot copy did not isolate rseq-shaped bytes");
+    }
+    initial.recover_running_state();
+}
+
 static void run_case(bool tiny)
 {
     char directory[] = "/tmp/detsim-thread-lifecycle-XXXXXX";
@@ -215,6 +312,7 @@ static void run_case(bool tiny)
         ptmc_state.running_state = initial;
         thread::init_all(ptmc_state);
         exec::init_all();
+        roundtrip_unregistered_rseq_bytes(child, initial);
 
         // A host-only clear_child_tid registration must block logical clone
         // before adding either a guest slot or a physical carrier.
@@ -238,6 +336,15 @@ static void run_case(bool tiny)
                 static_cast<char*>(__builtin_thread_pointer()) + __rseq_offset);
             require(tracee_do_syscall(child, SYS_rseq, rseq_address, 32, 0, RSEQ_SIG, 0, 0) == 0,
                     "register actual kernel rseq fixture");
+            const auto saves_before_rseq = StateStore::instance().get_stats().save_calls;
+            bool capture_rseq_rejected = false;
+            try { (void)capture_current(initial); }
+            catch (const std::runtime_error& error) {
+                capture_rseq_rejected = std::string(error.what()).find("active rseq registration") != std::string::npos;
+            }
+            require(capture_rseq_rejected &&
+                    StateStore::instance().get_stats().save_calls == saves_before_rseq,
+                    "active rseq capture was accepted or emitted snapshot data");
             bool rseq_rejected = false;
             try { (void)state_transition(initial, 0, 0); }
             catch (const std::runtime_error& error) {
@@ -303,6 +410,9 @@ static void run_case(bool tiny)
         require(after_a.child[0].threads[1].regs.rax == 0 &&
                 after_a.child[0].threads[1].regs.fs_base == reinterpret_cast<uintptr_t>(&tls[0]),
                 "newborn A clone return/TLS state incorrect");
+        reject_active_rseq(child, after_a, initial);
+        const pid_t a_carrier = ptmc_state.running_state.child[0].threads[1].physical_tid;
+        reject_active_rseq(a_carrier, after_a, initial);
         auto after_b = step(after_a, 0, SYS_clone);
         require(after_b.child[0].threads.size() == 3 && read_guest(child, &jobs[1]).tid == 0,
                 "clone B publication or newborn stop failed");
@@ -316,6 +426,7 @@ static void run_case(bool tiny)
         require(!after_a_exit.child[0].threads[1].alive && after_a_exit.child[0].threads[0].alive &&
                 after_a_exit.child[0].threads[2].alive, "thread exit terminated peers or lost its slot");
         assert_worker(child, 0, 2);
+        reject_active_rseq(a_carrier, after_a_exit, initial);
         dead_actor_rejected(after_a_exit, 1);
         auto parent_boundary = step(after_a_exit, 0, SYS_getpid);
         require(read_guest(child, const_cast<const long*>(&parent_tids[1])) == 3,

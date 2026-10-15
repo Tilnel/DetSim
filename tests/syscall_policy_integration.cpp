@@ -14,6 +14,7 @@
 #include <string>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/rseq.h>
 #include <sys/ptrace.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
@@ -23,6 +24,7 @@
 static_assert(NP == 2);
 extern "C" detsim::ui::NCursesUI* get_ncurses_ui() { return nullptr; }
 static int failures;
+alignas(32) static std::array<unsigned char,32> rseq_buffer{};
 static const char replacement_name[] = "escaped";
 static rlimit guest_limit{};
 static timespec guest_zero{}, guest_delay{1,0}, guest_invalid{-1,0};
@@ -99,6 +101,9 @@ int main() {
         child = fork();
         if (child < 0) throw std::runtime_error("fork");
         if (!child) {
+            if (__rseq_size && syscall(SYS_rseq,
+                    static_cast<char*>(__builtin_thread_pointer()) + __rseq_offset,
+                    32, RSEQ_FLAG_UNREGISTER, RSEQ_SIG)) _exit(9);
             if (setpgid(0, 0) || prctl(PR_SET_NAME, "policy-child", 0, 0, 0)) _exit(2);
             if (mmap(reinterpret_cast<void*>(scratch_page), 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) == MAP_FAILED) _exit(2);
@@ -120,6 +125,18 @@ int main() {
         for (const auto number : {-1, 1000000, SYS_prctl, SYS_kill, SYS_ptrace, SYS_reboot})
             unknown_rejected &= dispatcher.get_route(number).action == SyscallAction::REJECT;
         check(unknown_rejected, "unmodeled and out-of-range syscalls reject");
+        for (const auto args : {std::array<uint64_t,6>{reinterpret_cast<uint64_t>(rseq_buffer.data()),32,0,RSEQ_SIG,0,0},
+                               std::array<uint64_t,6>{1,UINT32_MAX,UINT32_MAX,0,0,0},
+                               std::array<uint64_t,6>{reinterpret_cast<uint64_t>(rseq_buffer.data()),32,RSEQ_FLAG_UNREGISTER,RSEQ_SIG,0,0}}) {
+            const auto unavailable=execute(dispatcher,child,SYS_rseq,args);
+            check(!unavailable.rejected && unavailable.value==-ENOSYS,"rseq unavailable for all argument forms");
+        }
+        std::array<unsigned char,32> observed_rseq{};
+        __ptrace_rseq_configuration registration{};
+        check(guest_read_exact(child,rseq_buffer.data(),observed_rseq.data(),observed_rseq.size()) &&
+              observed_rseq==rseq_buffer,"unavailable rseq leaves user memory unchanged");
+        check(ptrace(PTRACE_GET_RSEQ_CONFIGURATION,child,reinterpret_cast<void*>(sizeof(registration)),&registration)==sizeof(registration) &&
+              !registration.rseq_abi_pointer,"unavailable rseq never registers with host kernel");
         auto result = execute(dispatcher, child, SYS_prctl,
                               {PR_SET_NAME, reinterpret_cast<uint64_t>(replacement_name), 0, 0, 0, 0});
         check(result.rejected && child_name(child) == "policy-child", "PR_SET_NAME rejected before host mutation");

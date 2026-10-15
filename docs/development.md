@@ -314,7 +314,7 @@ and successful validation after stopping it. Raw carrier reconciliation now cove
 `clone` and `clone3` require VM/FS/FILES/SIGHAND/THREAD sharing, with optional
 SYSVSEM, SETTLS, PARENT_SETTID, CHILD_SETTID and CHILD_CLEARTID. Other flags reject.
 Initial clear-tid registration transfers into the logical task; carrier kernel
-registrations stay zero. Active kernel rseq registration still rejects birth. Nonempty/pending robust futex ownership rejects exit;
+registrations stay zero. Active kernel rseq registration rejects capture, restore and birth. Nonempty/pending robust futex ownership rejects exit;
 raw thread exit performs modeled clear-tid notification. The rseq/robust limits
 still apply; ordinary glibc/pthread startup is not certified.
 Host support for PR_GET_TID_ADDRESS and PTRACE_GET_RSEQ_CONFIGURATION is required.
@@ -400,8 +400,9 @@ The next platform slices should be tested across runtimes:
    exercise that shared machinery; suppressing their signals changes behavior.
 
 The audit found two prelude shortcuts: a fabricated set_tid_address return and
-whole-region rseq masking/live-byte preservation. The TID slice below removes the
-former; the rseq behavior still needs independent repair. ABI handlers should apply consistently from the exec stop,
+whole-region rseq masking/live-byte preservation. Both shortcuts are now removed:
+the TID slice models logical IDs, and the rseq-unavailable slice below removes
+registration and memory masking. ABI handlers apply consistently from the exec stop,
 even where the loader prelude otherwise remains a declared trusted environment.
 
 OS-thread fidelity and schedule coverage remain separate acceptance levels.
@@ -496,3 +497,37 @@ registered TLS address can contaminate its raw-memory identity oracle.
 The unmodified pthread probe now advances to the active-rseq clone rejection.
 This does not establish complete pthread support. Restoring an unreadable region
 currently writes its full saved contents, so large reserved ranges can be costly.
+
+## rseq-unavailable execution environment
+
+The fixed execution environment returns `-ENOSYS` for every `rseq` call, including
+registration, unregistration and invalid arguments. This applies from the first
+loader syscall after exec and throughout exploration, without touching the user
+buffer. `RuntimeProfile` identity records `rseq: unavailable-enosys` and kernel
+model v8. There is no native-rseq switch. Existing auxv feature-size/alignment
+hints remain; this is a syscall-unavailable environment, not a full emulation of
+a kernel compiled with CONFIG_RSEQ=n.
+
+The former global rseq address table, whole-region 0x55 masking and restoration
+of live bytes are deleted. Unregistered TLS/user memory is saved exactly through
+both backends. Actual native registration is rejected by the complete stopped
+carrier barrier (including spares), direct carrier creation, and low-level restore
+entry points before modification. Already-registered tasks are not silently
+unregistered. Snapshot layouts remain flat19/page20; the changed execution
+identity prevents old system states from being restored as the new model.
+
+`check-runtime-profile` and `check-syscall-policy` verify startup/runtime ENOSYS,
+untouched user buffers and empty physical registration. `check-thread-lifecycle`
+checks exact rseq-shaped bytes, branch identity/copy/persisted restore, and active
+main/worker/spare rejection for capture, both restore branches, direct carrier
+creation and low-level memory/mapping restore. Raw fork fixtures unregister their
+inherited host registration explicitly; product tracees use exec and interception.
+
+A native seccomp-ENOSYS oracle executes the unmodified pthread TLS/join probe to
+exit0. Under DetSim that probe now advances to unsupported set_robust_list
+(syscall273). Full rseq critical sections, robust owner-death and complete pthread
+support are not established by this change.
+
+References: [Linux syscall absence](https://raw.githubusercontent.com/torvalds/linux/v6.12/kernel/sys_ni.c),
+[Linux rseq ABI](https://raw.githubusercontent.com/torvalds/linux/v6.12/kernel/rseq.c),
+[glibc parent/child registration contract](https://raw.githubusercontent.com/bminor/glibc/glibc-2.41/nptl/pthread_create.c).

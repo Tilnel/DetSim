@@ -69,6 +69,7 @@ pid_t create_thread_carrier(pid_t anchor)
     const auto deadline = Clock::now() + std::chrono::seconds(5);
     const auto original = registers(anchor);
     require_no_pending_signals(anchor);
+    require_no_rseq(anchor);
     const auto original_mask = read_thread_signal_mask(anchor);
     if (original.cs != 0x33) fail("anchor is not native x86-64");
     __ptrace_syscall_info phase{};

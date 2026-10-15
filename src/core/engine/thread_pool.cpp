@@ -25,8 +25,6 @@
 #include <stdexcept>
 #include <sys/ptrace.h>
 
-extern std::unordered_map<int, int> rseq_len;
-
 namespace {
 struct CarrierPool {
   pid_t anchor;
@@ -76,17 +74,6 @@ uint64_t query_clear_child_tid(pid_t tid)
     throw std::runtime_error("Cannot query inherited clear_child_tid: PR_GET_TID_ADDRESS requires CONFIG_CHECKPOINT_RESTORE");
   if (!copied) throw std::runtime_error("Cannot read inherited clear_child_tid address");
   return address;
-}
-
-void require_no_rseq(pid_t tid)
-{
-  __ptrace_rseq_configuration configuration{};
-  const auto size = ptrace(PTRACE_GET_RSEQ_CONFIGURATION, tid,
-      reinterpret_cast<void*>(sizeof(configuration)), &configuration);
-  if (size != sizeof(configuration))
-    throw std::runtime_error("Cannot inspect thread rseq registration: PTRACE_GET_RSEQ_CONFIGURATION is required");
-  if (configuration.rseq_abi_pointer || configuration.rseq_abi_size)
-    throw std::runtime_error("Raw clone thread pool does not support active rseq registration");
 }
 
 void require_empty_robust_list(pid_t tid)
@@ -448,9 +435,6 @@ pid_t create_logical_thread(int node, pid_t parent, const CloneRequest& request)
   auto& state = ptmc_state.running_state.child[node];
   prepare_thread_pool(node, state);
   auto& pool = pool_for(node);
-  if (rseq_len[pool.anchor] != 0)
-    throw std::runtime_error("Raw clone thread pool does not support active rseq registration");
-  for (pid_t tid : pool.carriers) require_no_rseq(tid);
   for (pid_t tid : pool.carriers)
     if (query_clear_child_tid(tid))
       throw std::runtime_error("Thread carrier has unadopted inherited clear_child_tid registration");

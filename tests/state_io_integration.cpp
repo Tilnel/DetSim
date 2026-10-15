@@ -12,6 +12,8 @@
 #include <stdexcept>
 #include <sys/mman.h>
 #include <sys/ptrace.h>
+#include <sys/rseq.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 
@@ -158,6 +160,9 @@ int main()
         child = fork();
         require(child >= 0, "fork");
         if (!child) {
+            if (__rseq_size && syscall(SYS_rseq,
+                    static_cast<char*>(__builtin_thread_pointer()) + __rseq_offset,
+                    32, RSEQ_FLAG_UNREGISTER, RSEQ_SIG)) _exit(9);
             if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr)) _exit(2);
             asm volatile("int3");
             _exit(0);

@@ -13,6 +13,8 @@
 #include <cstring>
 #include <sys/mman.h>
 #include <sys/ptrace.h>
+#include <sys/rseq.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 
 extern "C" detsim::ui::NCursesUI *get_ncurses_ui() { return nullptr; }
@@ -68,6 +70,9 @@ int main(int argc, char** argv)
         require(mkdtemp(directory) && chdir(directory) == 0, "temporary directory");
         child = fork(); require(child >= 0, "fork");
         if (!child) {
+            if (__rseq_size && syscall(SYS_rseq,
+                    static_cast<char*>(__builtin_thread_pointer()) + __rseq_offset,
+                    32, RSEQ_FLAG_UNREGISTER, RSEQ_SIG)) _exit(9);
             if (mmap(reinterpret_cast<void*>(scratch_page), 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
                      MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED) _exit(2);
             auto* code = reinterpret_cast<unsigned char*>(scratch_page + 0xff0);

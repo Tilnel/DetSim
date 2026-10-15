@@ -224,3 +224,22 @@ The pthread smoke now stops at active rseq registration during clone. That exist
 whole-region rseq masking/live-byte preservation shortcut still needs a real
 per-task kernel ABI contract; guard support does not resolve it. Large guard
 reservations currently require full hidden-byte reads and full restore writes.
+
+## rseq unavailable policy (2026-10-16)
+
+C02/C08 no longer rely on whole-region rseq masking or live-byte preservation.
+The execution contract exposes rseq as unavailable (ENOSYS), consistently from
+exec prelude through runtime. Kernel model v8 records that policy; full/page
+layouts remain19/20. Ordinary unregistered memory is preserved byte-for-byte.
+
+RED: a real registration previously allowed capture and snapshot publication.
+GREEN: main/worker/spare registrations reject capture, same/different-state
+restore and direct carrier/low-level restore APIs without state mutation. Four
+full/pages/cache lifecycle variants verify these boundaries and exact archived
+rseq-shaped memory. Startup and syscall-policy tests cover valid/invalid/unregister
+arguments returning ENOSYS without memory writes or host registration.
+
+This closes the old masking/preservation shortcut, not full rseq semantics.
+CPU/node/mm-cid, restartable critical-section abort and signal/preemption outcomes
+remain unimplemented. The actual pthread probe's next blocker is set_robust_list;
+robust-list ownership and owner-death need a separate generic Linux ABI slice.

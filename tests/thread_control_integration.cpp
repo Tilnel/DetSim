@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
+#include <sys/rseq.h>
 #include <sys/syscall.h>
 #include <sys/user.h>
 #include <sys/wait.h>
@@ -54,6 +55,9 @@ static void run_case()
     pid_t child = fork();
     require(child >= 0, "fork tracee");
     if (!child) {
+        if (__rseq_size && syscall(SYS_rseq,
+                static_cast<char*>(__builtin_thread_pointer()) + __rseq_offset,
+                32, RSEQ_FLAG_UNREGISTER, RSEQ_SIG)) _exit(9);
         prctl(PR_SET_PDEATHSIG, SIGKILL);
         if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr)) _exit(2);
         raise(SIGSTOP);

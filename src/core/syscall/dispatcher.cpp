@@ -185,6 +185,10 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
             return SyscallRoute(SyscallCategory::UNSUPPORTED,SyscallAction::REJECT,
                                 "Unsupported virtual I/O or descriptor lifecycle");
 
+        case SYS_rseq:
+            return SyscallRoute(SyscallCategory::EMULATED, SyscallAction::EMULATE,
+                                "rseq syscall unavailable in this execution environment");
+
         case SYS_clone: case SYS_clone3: case SYS_set_tid_address: case SYS_rt_sigprocmask:
         case SYS_exit: case SYS_getpid: case SYS_gettid:
             return SyscallRoute(SyscallCategory::EMULATED, SyscallAction::EMULATE,
@@ -322,6 +326,10 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
 
     // Route to appropriate handler
     switch (info.nr) {
+        case SYS_rseq:
+            info.rval = -ENOSYS;
+            tracee_set_rax(pid,info.rval);
+            return CKPT_YES;
         // Network syscalls
         case SYS_sendto:
         case SYS_recvfrom:
