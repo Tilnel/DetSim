@@ -14,9 +14,9 @@
  * eval<T> - Evaluate expression and return typed result
  *
  * Usage:
- *   int state = eval<int>("raft.state", 0);        // process 0
- *   uint64_t term = eval<uint64_t>("raft.current_term", 1);
- *   bool is_leader = eval<bool>("raft.state == 2", 0);
+ *   int state = eval<int>("counter", 0);        // process 0
+ *   uint64_t term = eval<uint64_t>("sequence", 1);
+ *   bool is_leader = eval<bool>("counter == 2", 0);
  *
  * Supports types: int, uint32_t, uint64_t, long, bool, void*
  *

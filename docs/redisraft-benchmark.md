@@ -357,3 +357,44 @@ I/O语义，不能直接用两组墙钟说明优化/退化；这里仅比较本�
 ```sh
 python3 tests/page_snapshot_benchmark.py --repeats 1 --depth 12 --output build/io-boundary-benchmark-quiet
 ```
+
+## 通用框架与统一读取接口复核（2026-10-15）
+
+基线为 `d978d5b` 的保留二进制与旧插件；新版使用公开 C ABI、转换性质与历史 monitor，
+并删除 Raft 核心字段/隐式角色剪枝。固定seed、100轮手控、DFS深度8，每档每模式3次，
+顺序执行，不并行构建或测试。新旧合计24次，全部521 visits、275 new states，
+协议检查点和剩余预算3一致。计数相等不等于完整后继图等价性证明。
+
+| Hot/Warm MiB | 后端 | 旧/新墙钟中位数 s | 旧/新 tracer CPU s | 新峰值 RSS MiB |
+| --- | --- | --- | --- | --- |
+| 32/64 | full | 2.001 / 1.989 | 2.46 / 2.58 | 301.5 |
+| 32/64 | pages | 1.515 / 1.044 | 0.98 / 1.01 | 36.2 |
+| 256/512 | full | 1.753 / 1.584 | 2.19 / 2.25 | 818.3 |
+| 256/512 | pages | 1.515 / 1.024 | 1.01 / 0.99 | 35.9 |
+
+纯通用化阶段先单独测过三次：pages墙钟约1.516s基本不变，full小缓存中位数3.021s，
+但CPU仅2.63s（旧2.46s）。记录显示完成报告按1秒量化。定位到状态显示线程固定
+500ms/1s休眠并在停止时join；该线程同时无锁读取正在变动的状态树和运行态。
+随后改为探索线程在完成转换后定期刷新状态，删除后台竞态和固定退出等待。
+最终 pages 墙钟下降约31–32%，大缓存 full 下降约10%，小缓存 full 基本持平；
+tracer CPU变化约-2%至+5%。这包含更强的性质/历史检查与提交正确性修复，不能把
+墙钟收益归因于虚函数接口，也没有单独分离读取抽象的成本。
+
+DFS墙钟含命令完成、存储尾部工作和原有监控退出成本；初始化/手控阶段不计入该列。
+CPU为全部tracer线程，tracee另行计数。测量仍是有限、静态链接Raft驱动，不代表
+所有目标程序或大历史monitor的开销。
+
+产物：`build/generic-framework-before/benchmark-final/`（基线）、
+`build/generic-framework-after/`（纯通用化）、`build/generic-framework-final/`（最终版）。
+每个目录保存逐次日志、JSON结果与汇总；旧二进制/插件保留在build/generic-framework-before。
+
+```sh
+python3 tests/page_snapshot_benchmark.py --tracer build/generic-framework-before/tracer --plugin-dir build/generic-framework-before --repeats 3 --depth 8 --output build/generic-framework-before/benchmark-final
+python3 tests/page_snapshot_benchmark.py --repeats 3 --depth 8 --output build/generic-framework-final
+```
+
+较深的独立交叉检查：pages、32/64MiB、深度12，新旧均5593 visits/2867 new states，
+单次墙钟12.517/12.518s、tracer CPU11.59/11.93s，深探索没有观察到墙钟收益，CPU约+3%。
+另一次verify-pages对19257次捕获进行独立全读对照，oracle读取23.9GB，通过；其
+20.27s包括额外oracle，不纳入普通后端性能比较。产物为
+`build/generic-framework-deep-{before,after}/`和`build/generic-framework-verify/`。

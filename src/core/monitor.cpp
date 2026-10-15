@@ -16,7 +16,6 @@
 #include "fsstate.h"
 #include "guest.h"
 #include "proc_status.h"
-#include "raft_msg_parser.h"
 #include "scheduler.h"
 #include "sockstate.h"
 #include "state/state.h"

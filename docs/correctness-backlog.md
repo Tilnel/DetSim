@@ -13,18 +13,18 @@ relationship to the native-binary model-checking goal.
 | C03 | P0 | New BFS sets a selected thread before `state_transition`; recovery and `execute_step` synchronization can overwrite that selection. Two exploration implementations remain compiled; CLI uses the old one. | A two-thread finite program exposes both successor transitions from one snapshot. Trace all callers, compare BFS/DFS results, then consolidate to one path. |
 | C04 | Partial | Ordered system metadata identity includes status/budget; storage now compares duplicate bytes in cache, packed records and metadata instead of trusting hashes alone. | Identity and all storage gates cover ordering and duplicate conflicts. Logical thread identity and equivalence of differently encoded semantic states remain open. |
 | C05 | Fixed (scoped) | Removed filename heuristics; corrected libelf string-table index in Go-section detection. | Native `test_probe` starts at the same boundary as `probe`; ordinary/Go-section ELF fixtures and two existing gc Go binaries classified correctly. gccgo and actual Go runtime execution remain unverified. |
-| C06 | P1 | `state_to_be_discarded` reads Raft symbols and cuts paths in the generic scheduler; Raft metadata/parser also lives in core. | Generic workload search independent of symbol names; opt-in Raft checks through the existing plugin boundary, with the same intended counterexamples. |
+| C06 | Fixed (framework boundary) | Removed Raft fields, implicit role pruning, message inference and example parser from the production link. Versioned plugins inspect explicit snapshots; branch-owned opaque monitors enter product identity before successor publication. | `check-state-view`, `check-plugins`, `check-identity` and native counter-plugin restore/violation scenarios cover readonly inspection, ABI failures, history isolation, terminal witnesses and decoder noninterference. Raft examples have separate projection/history contracts; this does not certify every Raft property. |
 | C07 | Fixed | Snapshot reads now require saved bytes and reject missing/corrupt data; no live-memory substitution. | `check-state-io` covers missing/invalid archives and reads spanning saved regions. |
-| C08 | Partial | Native same-edge replay preserves hash; storage tests now cover immutable reader lifetime, cache pressure/zero budgets, short I/O, prefetch and fresh-process reload. | `check-storage`, `check-state-io`, `check-capture` full-byte oracle, mapping and native replay gates pass. Full exploration equivalence across cache policies and general multi-node semantic canonicalization remain unproven. |
+| C08 | Partial | Native same-edge replay preserves hash; storage tests now cover immutable reader lifetime, cache pressure/zero budgets, short I/O, prefetch and fresh-process reload. | `check-storage`, `check-state-io`, `check-capture` full-byte oracle, mapping and native replay gates pass. Full exploration equivalence across cache policies and general multi-node semantic canonicalization remain unproven. Also reproduce cross-branch virtual-exit closure: restore currently skips dead physical images, while later captures still walk every node; reading a saved snapshot correctly does not establish that a later dead-node capture used the right branch. |
 | C09 | Fixed (scoped) | Replaced process-group termination with owned-child kill/reap; signal handler avoids store shutdown locks. | NP=1 scenarios verify unrelated sibling survives both normal exit and SIGTERM, and SIGTERM reaps tracees. Fork descendants, multithread races and initialization failures need additional coverage. |
 | C10 | Fixed | Migrated removed libdwarf calls to supported APIs; validated with installed libdwarf 0.11.1 and GCC 14.2. | Real production parser tests pass DWARF 4/5, two CUs, sizes/member offsets, symbols, arrays and cleanup/reinit; tracer compiles and links. Split DWARF and PIE relocation remain outside coverage. |
 | C11 | Fixed (distinct addresses) | Direct `futex_requeue` now updates `waiter_map_` when moving a waiter. | Both entry points agree on queue/address; archive round trip followed by `wake_thread` succeeds. Same-address and syscall requeue ABI now have C16 regressions. |
 | C12 | Fixed | `handle_exit_group` wrote a raw wait status without the DetSim exited flag; successful exit became “running” and the next step crashed. | Finite program reaches counter 1/2/3, exits virtually, and further stepping reports exit status 0. |
-| C13 | Fixed | BFS reset an optional on violation, continued executing and printed a false completion message. | Reachable `counter < 3` violation interrupts BFS without printing completion; ordinary finite BFS explores the expected five states. |
+| C13 | Fixed (BFS/DFS/RAND) | BFS formerly continued after violation; DFS ignored its stop code and RAND only broke an inner loop. All now stop the entire search, retaining a failed product-state witness. | Native scenarios verify reachable assertion violations stop each mode without a false completion; counter-plugin replay preserves terminal identity. Ordinary finite BFS still explores the expected five states. |
 | C14 | Fixed | Batch command parser pointed at the NUL inserted by strtok and discarded all arguments. | Real batch handles whitespace, `sw 0`, `p counter` and `q`. |
 | C15 | Fixed (captured streams) | STDIO descriptors share the virtual FD registry; stdin is deterministic EOF and stdout/stderr content is archived VFS state. | `check-io-boundary` covers access modes, writes, close, archive and branch isolation; terminal input/output and interactive stdin remain unsupported. |
 | C16 | Fixed (scoped) | WAKE unblocks removed waiters, successful WAIT saves a suspended successor with return 0; requeue uses arg4 count/arg6 comparison, returns total affected and handles same address safely. | `check-futex` covers real ptrace WAIT/WAKE/bitset/requeue/errors; unsupported timed/realtime/PI operations explicitly fail. Exhaustive wake-order outcomes remain outside coverage. |
-| C17 | P1 | CPU-feature patch logs “Symbol not found” on ordinary dynamic workloads because the requested loader symbol is not resolved. | Define and test which nondeterministic CPU/runtime state must be normalized; avoid assuming this patch worked from a successful scenario. |
+| C17 | P1 | The glibc-private CPU-feature patch has been removed; general nondeterministic CPU instructions/runtime inputs still need a supported execution contract. | Define and test which nondeterministic CPU/runtime state must be normalized; avoid assuming this patch worked from a successful scenario. |
 | C20 | Fixed (host user XSTATE) | Capture/archive/restore NT_X86_XSTATE for each thread; snapshot version 5 rejects old formats. | `check-xstate` covers XMM/AVX/x87/MXCSR; native SIMD scenario repeatedly restores observed=0 and replays observed=11. Cross-host layouts and supervisor state are outside coverage. |
 | C21 | Fixed (scoped) | Save private readable mappings including RO pages; restore protections/backing and canonicalize equivalent VMA partitions. Reject shared/unreadable maps and missing file/named backing. | `check-mappings` covers RO contents, permissions, split/merge, anonymous recreation, explicit unsupported cases and wide map fields. Native replay preserves successor identity. |
 | C22 | Fixed (snapshot I/O) | Exact read/write counts and archive bounds required; failures propagate, without zero-fill or live fallback. | `check-state-io` fault-injects short/failed process_vm I/O and corrupt/missing/old archives. Failed restore is fatal; no successor may execute afterward. |
@@ -63,7 +63,7 @@ Redis findings and resolution:
 - **C19 / fixed for the supported path:** Checked guest sockaddr/length copies,
   length writeback, truncation, fd/peer matching and stale queue handling pass 12
   cross-process cases; original Redis SET/GET now completes. Pending connections now use captured endpoint keys; same numeric client FDs
-  across nodes no longer alias. Snapshot formats are7/8.
+  across nodes no longer alias. Snapshot formats are now9/10 (I/O repair first introduced7/8).
   EFAULT retains the virtual pending connection; partial copyout is not rolled back.
   These error-path modeling limits and accept4 flag fidelity need further coverage.
 
@@ -98,3 +98,18 @@ Private VFS mmap copies initial bytes and restores permissions, but does not tra
 subsequent file writes into clean mapped pages. fsync validates a virtual regular
 file without modeling filesystem crashes/durability. These require new transition
 and snapshot contracts, rather than success-only syscall stubs.
+
+## Generic framework slice (2026-10-15)
+
+Machine snapshots no longer contain application/checker fields. Flat9/page10 share
+SnapshotView chunk readers; opaque per-plugin history is persisted in version2
+system metadata with model context and terminal failure identity. Model fingerprints
+cover executables, semantic plugin binaries/configuration and runtime profile,
+excluding caches, UI and decoder-only plugins. Incompatible states fail explicitly.
+
+Known support limits: trusted native plugin ABI, fixed NP in core, symbolic
+inspection of a matching non-PIE main image only, immutable executable files during
+a run, explicit Linux syscall bootstrap outside exploration, and time-choice-only
+external environment callbacks. Generic network/futex outcomes remain in platform
+models. Signal delivery and universal CPU nondeterminism are not solved by removing
+workload patches. C02/C03/C08/C23/C25 remain open at their stated scope.

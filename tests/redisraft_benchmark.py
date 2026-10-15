@@ -13,6 +13,8 @@ import subprocess
 import tempfile
 import time
 
+from fixture_profile import startup_boundary
+
 ROOT = Path(__file__).resolve().parents[1]
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--tracer', type=Path, default=ROOT/'tracer')
@@ -38,7 +40,7 @@ result = {'passed': False, 'workdir':str(work), 'rounds':a.rounds, 'dfs_depth':a
           'hot_mb':a.hot_mb, 'warm_mb':a.warm_mb, 'checker':str(a.check) if a.check else None, 'steps':0, 'peak_rss_kib':0,
           'search_seed':a.seed if a.seed_shim else None,
           'binary_sha256':hashlib.sha256(a.binary.read_bytes()).hexdigest()}
-config = {'Nodes':3,'Loglevel':4,'Tracee':[[str(a.binary.resolve()),str(i)] for i in range(3)],
+config = {'RuntimeProfile':{'startup_syscall':startup_boundary(a.binary)}, 'Nodes':3,'Loglevel':4,'Tracee':[[str(a.binary.resolve()),str(i)] for i in range(3)],
           'Addr':['192.168.0.1','192.168.0.2','192.168.0.3'], 'WorkingDir':'/',
           'ChoosePoint':[{'syscall':96,'choose':2}], 'ChooseFunc':str(a.choose.resolve()),
           'StateStore':{'hot_cache_mb':a.hot_mb,'warm_cache_mb':a.warm_mb,'prefetch_window':0}}
@@ -132,8 +134,15 @@ try:
         while offset < len(blob):
             magic,key,size,checksum=struct.unpack_from('<IQII',blob,offset)
             offset+=20
-            if magic!=0x53534545 or size!=40: raise RuntimeError('unexpected NP3 metadata record')
-            result['error_bound_after_manual']=struct.unpack_from('<i',blob,offset+36)[0]
+            if magic!=0x53534545 or size>len(blob)-offset:
+                raise RuntimeError('invalid metadata record')
+            if size==40:  # retained pre-framework benchmark binary
+                budget_offset=36
+            elif size>=53 and struct.unpack_from('<III',blob,offset)==(0x4453534d,2,3):
+                budget_offset=48
+            else:
+                raise RuntimeError('unsupported NP3 system metadata schema')
+            result['error_bound_after_manual']=struct.unpack_from('<i',blob,offset+budget_offset)[0]
             offset+=size
         if a.depth and result['error_bound_after_manual']<=0:
             raise RuntimeError('manual schedule exhausted search error budget')

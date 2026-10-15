@@ -1,0 +1,151 @@
+#include "state/state.h"
+#include "runtime_profile.h"
+#include "ncurses_ui.h"
+extern "C" detsim::ui::NCursesUI* get_ncurses_ui() { return nullptr; }
+#include "engine/signal_handler.h"
+#include "guest.h"
+#include "scheduler.h"
+#include <elf.h>
+#include <sys/wait.h>
+#include <sys/ptrace.h>
+#include <sys/user.h>
+#include <cstdint>
+#include <nlohmann/json.hpp>
+#include <stdexcept>
+#include <cstdio>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static void require(bool value, const char* message) {
+  if (!value) throw std::runtime_error(message);
+}
+static bool rejected(const nlohmann::json& value) {
+  try { detsim::configure_runtime_profile(value); }
+  catch (const std::exception&) { return true; }
+  return false;
+}
+static void check_initial_auxv(const char* executable) {
+  pid_t pid = fork();
+  require(pid >= 0, "fork auxv fixture");
+  if (pid == 0) {
+    if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) < 0) _exit(101);
+    execl(executable, executable, "--auxv-fixture", nullptr);
+    _exit(102);
+  }
+  int status = 0;
+  auto cleanup = [&] { kill(pid, SIGKILL); waitpid(pid, &status, 0); };
+  try {
+    require(waitpid(pid, &status, 0) == pid && WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP,
+            "fixture stopped immediately after exec");
+    require(patch_at_random(pid) == 0, "ELF AT_RANDOM normalization succeeds");
+    remove_vdso(pid);
+    user_regs_struct regs{};
+    require(ptrace(PTRACE_GETREGS, pid, nullptr, &regs) == 0, "read initial stack registers");
+    uintptr_t argc = 0, word = 0;
+    require(guest_read_exact(pid, reinterpret_cast<void*>(regs.rsp), &argc, sizeof(argc)), "read argc");
+    uintptr_t pos = regs.rsp + (argc + 2) * sizeof(uintptr_t);
+    do {
+      require(guest_read_exact(pid, reinterpret_cast<void*>(pos), &word, sizeof(word)), "read environment pointer");
+      pos += sizeof(word);
+    } while (word);
+    bool normalized_random = false;
+    for (size_t i = 0; i < 256; ++i, pos += sizeof(Elf64_auxv_t)) {
+      Elf64_auxv_t entry{};
+      require(guest_read_exact(pid, reinterpret_cast<void*>(pos), &entry, sizeof(entry)), "read auxv");
+      if (entry.a_type == AT_NULL) break;
+      require(entry.a_type != AT_SYSINFO_EHDR, "initial vDSO entry disabled");
+      if (entry.a_type == AT_RANDOM) {
+        uint64_t bytes[2]{};
+        require(guest_read_exact(pid, reinterpret_cast<void*>(entry.a_un.a_val), bytes, sizeof(bytes)), "read random bytes");
+        normalized_random = bytes[0] == 0xdeadbeefcafebabeULL && bytes[1] == 0x1122334455667788ULL;
+      }
+    }
+    require(normalized_random, "full AT_RANDOM matches deterministic ELF platform value");
+  } catch (...) { cleanup(); throw; }
+  cleanup();
+  require(patch_at_random(-1) < 0, "missing tracee AT_RANDOM fails explicitly");
+  bool failed = false;
+  try { remove_vdso(-1); } catch (const std::runtime_error&) { failed = true; }
+  require(failed, "missing tracee vDSO normalization fails explicitly");
+}
+static void check_startup_exit_diagnostic() {
+  pid_t pid = fork();
+  require(pid >= 0, "fork early-exit startup fixture");
+  if (pid == 0) {
+    if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) < 0) _exit(101);
+    raise(SIGSTOP);
+    syscall(SYS_exit_group, 17);
+    _exit(102);
+  }
+  auto cleanup = [&] {
+    int status = 0;
+    if (waitpid(pid, &status, WNOHANG) == 0) {
+      kill(pid, SIGKILL);
+      waitpid(pid, &status, 0);
+    }
+  };
+  try {
+    int status = 0;
+    require(waitpid(pid, &status, 0) == pid && WIFSTOPPED(status), "early-exit fixture stopped");
+    require(ptrace(PTRACE_SETOPTIONS, pid, nullptr, PTRACE_O_TRACESYSGOOD) == 0, "enable syscall stops");
+    bool diagnosed = false;
+    try { extract_one_syscall(pid); }
+    catch (const std::runtime_error& error) {
+      std::string message = error.what();
+      diagnosed = message.find("RuntimeProfile") != std::string::npos &&
+                  message.find("exit status 17") != std::string::npos;
+    }
+    require(diagnosed, "startup exit reports actionable boundary error instead of assert");
+  } catch (...) { cleanup(); throw; }
+  cleanup();
+}
+int main(int argc, char** argv) {
+  if (argc > 1) return 103; // Parent never resumes the fixture beyond exec stop.
+
+  using nlohmann::json;
+  detsim::configure_runtime_profile(json::object());
+  require(detsim::runtime_profile().startup_syscall == SYS_munmap, "declared dynamic-loader boundary");
+  std::string default_identity = detsim::runtime_profile_identity();
+  std::vector<int> boundaries(NP, SYS_mprotect);
+  detsim::configure_runtime_profile({{"startup_syscalls", boundaries}});
+  require(detsim::startup_syscall_for_node(0) == SYS_mprotect, "per-node startup boundary");
+  require(detsim::runtime_profile_identity() != default_identity, "per-node boundaries enter identity");
+  if (NP > 1) {
+    boundaries[1] = SYS_munmap;
+    detsim::configure_runtime_profile({{"startup_syscalls", boundaries}});
+    require(detsim::startup_syscall_for_node(1) == SYS_munmap, "heterogeneous startup boundary");
+  }
+  require(rejected({{"startup_syscalls", std::vector<int>(NP + 1, SYS_munmap)}}), "wrong boundary vector size rejected");
+  boundaries[0] = -1;
+  require(rejected({{"startup_syscalls", boundaries}}), "invalid per-node syscall rejected");
+  detsim::configure_runtime_profile(json::object());
+  SignalHandler handler;
+  SignalContext context;
+  context.pid = getpid();
+  context.signal = SIGURG;
+  context.category = handler.classify(context.signal);
+  bool threw = false;
+  try { handler.handle(context); } catch (const std::runtime_error&) { threw = true; }
+  require(threw, "SIGURG must not be guessed to be Go preemption");
+  detsim::configure_runtime_profile({{"startup_syscall", SYS_mprotect}, {"ignored_signals", {SIGURG}}});
+  require(detsim::runtime_profile().startup_syscall == SYS_mprotect, "explicit startup boundary");
+  require(detsim::runtime_profile_identity() != default_identity, "runtime semantics included in identity");
+  auto result = handler.handle(context);
+  require(result.should_retry && sig::should_continue(result), "explicit ignored signal retries");
+  require(rejected({{"ignored_signals", {SIGKILL}}}), "cannot ignore SIGKILL");
+  require(rejected({{"startup_syscall", 11.5}}), "fractional syscall rejected");
+  require(rejected({{"ignored_signals", {1.5}}}), "fractional signal rejected");
+  require(rejected({{"startup_syscall", uint64_t(1) << 32}}), "overflowing syscall rejected");
+  require(rejected({{"ignored_signals", {uint64_t(1) << 32}}}), "overflowing signal rejected");
+  require(rejected({{"startup_syscall", -1}}), "invalid boundary rejected");
+  require(rejected({{"startup_syscall_limit", 0}}), "unbounded startup rejected");
+  require(rejected({{"unknown_policy", true}}), "misspelled profile key rejected");
+  require(rejected({{"legacy_glibc_cpu_mask", true}}), "private glibc patch removed");
+  require(rejected({{"ignored_signals", {SIGSEGV}}}), "fatal signal suppression rejected");
+  detsim::configure_runtime_profile(json::object());
+  require(detsim::runtime_profile_identity() == default_identity, "runtime identity canonical reset");
+  require(!detsim::runtime_profile().ignored_signals.count(SIGURG), "profile reset has no leftover policy");
+  check_initial_auxv(argv[0]);
+  check_startup_exit_diagnostic();
+  std::puts("PASS explicit runtime startup, ELF normalization and signal policy");
+}

@@ -25,12 +25,16 @@ std::vector<uint8_t> encode_page_manifest(const std::vector<RegionInfo>& regions
 
 class SnapshotView {
  public:
+  SnapshotView(const SnapshotView&) = delete;
+  SnapshotView& operator=(const SnapshotView&) = delete;
   struct OwnedSpan {
     uint64_t address;
     uint32_t length;
     const uint8_t* data;
     std::shared_ptr<const std::vector<uint8_t>> owner;
   };
+  // Backend dispatch occurs once per chunk, never once per byte.
+  class Memory;
   static std::shared_ptr<const SnapshotView> open(hash_type hash);
   const std::vector<RegionInfo>& regions() const { check_generation(); return regions_; }
   std::span<const uint8_t> metadata() const;
@@ -50,8 +54,6 @@ class SnapshotView {
   std::vector<RegionInfo> regions_;
   std::vector<PageRef> pages_;
   user_regs_struct regs_{};
-  mutable std::mutex page_mutex_;
-  mutable hash_type cached_key_ = 0;
-  mutable std::shared_ptr<const std::vector<uint8_t>> cached_page_;
+  std::shared_ptr<const Memory> memory_;
 };
 #endif

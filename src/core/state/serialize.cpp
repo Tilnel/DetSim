@@ -25,28 +25,50 @@ void tracee_state::serialize(Archive &ar)
   }
   if (has_futex) ar(*futex_state);
 
-  // Safety check for threads vector size to prevent corruption
-  size_t thread_count = threads.size();
-  if (thread_count > 10000) {
-    // Sanity check - more than 10k threads is likely corrupted data
-    LOG_ERROR("serialize: suspicious thread count %zu, capping at 0", thread_count);
-    if (!Archive::is_loading::value) {
-      // When saving, use empty threads vector
-      std::vector<thread_state> empty_threads;
-      ar(si, brk, tv.tv_sec, tv.tv_usec, fs_state, sock_state, raft_state, fd_manager_state,
-         empty_threads, thread_create_records, main_tid, current_thread_idx);
-      return;
-    }
-  }
+  if (threads.size() > 10000)
+    throw std::runtime_error("Thread archive exceeds supported limit");
 
-  ar(si, brk, tv.tv_sec, tv.tv_usec, fs_state, sock_state, raft_state, fd_manager_state,
+  ar(si, brk, tv.tv_sec, tv.tv_usec, fs_state, sock_state, fd_manager_state,
      threads, thread_create_records, main_tid, current_thread_idx);
 }
 
 template <class Archive>
 void sys_state::serialize(Archive &ar)
 {
-  ar(ts_hash, status, error_bound);
+  uint32_t magic = 0x4453534d, version = 2, nodes = NP;
+  ar(magic, version, nodes);
+  if (magic != 0x4453534d || version != 2 || nodes != NP)
+    throw std::runtime_error("Incompatible system-state archive");
+  ar(ts_hash, status, error_bound, property_failed);
+  // Check lengths before allocation; monitor data belongs to a search branch.
+  constexpr uint64_t limit = 64ULL * 1024 * 1024;
+  auto bytes = [&](auto& value, uint64_t maximum) {
+    uint64_t length = value.size();
+    ar(length);
+    if (length > maximum) throw std::runtime_error("Monitor archive exceeds limit");
+    if constexpr (Archive::is_loading::value) value.resize(length);
+    if (length) ar(cereal::binary_data(value.data(), length));
+  };
+  bytes(model_identity, 4096);
+  uint32_t count = monitor_states.size();
+  ar(count);
+  if (count > 1024) throw std::runtime_error("Too many monitor states");
+  if constexpr (Archive::is_loading::value) monitor_states.clear();
+  uint64_t remaining = limit;
+  if constexpr (Archive::is_loading::value) {
+    for (uint32_t i = 0; i < count; ++i) {
+      std::string key; std::vector<uint8_t> value;
+      bytes(key, 4096); bytes(value, remaining); remaining -= value.size();
+      if (key.empty() || !monitor_states.emplace(key, std::move(value)).second)
+        throw std::runtime_error("Invalid duplicate monitor identity");
+    }
+  } else {
+    for (auto& [name, value] : monitor_states) {
+      auto key = name;
+      if (key.empty()) throw std::runtime_error("Empty monitor identity");
+      bytes(key, 4096); bytes(value, remaining); remaining -= value.size();
+    }
+  }
 }
 
 template void syscall_info::serialize<cereal::BinaryInputArchive>(
@@ -61,8 +83,3 @@ template void
 sys_state::serialize<cereal::BinaryInputArchive>(cereal::BinaryInputArchive &);
 template void sys_state::serialize<cereal::BinaryOutputArchive>(
     cereal::BinaryOutputArchive &);
-
-/* Old structures' serialization is now inline in sockstate.h */
-
-/* New SockState serialization - explicit instantiations are in sockstate_new.cpp */
-

@@ -168,7 +168,7 @@ unary_expr:
     | INC unary_expr { $$ = new PrefixOpNode(PrefixOp::PRE_INC, $2); }
     | DEC unary_expr { $$ = new PrefixOpNode(PrefixOp::PRE_DEC, $2); }
     | '&' unary_expr { $$ = new AddressOfNode($2); }
-    | '*' unary_expr { $$ = new DereferenceNode($2); }
+    | '*' cast_expr { $$ = new DereferenceNode($2); }
     | '+' unary_expr { $$ = $2; }
     | '-' unary_expr { $$ = new UnaryOpNode(UnaryOp::NEG, $2); }
     | '!' unary_expr { $$ = new UnaryOpNode(UnaryOp::NOT, $2); }

@@ -25,6 +25,46 @@ uint64_t cache_generation = 0;
 size_t cache_bytes = 0;
 }
 
+// Both storage encodings expose the same immutable chunk reader. SnapshotView
+// owns format validation, region lookup and lifetime checks above this boundary.
+class SnapshotView::Memory {
+ public:
+  virtual ~Memory() = default;
+  virtual OwnedSpan page(const RegionInfo& region, size_t index) const = 0;
+};
+namespace {
+class FlatMemory final : public SnapshotView::Memory {
+  std::shared_ptr<const std::vector<uint8_t>> data_;
+ public:
+  explicit FlatMemory(std::shared_ptr<const std::vector<uint8_t>> data) : data_(std::move(data)) {}
+  SnapshotView::OwnedSpan page(const RegionInfo& region, size_t index) const override {
+    const uint64_t address = index == 0 ? region.start : (region.start / page_size + index) * page_size;
+    return {address, uint32_t(chunk_length(address, region.end)),
+            data_->data() + region.offset + address - region.start, data_};
+  }
+};
+class PagedMemory final : public SnapshotView::Memory {
+  const std::vector<PageRef>& pages_;
+  mutable std::mutex mutex_;
+  mutable hash_type cached_key_ = 0;
+  mutable std::shared_ptr<const std::vector<uint8_t>> cached_page_;
+ public:
+  explicit PagedMemory(const std::vector<PageRef>& pages) : pages_(pages) {}
+  SnapshotView::OwnedSpan page(const RegionInfo& region, size_t index) const override {
+    const auto& reference = pages_.at(region.offset + index);
+    std::lock_guard lock(mutex_);
+    if (!cached_page_ || cached_key_ != reference.key) {
+      auto bytes = StateStore::instance().load_shared(reference.key);
+      require(bool(bytes), "Missing snapshot page");
+      require(bytes->size() == reference.length, "Snapshot page length mismatch");
+      cached_page_ = std::move(bytes); cached_key_ = reference.key;
+    }
+    require(cached_page_->size() == reference.length, "Snapshot page length mismatch");
+    return {reference.address, reference.length, cached_page_->data(), cached_page_};
+  }
+};
+}
+
 std::vector<uint8_t> encode_page_manifest(const std::vector<RegionInfo>& regions,
     std::span<const uint8_t> metadata, std::string_view maps,
     const user_regs_struct& regs, const std::vector<PageRef>& pages) {
@@ -118,6 +158,8 @@ SnapshotView::SnapshotView(std::shared_ptr<const std::vector<uint8_t>> data, uin
     }
   }
   require(next_data == (paged ? pages_.size() : header_.regs_offset), "Invalid snapshot memory extent");
+  if (paged) memory_ = std::make_shared<PagedMemory>(pages_);
+  else memory_ = std::make_shared<FlatMemory>(data_);
 }
 
 void SnapshotView::check_generation() const {
@@ -143,7 +185,8 @@ std::shared_ptr<const SnapshotView> SnapshotView::open(hash_type hash) {
   require(generation == loaded_generation, "Store changed while opening snapshot");
   // StateStore validates content keys before publishing immutable loaded buffers.
   auto result = std::shared_ptr<const SnapshotView>(new SnapshotView(bytes, loaded_generation));
-  const size_t size = sizeof(SnapshotView) + bytes->size() +
+  const size_t reader_size = result->header_.version == PAGE_SNAPSHOT_VERSION ? sizeof(PagedMemory) : sizeof(FlatMemory);
+  const size_t size = sizeof(SnapshotView) + reader_size + bytes->size() +
       result->regions_.size() * sizeof(RegionInfo) + result->pages_.size() * sizeof(PageRef) + page_size;
   if (size <= cache_limit) {
     std::lock_guard lock(cache_mutex);
@@ -172,22 +215,9 @@ SnapshotView::OwnedSpan SnapshotView::page(size_t region_index, size_t index) co
   check_generation();
   const auto& r = regions_.at(region_index);
   require(index < page_count(region_index), "Snapshot page index out of range");
-  if (header_.version == FLAT_SNAPSHOT_VERSION) {
-    const uint64_t address = index == 0 ? r.start : (r.start / page_size + index) * page_size;
-    return {address, uint32_t(chunk_length(address, r.end)),
-            data_->data() + r.offset + address - r.start, data_};
-  }
-  const auto& reference = pages_.at(r.offset + index);
-  std::lock_guard lock(page_mutex_);
-  if (!cached_page_ || cached_key_ != reference.key) {
-    auto bytes = StateStore::instance().load_shared(reference.key);
-    check_generation();
-    require(bool(bytes), "Missing snapshot page");
-    require(bytes->size() == reference.length, "Snapshot page length mismatch");
-    cached_page_ = std::move(bytes); cached_key_ = reference.key;
-  }
-  require(cached_page_->size() == reference.length, "Snapshot page length mismatch");
-  return {reference.address, reference.length, cached_page_->data(), cached_page_};
+  auto result = memory_->page(r, index);
+  check_generation();
+  return result;
 }
 void SnapshotView::read_into(uint64_t address, void* destination, size_t length) const {
   check_generation();

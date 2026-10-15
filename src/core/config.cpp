@@ -11,15 +11,21 @@
 #include "guest.h"
 #include "monitor.h"
 #include "state/state_store.h"
-#include <dlfcn.h>
+#include "plugins.h"
+#include "runtime_profile.h"
 #include <filesystem>
 #include <fstream>
+#include <array>
+#include <algorithm>
+#include <memory>
+#include <xxhash.h>
 #include <getopt.h>
 #include <iostream>
 #include <libgen.h>
 #include <limits.h>
 #include <nlohmann/json.hpp>
-#include <wait.h>
+#include <sys/syscall.h>
+#include <stdexcept>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -92,7 +98,7 @@ static void parse_tracees(const json &cfg, const fs::path &cfg_dir)
   for (int i = 0; i < nodes; i++)
   {
     auto argv_json = tracees[i];
-    Assert(argv_json.is_array() && argv_json.size() <= 5,
+    Assert(argv_json.is_array() && !argv_json.empty() && argv_json.size() <= 5,
            "Tracee %d: invalid arguments (max 5 supported)", i);
 
     ptmc_state.tracee[i].argc = static_cast<int>(argv_json.size());
@@ -177,64 +183,19 @@ static void parse_assertions(const json &cfg)
   }
 }
 
-/* Compile .cpp to .so if needed, return path to .so */
-static std::string compile_plugin_if_needed(const std::string &src_path,
-                                            const std::string &default_name)
+/* Plugins are built explicitly and expose only the versioned public C ABI. */
+static void parse_plugins(const json &cfg, const fs::path &cfg_dir)
 {
-  // If already a .so file, use it directly
-  if (src_path.size() > 3 && src_path.substr(src_path.size() - 3) == ".so")
+  detsim::plugins::reset();
+  for (const auto &entry : cfg.value("Plugins", json::array()))
   {
-    LOG_INFO("Loading plugin %s", src_path.c_str());
-    return src_path;
+    std::string path = entry.is_string() ? entry.get<std::string>() : entry.at("Path").get<std::string>();
+    std::string configuration = entry.is_object() ? entry.value("Configuration", json::object()).dump() : "{}";
+    detsim::plugins::load(resolve_path(path, cfg_dir), configuration);
   }
-
-  // Compile .cpp to .so
-  fs::path src(src_path);
-  std::string obj_name = "./" + src.stem().string() + ".so";
-
-  LOG_INFO("Compiling %s -> %s", src_path.c_str(), obj_name.c_str());
-
-  if (access(obj_name.c_str(), R_OK | X_OK) != 0)
-  {
-    int pid = vfork();
-    if (pid == 0)
-    {
-      char arg_d[16];
-      snprintf(arg_d, sizeof(arg_d), "-DNP=%d", NP);
-      execlp("g++", "g++", "-O2", arg_d, "-fpic", "-shared", "-I.", "-Isrc",
-             "-Isrc/core", "-Isrc/utils", "-Isrc/subsys", src_path.c_str(),
-             "-o", obj_name.c_str(), nullptr);
-      perror("exec");
-      _exit(1);
-    }
-    else
-    {
-      waitpid(pid, nullptr, 0);
-    }
-  }
-
-  return obj_name;
-}
-
-/* Parse and load user check plugin */
-static void parse_user_check(const json &cfg, const fs::path &cfg_dir)
-{
-  if (!cfg.contains("UserCheck"))
-    return;
-
-  std::string src = cfg["UserCheck"].get<std::string>();
-  std::string src_path = resolve_path(src, cfg_dir);
-  std::string obj_path = compile_plugin_if_needed(src_path, "check");
-
-  void *handle = dlopen(obj_path.c_str(), RTLD_LAZY | RTLD_LOCAL);
-  if (!handle)
-  {
-    panic("%s", dlerror());
-  }
-
-  auto *func = reinterpret_cast<int (*)()>(dlsym(handle, "check"));
-  ptmc_state.user_checks.push_back(func);
-  LOG_INFO("User check plugin loaded");
+  // Transitional configuration keys use the same ABI and never compile source.
+  for (const char *key : {"UserCheck", "ChooseFunc"})
+    if (cfg.contains(key)) detsim::plugins::load(resolve_path(cfg.at(key).get<std::string>(), cfg_dir));
 }
 
 /* Parse choose points */
@@ -273,39 +234,14 @@ static void parse_choose_points(const json &cfg)
 
     if (nr >= 0 && cp.contains("choose"))
     {
-      choose_many[nr] = cp["choose"].get<int>();
+      int count = cp["choose"].get<int>();
+      if (nr != SYS_gettimeofday || count < 0 || count > 1024)
+        throw std::runtime_error("ChoosePoint supports only gettimeofday with 0..1024 choices");
+      if (count && !detsim::plugins::has_time_choice())
+        throw std::runtime_error("ChoosePoint requires a time-choice plugin");
+      choose_many[nr] = count;
     }
   }
-}
-
-/* Parse and load choose function plugin */
-static void parse_choose_function(const json &cfg, const fs::path &cfg_dir)
-{
-  if (!cfg.contains("ChooseFunc"))
-    return;
-
-  std::string src = cfg["ChooseFunc"].get<std::string>();
-  std::string src_path = resolve_path(src, cfg_dir);
-  std::string obj_path = compile_plugin_if_needed(src_path, "choose");
-
-  void *handle = dlopen(obj_path.c_str(), RTLD_LAZY | RTLD_LOCAL);
-  if (!handle)
-  {
-    panic("%s", dlerror());
-  }
-
-  for (int nr = 0; nr < 450; nr++)
-  {
-    if (syscalls[nr] == nullptr)
-      continue;
-
-    char funcname[64];
-    snprintf(funcname, sizeof(funcname), "choose_%s", syscalls[nr]);
-    auto *func = reinterpret_cast<choose_func>(dlsym(handle, funcname));
-    choose_syswhat[nr] = func;
-  }
-
-  LOG_INFO("Choose function plugin loaded");
 }
 
 /* Parse StateStore configuration */
@@ -373,9 +309,59 @@ void read_config(const char *cfg_file)
   parse_addrs(cfg);
   parse_fsmap(cfg, cfg_dir);
   parse_assertions(cfg);
-  parse_user_check(cfg, cfg_dir);
+  detsim::configure_runtime_profile(cfg.value("RuntimeProfile", json::object()));
+  parse_plugins(cfg, cfg_dir);
   parse_choose_points(cfg);
-  parse_choose_function(cfg, cfg_dir);
+
+  // Search compatibility includes semantic configuration, not cache sizes or UI.
+  // Resolve paths and fingerprint each executable once, outside exploration.
+  json model = {{"Nodes", NP}, {"WorkingDir", cfg.value("WorkingDir", "/")}};
+  std::map<std::string, uint64_t> binaries;
+  model["Tracee"] = json::array();
+  for (int node = 0; node < NP; ++node)
+  {
+    json arguments = json::array();
+    for (int arg = 0; arg < ptmc_state.tracee[node].argc; ++arg)
+      arguments.push_back(arg ? std::string(ptmc_state.tracee[node].argv[arg]) :
+        fs::absolute(ptmc_state.tracee[node].argv[arg]).lexically_normal().string());
+    std::string executable = arguments.at(0).get<std::string>();
+    if (!binaries.count(executable))
+    {
+      std::ifstream binary(executable, std::ios::binary);
+      if (!binary) throw std::runtime_error("Cannot fingerprint executable: " + executable);
+      auto raw = XXH64_createState();
+      if (!raw) throw std::bad_alloc();
+      std::unique_ptr<XXH64_state_t, decltype(&XXH64_freeState)> hash(raw, XXH64_freeState);
+      XXH64_reset(hash.get(), 0);
+      std::array<char, 65536> buffer;
+      while (binary)
+      {
+        binary.read(buffer.data(), buffer.size());
+        XXH64_update(hash.get(), buffer.data(), static_cast<size_t>(binary.gcount()));
+      }
+      if (!binary.eof()) throw std::runtime_error("Cannot fingerprint executable: " + executable);
+      binaries.emplace(executable, XXH64_digest(hash.get()));
+    }
+    model["Tracee"].push_back({{"argv", arguments}, {"binary", binaries.at(executable)}});
+  }
+  model["Addr"] = json::array();
+  for (int node = 0; node < NP; ++node) model["Addr"].push_back(ptmc_state.addrs[node]);
+  model["FSMap"] = cfg.value("FSMap", json::array());
+  for (auto &mapping : model["FSMap"])
+    if (mapping.contains("Host")) mapping["Host"] = fs::absolute(resolve_path(mapping.at("Host").get<std::string>(), cfg_dir)).lexically_normal().string();
+  model["Choices"] = json::object();
+  for (int nr = 0; nr < 450; ++nr)
+    if (choose_many[nr]) model["Choices"][std::to_string(nr)] = choose_many[nr];
+  std::vector<std::string> assertions(ptmc_state.assertions.begin(), ptmc_state.assertions.end());
+  std::sort(assertions.begin(), assertions.end());
+  model["Assertions"] = assertions;
+  model["plugins"] = detsim::plugins::context_key();
+  model["runtime"] = detsim::runtime_profile_identity();
+  const auto canonical = model.dump();
+  char identity[40];
+  snprintf(identity, sizeof(identity), "detsim-model-v1:%016llx",
+    static_cast<unsigned long long>(XXH64(canonical.data(), canonical.size(), 0)));
+  ptmc_state.model_identity = identity;
   parse_statestore_config(cfg);
 }
 
@@ -428,6 +414,7 @@ int is_auto_mode() { return auto_mode; }
 
 void cleanup_config()
 {
+  detsim::plugins::reset();
   for (int i = 0; i < NP; i++)
   {
     for (int j = 0; j < ptmc_state.tracee[i].argc; j++)

@@ -137,11 +137,15 @@ void show_syscall_history()
  * Generic callers have no source hint and use the ordinary full-save path.
  */
 sys_state::sys_state(const struct syscall_info info[][MAX_THREADS_PER_PROCESS],
-                     const sys_state *restored_source)
+                     const sys_state *restored_source, bool persist)
 {
   const char *mode = getenv("DETSIM_CAPTURE_MODE");
   const bool force_full = mode && !strcmp(mode, "full");
   error_bound = ptmc_state.error_bound;
+  const auto& context = restored_source ? *restored_source : ptmc_state.running_state;
+  property_failed = context.property_failed;
+  monitor_states = context.monitor_states;
+  model_identity = context.model_identity;
   for (int j = 0; j < NP; ++j) {
     child[j] = tracee_state(j, info[j]);
     status[j] = ptmc_state.status[j];
@@ -153,6 +157,12 @@ sys_state::sys_state(const struct syscall_info info[][MAX_THREADS_PER_PROCESS],
   }
   ss_hash = identity_hash();
   LOG_DEBUG("Create sstate " HASH_FORMAT, ss_hash);
+  if (persist) save_metadata();
+}
+
+void sys_state::commit_metadata()
+{
+  ss_hash = identity_hash();
   save_metadata();
 }
 
@@ -165,7 +175,7 @@ hash_type sys_state::identity_hash() const
   std::ostringstream encoded;
   {
     cereal::BinaryOutputArchive archive(encoded);
-    const uint32_t domain = 0x44535334; // DSS4: ordered system metadata
+    const uint32_t domain = 0x44535335; // DSS5: ordered machine/monitor/model product state
     const uint32_t nodes = NP;
     archive(domain, nodes, *this);
   }
@@ -637,7 +647,6 @@ void tracee_state::restore_runtime_state(int index) const
   /* Restore subsystems */
   ptmc_state.sock_states[index] = sock_state;
   ptmc_state.fs_states[index] = fs_state;
-  ptmc_state.raft_states[index] = raft_state;
 
   /* Restore FdManager state */
   *ptmc_state.fd_managers[index] = fd_manager_state;
@@ -948,7 +957,6 @@ tracee_state::tracee_state(int which, const struct syscall_info info[])
   /* Save subsystems */
   sock_state = ptmc_state.sock_states[which];
   fs_state = ptmc_state.fs_states[which];
-  raft_state = ptmc_state.raft_states[which];
 
   /* Save FdManager state */
   if (ptmc_state.fd_managers[which])
@@ -1151,6 +1159,8 @@ void show_state_stats()
 
 void sys_state::recover_running_state() const
 {
+  if (!ptmc_state.model_identity.empty() && model_identity != ptmc_state.model_identity)
+    throw std::runtime_error("Snapshot execution model differs from the configured model");
   ptmc_state.error_bound = error_bound;
   for (int i = 0; i < NP; i++)
   {
@@ -1167,6 +1177,10 @@ void sys_state::recover_running_state() const
       child[i].recover_running_state(i, ts_hash[i]);
     }
   }
+  // Select the complete product state, including its branch-owned monitor.
+  // Restoring only process resources leaves generic captures/CLI loads attached
+  // to the previous branch's identity and property history.
+  ptmc_state.running_state = *this;
 }
 
 /* ======================================================================
@@ -1196,7 +1210,6 @@ void cleanup_all()
     ptmc_state.sock_states[i] = SockState();
     ptmc_state.fs_states[i] = FileSystemState();
     ptmc_state.fd_managers[i].reset();
-    ptmc_state.raft_states[i] = raft_check_state();
   }
 
   /* 4. Clear global containers */

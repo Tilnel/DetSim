@@ -72,10 +72,7 @@ struct PTMC_STATE
   std::string addrs[NP];
 
   std::unordered_set<std::string> assertions;
-  std::vector<int (*)()> user_checks;
-
-  /* Raft consensus checking state - stored per-process */
-  raft_check_state raft_states[NP];
+  std::string model_identity; // Configured execution/inspection model.
 
   int error_bound = 5;
 

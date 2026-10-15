@@ -1,5 +1,11 @@
 #include "state_transition.h"
+#include <algorithm>
+#include "state_view.h"
+#include "plugins.h"
 #include "common.h"
+#include "runtime_profile.h"
+#include <stdexcept>
+#include <algorithm>
 #include "emu.h"
 #include "fsstate.h"
 #include "futexstate.h"
@@ -152,9 +158,25 @@ int exec_once(const sys_state &s, syscall_info &info)
   return result.checkpoint_decision;
 }
 
+static bool check_assertions(const sys_state& state, unsigned actor)
+{
+  if (ptmc_state.assertions.empty()) return false;
+  const detsim::StateView view(state);
+  bool violated = false;
+  for (const auto& assertion : ptmc_state.assertions) {
+    if (!view.evaluate(actor, assertion)) {
+      detsim::ui::ui_printf("Assertion \"%s\" failed.\n", assertion.c_str());
+      violated = true;
+    }
+  }
+  return violated;
+}
+
 TransitionResult state_transition(const sys_state &source_state,
                                   int process_index)
 {
+  if (source_state.property_failed)
+    throw std::runtime_error("Cannot execute a terminal property violation; load a predecessor state first");
   TransitionResult result;
   ptmc_state.cursor = process_index;
 
@@ -181,7 +203,20 @@ TransitionResult state_transition(const sys_state &source_state,
 
   // save state with timing
   auto t3 = std::chrono::high_resolution_clock::now();
-  result.new_state = sys_state(new_syscalls, &source_state);
+  result.new_state = sys_state(new_syscalls, &source_state, false);
+  if (ckpt != CKPT_DISCARD) {
+    detsim_event_v1 event{};
+    event.process = process_index; event.thread = thread_idx;
+    event.syscall_number = executed.nr;
+    event.choice = ptmc_state.n_choose ? ptmc_state.choose : -1;
+    std::copy(std::begin(executed.args), std::end(executed.args), event.args);
+    event.result = static_cast<int64_t>(executed.rval);
+    result.property_violation = detsim::plugins::check_transition(source_state, result.new_state, event);
+    result.property_violation |= check_assertions(result.new_state, process_index);
+  }
+  // Monitor state is committed atomically with the product-state identity.
+  result.new_state.property_failed = result.property_violation;
+  result.new_state.commit_metadata();
   auto t4 = std::chrono::high_resolution_clock::now();
   result.save_time =
       std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3);
@@ -254,29 +289,50 @@ static void exit_all(void)
 extern std::unordered_map<int, void *> rseq_struct;
 extern std::unordered_map<int, int> rseq_len;
 
+static int resume_startup_syscall(pid_t pid)
+{
+  ptrace_right(PTRACE_SYSCALL, pid, nullptr, nullptr);
+  for (;;) {
+    int status = 0;
+    pid_t waited;
+    do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+    if (waited != pid)
+      throw std::runtime_error("Cannot wait for tracee during configured startup prelude");
+    if (!WIFSTOPPED(status)) {
+      const std::string result = WIFEXITED(status) ?
+          "exit status " + std::to_string(WEXITSTATUS(status)) :
+          "signal " + std::to_string(WTERMSIG(status));
+      throw std::runtime_error("Startup prelude ended with " + result +
+          " before reaching the configured boundary; check RuntimeProfile startup_syscall/startup_syscalls");
+    }
+    if (WSTOPSIG(status) == PTRACE_TRAP_SIG) return status;
+    try {
+      auto signal = sig::process(pid, status);
+      if (!sig::should_continue(signal))
+        throw std::runtime_error("tracee terminated by signal " + std::to_string(WSTOPSIG(status)));
+    } catch (const std::exception& error) {
+      throw std::runtime_error(std::string("Startup prelude did not reach configured RuntimeProfile boundary: ") + error.what());
+    }
+    ptrace_right(PTRACE_SYSCALL, pid, nullptr, nullptr);
+  }
+}
+
 /* Extract one entire syscall, preserve its original effect */
 syscall_info extract_one_syscall(pid_t pid)
 {
   /* ptrace(2): When delivering system call traps, set bit 7 in the signal     *
    * number (i.e., deliver SIGTRAP|0x80). This makes it easy for the tracer to *
    * distinguish normal traps from those caused by a system call. */
-  int wstatus = 0;
   struct ptrace_syscall_info info;
   syscall_info ret = {}; /* Zero-initialize all fields */
 
   /* entry */
-  ptrace_right(PTRACE_SYSCALL, pid, NULL, NULL);
-  waitpid(pid, &wstatus, 0);
-  /* Handle SIGURG from Go runtime (preemption signal) */
-  while (WIFSTOPPED(wstatus) && WSTOPSIG(wstatus) == SIGURG) {
-    ptrace_right(PTRACE_SYSCALL, pid, NULL, NULL);
-    waitpid(pid, &wstatus, 0);
-  }
-  assert(WIFSTOPPED(wstatus) && WSTOPSIG(wstatus) == PTRACE_TRAP_SIG);
+  resume_startup_syscall(pid);
 
   ptrace_right(PTRACE_GET_SYSCALL_INFO, pid, (void *)sizeof(info), &info);
 
-  assert(info.op == PTRACE_SYSCALL_INFO_ENTRY);
+  if (info.op != PTRACE_SYSCALL_INFO_ENTRY)
+    throw std::runtime_error("Unexpected syscall phase before configured RuntimeProfile startup boundary");
   ret.nr = info.entry.nr;
   for (int i = 0; i < 6; i++)
     ret.args[i] = info.entry.args[i];
@@ -302,17 +358,11 @@ syscall_info extract_one_syscall(pid_t pid)
   }
 
   /* exit */
-  ptrace_right(PTRACE_SYSCALL, pid, NULL, NULL);
-  waitpid(pid, &wstatus, 0);
-  /* Handle SIGURG from Go runtime (preemption signal) */
-  while (WIFSTOPPED(wstatus) && WSTOPSIG(wstatus) == SIGURG) {
-    ptrace_right(PTRACE_SYSCALL, pid, NULL, NULL);
-    waitpid(pid, &wstatus, 0);
-  }
-  assert(WIFSTOPPED(wstatus) && WSTOPSIG(wstatus) == PTRACE_TRAP_SIG);
+  resume_startup_syscall(pid);
 
   ptrace_right(PTRACE_GET_SYSCALL_INFO, pid, (void *)sizeof(info), &info);
-  assert(info.op == PTRACE_SYSCALL_INFO_EXIT);
+  if (info.op != PTRACE_SYSCALL_INFO_EXIT)
+    throw std::runtime_error("Unexpected syscall phase before configured RuntimeProfile startup boundary");
   ret.rval = info.exit.rval;
 
   /* eliminate indeterministic syscall result */
@@ -324,11 +374,20 @@ syscall_info extract_one_syscall(pid_t pid)
     LOG_INFO("Neutralize set_tid_address, return 114514");
   }
   /* getrandom */
-  if (ret.nr == SYS_getrandom)
+  if (ret.nr == SYS_getrandom && ret.rval > 0)
   {
-    memcpy_host2guest((void *)ret.args[0], "\0\0\0\0\0\0\0\0", 8);
-    LOG_INFO("Neutralize getrandom(%p, %d, %d)", (void *)ret.args[0],
-             ret.args[1], ret.args[2]);
+    const unsigned char zeros[4096]{};
+    size_t remaining = size_t(ret.rval);
+    if (remaining > ret.args[1])
+      throw std::runtime_error("Invalid startup getrandom result length");
+    uintptr_t address = ret.args[0];
+    while (remaining) {
+      size_t length = std::min(remaining, sizeof(zeros));
+      if (!guest_write_exact(pid, reinterpret_cast<void*>(address), zeros, length))
+        throw std::runtime_error("Cannot normalize startup getrandom output");
+      address += length;
+      remaining -= length;
+    }
   }
   /* rseq mask */
   if (ret.nr == SYS_rseq)
@@ -338,11 +397,13 @@ syscall_info extract_one_syscall(pid_t pid)
     LOG_INFO("Record rseq(%p, %d)", (void *)ret.args[0], ret.args[1]);
   }
 
-  if (ret.nr == SYS_getcpu)
+  if (ret.nr == SYS_getcpu && ret.rval == 0)
   {
-    tracee_set_rax(pid, 0);
-    tracee_set_orig_rax(pid, 0);
-    LOG_INFO("Neutralize getcpu, return 0 and do nothing to arguments");
+    const unsigned int zero = 0;
+    for (int argument = 0; argument < 2; ++argument)
+      if (ret.args[argument] &&
+          !guest_write_exact(pid, reinterpret_cast<void*>(ret.args[argument]), &zero, sizeof(zero)))
+        throw std::runtime_error("Cannot normalize startup getcpu output");
   }
 
   /* Record new thread creation from clone/clone3 */
@@ -433,24 +494,12 @@ static void init_tracee_state(int index)
 {
   int pid = pids[index];
   int wstatus = 0;
-  int stop_nr;
-  // Convert to absolute path for Go detection
-  char abs_path[PATH_MAX];
-  realpath(ptmc_state.tracee[index].executable, abs_path);
-  LOG_INFO("Checking if %s (abs: %s) is a Go program", ptmc_state.tracee[index].executable, abs_path);
-  int go_check = is_go_program(abs_path);
-  LOG_INFO("is_go_program result: %d", go_check);
-  if (go_check) {
-    // Go programs: stop at first mmap after initialization
-    LOG_INFO("Detected Go program, using SYS_mmap as stop_nr");
-    stop_nr = SYS_mmap;
-  } else if (is_dynamically_linked(ptmc_state.tracee[index].executable)) {
-    stop_nr = SYS_munmap;
-  } else {
-    stop_nr = SYS_mprotect;
-  }
-  Assert(waitpid(pid, &wstatus, 0) == pid, "%s", strerror(errno));
-  assert(WIFSTOPPED(wstatus) && WSTOPSIG(wstatus) == SIGSTOP);
+  const auto& profile = detsim::runtime_profile();
+  const int stop_nr = detsim::startup_syscall_for_node(index);
+  LOG_INFO("Startup prelude boundary: syscall %d (limit %zu)",
+           stop_nr, profile.startup_syscall_limit);
+  if (waitpid(pid, &wstatus, 0) != pid || !WIFSTOPPED(wstatus) || WSTOPSIG(wstatus) != SIGSTOP)
+    throw std::runtime_error("Tracee failed to reach initial startup stop");
   /* tracee: stop at raise(SIGSTOP) */
 
   /* ptrace_right(PTRACE_SEIZE, pid, 0, 0); */
@@ -463,17 +512,19 @@ static void init_tracee_state(int index)
   /* execve(2): after a successful execve, a SIGTRAP *
    * (instead of SIGTRAP | 0x80) will be sent to it  */
   ptrace_right(PTRACE_SYSCALL, pid, 0, 0);
-  waitpid(pid, &wstatus, 0);
-  assert(WIFSTOPPED(wstatus) && WSTOPSIG(wstatus) == SIGTRAP);
+  if (waitpid(pid, &wstatus, 0) != pid || !WIFSTOPPED(wstatus) || WSTOPSIG(wstatus) != SIGTRAP)
+    throw std::runtime_error("Tracee failed to exec before configured RuntimeProfile startup boundary");
 
-  remove_vdso(pid);
-  patch_at_random(pid);
+  if (profile.disable_vdso) remove_vdso(pid);
+  if (profile.deterministic_at_random && patch_at_random(pid) != 0)
+    throw std::runtime_error("Cannot normalize tracee AT_RANDOM");
 
-  /* skip non-user code: *
-   * Libc initialization ends with an `munmap` call */
-  while (extract_one_syscall(pid).nr != stop_nr)
-    ;
-  patch_cpu_features_elf(pid);
+  bool reached = false;
+  for (size_t count = 0; count < profile.startup_syscall_limit; ++count) {
+    if (extract_one_syscall(pid).nr == stop_nr) { reached = true; break; }
+  }
+  if (!reached)
+    throw std::runtime_error("Runtime startup syscall boundary was not reached");
 
   /* Preserve memory for parameters. Need recover registers *
    * for the original first syscall. */
@@ -552,7 +603,13 @@ int state_initialization()
   memset(syscall_info, 0, sizeof(syscall_info));
   ptmc_state.cursor = -1;
 
-  sys_state first_state(syscall_info);
+  sys_state first_state(syscall_info, nullptr, false);
+  first_state.model_identity = ptmc_state.model_identity;
+  bool violation = detsim::plugins::check_initial(first_state);
+  violation |= check_assertions(first_state, 0);
+  first_state.property_failed = violation;
+  first_state.commit_metadata();
   ptmc_state.running_state = first_state;
+  if (violation) throw std::runtime_error("Initial state violates configured properties");
   return 0;
 }

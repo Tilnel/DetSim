@@ -4,6 +4,7 @@
 
 #include "debug.h"
 #include "dwarf_info.h"
+#include "expr_ast.hpp"
 #include <cctype>
 #include <cstring>
 #include <dwarf.h>
@@ -99,6 +100,15 @@ struct library_symbols
 /* Global library cache */
 static std::unordered_map<std::string, library_symbols> elf_library_cache;
 static std::string current_elf_path;
+static bool current_elf_fixed = false;
+static std::vector<std::pair<uint64_t,uint64_t>> current_elf_ranges;
+const std::string& dwarf_executable_path() { return current_elf_path; }
+bool dwarf_fixed_executable() { return current_elf_fixed; }
+bool dwarf_main_image_contains(uint64_t address) {
+  for (const auto& [start,end] : current_elf_ranges)
+    if (address >= start && address < end) return true;
+  return false;
+}
 static int elf_symbols_loaded_for_pid = -1;
 
 /* Forward declarations for ELF symbol handling */
@@ -695,6 +705,7 @@ static bool get_variable_address(Dwarf_Debug dbg, Dwarf_Die die,
 
 void dwarf_init(const char *executable)
 {
+  ExprCache::instance().clear();
   if (dbg != nullptr)
   {
     dwarf_cleanup();
@@ -800,6 +811,7 @@ void dwarf_init(const char *executable)
 
 void dwarf_cleanup(void)
 {
+  ExprCache::instance().clear();
   if (dbg != nullptr)
   {
     dwarf_finish(dbg);
@@ -818,6 +830,8 @@ void dwarf_cleanup(void)
   member_offset_cache.clear();
   elf_library_cache.clear();
   current_elf_path.clear();
+  current_elf_fixed = false;
+  current_elf_ranges.clear();
   elf_symbols_loaded_for_pid = -1;
 }
 
@@ -1056,6 +1070,27 @@ static void load_elf_symbols(const char *executable)
   /* Clear existing cache */
   elf_library_cache.clear();
   current_elf_path = executable;
+  current_elf_fixed = false;
+  current_elf_ranges.clear();
+  const int image_fd = open(executable, O_RDONLY);
+  if (image_fd >= 0) {
+    Elf* image = elf_begin(image_fd, ELF_C_READ, nullptr);
+    GElf_Ehdr header{};
+    if (image && gelf_getehdr(image, &header)) {
+      current_elf_fixed = header.e_type == ET_EXEC;
+      size_t count = 0;
+      if (elf_getphdrnum(image, &count) == 0) {
+        for (size_t i = 0; i < count; ++i) {
+          GElf_Phdr segment{};
+          if (gelf_getphdr(image, i, &segment) && segment.p_type == PT_LOAD &&
+              segment.p_memsz <= UINT64_MAX - segment.p_vaddr)
+            current_elf_ranges.emplace_back(segment.p_vaddr, segment.p_vaddr + segment.p_memsz);
+        }
+      }
+    }
+    if (image) elf_end(image);
+    close(image_fd);
+  }
 
   /* Load main executable with base=0 (we'll fix this when we know runtime base)
    */

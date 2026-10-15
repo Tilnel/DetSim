@@ -1,4 +1,5 @@
 #include "config.h"
+#include "state/state_transition.h"
 #include "monitor.h"
 #include "ncurses_ui.h"
 #include "proc_status.h"
@@ -11,6 +12,7 @@
 #include <stdexcept>
 #include <unistd.h>
 
+extern TSS state_tree;
 extern "C" detsim::ui::NCursesUI *get_ncurses_ui() { return nullptr; }
 
 static void require(bool ok, const char *message)
@@ -71,6 +73,27 @@ int main()
     other.ts_hash[0] = other.ts_hash[1] = 0x2222;
     require(repeated.identity_hash() != other.identity_hash(), "equal node hashes cancelled out");
     require(original.identity_hash() == ordered, "identity is not deterministic");
+    auto monitored = original;
+    monitored.monitor_states["monitor:v1"] = {1,2,3};
+    require(monitored.identity_hash() != ordered, "monitor state omitted from identity");
+    auto branch = monitored;
+    branch.monitor_states.at("monitor:v1")[0] = 9;
+    require(monitored.monitor_states.at("monitor:v1")[0] == 1 &&
+            branch.identity_hash() != monitored.identity_hash(), "monitor branches alias or merge");
+    auto failed = original;
+    failed.property_failed = true;
+    require(failed.identity_hash() != ordered, "terminal verdict omitted from identity");
+    sys_state parent_a = original, parent_b = original;
+    parent_a.error_bound = 4; parent_b.error_bound = 3;
+    parent_a.ss_hash = parent_a.identity_hash(); parent_b.ss_hash = parent_b.identity_hash();
+    auto passed_target = original; passed_target.ss_hash = passed_target.identity_hash();
+    failed.ss_hash = failed.identity_hash();
+    state_tree.clear();
+    state_tree_add(parent_a, passed_target, 0, 0);
+    state_tree_add(parent_b, failed, 0, 0);
+    require(std::get<0>(state_tree.at(failed.ss_hash)) == parent_b.ss_hash,
+            "failing edge reused an earlier valid witness");
+    rejects([&] { state_transition(failed, 0); }, "terminal source executed before rejection");
     StoreDirectory directory;
     original.ss_hash = ordered;
     require(original.save_metadata() == 1, "save original metadata");
@@ -82,6 +105,14 @@ int main()
             loaded.ts_hash[1] == original.ts_hash[1] &&
             loaded.error_bound == original.error_bound &&
             loaded.status[0] == original.status[0], "metadata round trip");
+    monitored.commit_metadata();
+    sys_state monitor_loaded(monitored.ss_hash);
+    require(monitor_loaded.monitor_states == monitored.monitor_states, "monitor archive roundtrip");
+    auto model = monitored;
+    model.model_identity = "different model";
+    require(model.identity_hash() != monitored.identity_hash(), "model context omitted from identity");
+    failed.commit_metadata();
+    require(sys_state(failed.ss_hash).property_failed, "terminal verdict lost on reload");
     auto wrong = original;
     wrong.error_bound--;
     rejects([&] { wrong.save_metadata(); }, "modified metadata reused stale identity");

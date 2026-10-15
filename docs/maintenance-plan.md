@@ -1,5 +1,102 @@
 # Maintenance baseline
 
+## Generic framework implementation plan (2026-10-15)
+
+Invariant: core captures machine/environment state without application-specific
+fields; properties inspect explicit immutable source/target views and run before
+successor publication/dedup. Monitor memory is branch-owned and part of search
+identity, not guest restore. Flat/page snapshots share a memory-reader contract;
+there is no implicit saved-to-live fallback. Environment choices may inspect an
+explicit stopped-live read-only view and return validated outcomes/costs.
+
+Regression first: flat/page read equivalence, explicit expression context and
+write rejection; plugin error/ABI handling, state/edge checks, history branch
+isolation/archive/identity, decoder noninterference, configurable startup/signal
+semantics, no core/example coupling. Preserve before binary/plugins under build.
+
+Passes: (1) common snapshot readers and explicit observation; (2) versioned plugin
+API and Raft/Paxos migration; (3) generic monitor product state and single checker
+commit boundary; (4) explicit runtime profile and presentation plugins; (5) remove
+old fields/pruning/duplicate plugin paths and bump incompatible schemas. No new
+dependencies. Separate implementation and read-only review. Keep workload-specific
+code in examples, not resource models or persistence. Do not merge two scheduler
+implementations without equivalence evidence; route both through the common
+transition/check path.
+
+Verification: make check, production NP1/2/3 builds, native restore/state/reader
+and plugin regressions, Redis smoke, Raft flat/pages bounded exploration. Compare
+same-work baseline where semantics match; report changed exploration coverage
+separately, and time only isolated executions after builds finish. Finish with
+strict diagnostics, diff review and a coherent commit.
+
+Implementation and validation completed:
+
+- Common `SnapshotView` chunk dispatch (`FlatMemory`/`PagedMemory`) and explicit
+  `StateView`: snapshot memory, typed readonly expressions, authoritative clocks,
+  logical registers/resource JSON and non-consuming file/pipe/network buffers.
+- Public `src/api/plugin.h`, loader/runtime, example adapters and standalone
+  public-header builds. No Raft/Paxos/Redis reference remains in product source.
+  Pure presentation cannot affect model identity; decoder errors fall back raw.
+- Machine snapshots9/10 omit Raft fields. Version2 system metadata owns bounded
+  monitor bytes, model compatibility and terminal failure identity. Restore
+  selects the complete product state, including history even on same machine.
+- Checks precede commit/tree/dedup. Failed monitor writes are discarded; terminal
+  states remain inspectable but cannot execute. Native witness regression proves
+  valid and failing incoming edges cannot share the wrong counterexample parent.
+- Explicit per-node runtime preludes, normalization and signal policy; removed Go
+  guessing/private glibc-offset writes. Fixture harnesses declare their own Linux
+  ELF bootstrap profiles outside the generic product.
+
+Verification (system GCC14, all exit0):
+
+```sh
+make check CC=/usr/bin/gcc CXX=/usr/bin/g++
+make NP=2 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4 tracer check-state-view check-plugins check-runtime-profile check-identity check-capture check-io-boundary check-port check-accept check-redis
+make NP=1 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4 tracer check-state-io check-page-snapshot check-mappings check-xstate check-futex-snapshot check-futex check-exec check-scenarios
+# Repeat NP1 scenarios/mapping/XSTATE/futex and NP2 capture/Redis with verify-pages.
+make NP=3 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4 tracer
+```
+
+Native scenarios pass14 cases, including a third-system counter plugin with
+history/restore/terminal replay and first-violation stopping in BFS/DFS/RAND.
+Component tests pass8 cases and10 build contracts. Plugin gates cover both library
+adapters and flat/page payloads, ABI/config failures, history/terminal transactions,
+pure-decoder noninterference and all generic resource readers. Observer regressions
+also cover cold exited-node clocks, symbol reload with changed same-name layout,
+readonly ASTs, invalid process qualifiers and lifecycle/poison invalidation.
+
+Strict GCC diagnostics pass on the changed core (existing unused warnings
+suppressed); focused new observers/plugin/tests also pass with only the existing
+unused-parameter suppression. Selected clang-tidy core/C++ lifetime/move analyzer
+checks report no project findings (external-header warnings filtered). Generated
+parser changes were reviewed separately from the one-line grammar fix.
+Independent read-only review found and verified fixes for monitor commit order,
+cold metadata/cache handling, terminal witnesses and telemetry ownership.
+
+Final Raft verification: depth8,3 repetitions per backend/cache,24 old/new runs
+all match521 visits/275 new states, budget and protocol checkpoints. Depth12
+verify-pages checks19257 captures (23.9GB oracle reads),5593 visits/2867 new states;
+paired ordinary pages runs match the same counts,12.517/12.518s old/new and
+11.59/11.93s tracer CPU (one run each). Short runs benefit from telemetry removal;
+longer exploration is wall-time neutral here with about3% more CPU. See
+[measurement scope and full tables](redisraft-benchmark.md).
+
+Remaining limits are tracked in the correctness backlog: fixed NP, supported
+non-PIE main-image symbol context, bootstrap outside exploration, thread/signal
+lifecycle and wider machine-state closure. Genericization is not a proof of those
+unimplemented guarantees. No dependencies or vendor/submodule changes added.
+
+### Bounded telemetry follow-up
+
+The three-repeat comparison exposed 1-second wall-time quantization from the
+status thread's fixed sleeps/join. The same thread concurrently reads mutable
+state_set/state_tree/runtime structures, which is not safe. Preserve existing
+finite-search/violation/cleanup scenario tests and search counts, remove the
+background reader, and poll presentation periodically at completed-transition
+boundaries on the exploration thread. Status display must not delay exploration
+completion or observe half-published state. Recheck counts and remeasure before
+claiming an improvement; keep the pre-telemetry comparison separately.
+
 ## Joint virtual I/O boundary plan (2026-10-15)
 
 Lock mixed file/socket/pipe/epoll read-write-close, flags, guest-copy failure,

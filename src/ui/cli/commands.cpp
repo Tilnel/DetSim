@@ -331,9 +331,9 @@ int cmd_rand(char *args) {
     }
 
     auto_mode = 1;
-    exec_rand(depth);
+    const int result = exec_rand(depth);
     auto_mode = 0;
-    return 0;
+    return result;
 }
 
 /* ======================================================================

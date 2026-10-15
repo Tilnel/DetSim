@@ -33,31 +33,18 @@ extern "C" detsim::ui::NCursesUI *get_ncurses_ui();
 #include <cstddef>
 #include <cstdlib>
 #include <fcntl.h>
-#include <pthread.h>
 #include <random>
 #include <readline/readline.h>
 #include <signal.h>
 #include <string.h>
-#include <sys/ioctl.h>
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
-#include <thread>
 #include <unistd.h>
 
 #define pids ptmc_state.pids
 extern FILE *log_fp;
 double start_time = 0.0;
-
-/* Apply user choice modifications to syscall arguments */
-void apply_choose(const syscall_info &info, choose_out *out)
-{
-  for (int i = 0; i < 6; i++)
-  {
-    if (out->len[i])
-      memcpy_host2guest((void *)info.args[i], out->args[i], out->len[i]);
-  }
-}
 
 void show_syscall_history();
 /* For single step use. Should get hash from ptmc_state.sysstate_hash. *
@@ -74,34 +61,7 @@ void load(hash_type hash)
 
 /* Forward declarations for status monitor */
 static void stop_status_monitor();
-
-long expr(const char *e, bool *success);
-/* Judge state assertions. Return 0 if legal */
-static int check_state()
-{
-  hash_type current_hash = ptmc_state.running_state.ss_hash;
-  for (auto &assertion : ptmc_state.assertions)
-  {
-    bool success;
-    long val = expr(assertion.c_str(), &success);
-    LOG_DEBUG("Assertion \"%s\" = %ld (success=%d)", assertion.c_str(), val,
-              success);
-    if (!success)
-      LOG_ERROR("Failed to evaluate expression \"%s\"", assertion.c_str());
-    if (val == false)
-    {
-      detsim::ui::ui_printf("Assertion \"%s\" fail at sys_state " HASH_FORMAT
-                            "!\n",
-                            assertion.c_str(), current_hash);
-      return 1;
-    }
-  }
-  for (auto f : ptmc_state.user_checks)
-    if (f())
-      return 1;
-
-  return 0;
-}
+static void poll_status_monitor();
 
 int load_exec_store()
 {
@@ -126,6 +86,7 @@ int load_exec_store()
   }
 
   TransitionResult result = state_transition(s, index);
+  poll_status_monitor();
 
   // Check if the current thread is blocked
   if (result.code == CKPT_DISCARD)
@@ -144,7 +105,7 @@ int load_exec_store()
     return -1;
   }
 
-  if (check_state() != 0)
+  if (result.property_violation != 0)
     detsim::ui::ui_printf("Reach illegal state.\n");
 
   return 0;
@@ -171,7 +132,8 @@ static std::atomic<size_t> g_states_searched{0};
 static std::atomic<size_t> g_states_new{0};
 static std::atomic<size_t> g_queue_size{0};
 static std::atomic<double> g_start_time{0.0};
-static std::atomic<bool> g_monitor_running{false};
+static bool g_monitor_running = false;
+static double g_next_status_update = 0;
 
 /* Depth tracking for depth vs states analysis */
 static std::atomic<size_t> g_max_depth_recorded{0}; // Maximum depth seen so far
@@ -269,8 +231,6 @@ static std::atomic<uint64_t> g_syscall_time_us{
     0};                                        // Total syscall execution time
 static std::atomic<size_t> g_save_count{0};    // Number of saves
 static std::atomic<size_t> g_restore_count{0}; // Number of restores
-static std::chrono::high_resolution_clock::time_point g_last_stat_time;
-static std::thread g_monitor_thread;
 
 /* Calculate real depth from state_tree by backtracking to root
  * This is the actual path length from current state to initial state */
@@ -296,19 +256,6 @@ static size_t calculate_state_depth(hash_type current_hash)
   }
 
   return depth;
-}
-
-/* Get terminal size */
-static void get_terminal_size(int &rows, int &cols)
-{
-  struct winsize w;
-  rows = 24;
-  cols = 80; /* defaults */
-  if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0)
-  {
-    rows = w.ws_row;
-    cols = w.ws_col;
-  }
 }
 
 /* Format bytes to human readable */
@@ -525,68 +472,56 @@ static void print_text_status(const struct StoreStats &stats, double elapsed,
   fflush(stdout);
 }
 
-static void status_monitor_thread()
+// Inspect mutable exploration state only on the exploration thread, after a
+// completed transition. Telemetry cannot race snapshots or delay completion.
+static void poll_status_monitor()
 {
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
+  if (!g_monitor_running) return;
+  const double now = gettime();
+  if (now < g_next_status_update) return;
+  g_next_status_update = now + 1.0;
   detsim::ui::NCursesUI *ui = get_ncurses_ui();
-  int rows, cols;
-  get_terminal_size(rows, cols);
+  struct StoreStats stats;
+  collect_store_stats(stats);
 
-  while (g_monitor_running.load())
+  double elapsed = gettime() - g_start_time.load();
+  size_t total_sysstates = state_set.size();
+  size_t unique_states = g_states_new.load();
+  size_t queue_size = g_queue_size.load();
+  size_t depth = calculate_state_depth(ptmc_state.running_state.ss_hash);
+
+  update_depth_statistics(depth, g_states_searched.load());
+
+  size_t sock_state_total, fs_state_total;
+  calculate_subsystem_stats(sock_state_total, fs_state_total);
+
+  size_t state_tree_size = state_tree.size();
+  size_t state_queue_internal = StateStore::instance().queue_size();
+
+  if (ui)
   {
-    struct StoreStats stats;
-    collect_store_stats(stats);
-
-    double elapsed = gettime() - g_start_time.load();
-    size_t total_sysstates = state_set.size();
-    size_t unique_states = g_states_new.load();
-    size_t queue_size = g_queue_size.load();
-    size_t depth = calculate_state_depth(ptmc_state.running_state.ss_hash);
-
-    update_depth_statistics(depth, g_states_searched.load());
-
-    size_t sock_state_total, fs_state_total;
-    calculate_subsystem_stats(sock_state_total, fs_state_total);
-
-    size_t state_tree_size = state_tree.size();
-    size_t state_queue_internal = StateStore::instance().queue_size();
-
-    if (ui)
-    {
-      update_ui_status(ui, stats, elapsed, depth, queue_size,
-                       state_tree_size, total_sysstates, unique_states,
-                       sock_state_total, fs_state_total, state_queue_internal);
-    }
-    else
-    {
-      print_text_status(stats, elapsed, depth, queue_size, total_sysstates, unique_states);
-    }
-
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    update_ui_status(ui, stats, elapsed, depth, queue_size,
+                     state_tree_size, total_sysstates, unique_states,
+                     sock_state_total, fs_state_total, state_queue_internal);
   }
+  else
+  {
+    print_text_status(stats, elapsed, depth, queue_size, total_sysstates, unique_states);
+  }
+
 }
 
 static void start_status_monitor()
 {
   g_monitor_running = true;
   g_start_time = gettime();
-  g_last_stat_time = std::chrono::high_resolution_clock::now();
+  g_next_status_update = g_start_time.load() + 0.5;
   g_max_depth_recorded = 0;
-
-  /* Open depth statistics file for append */
-  std::lock_guard<std::mutex> lock(g_depth_stat_mutex);
-  g_monitor_thread = std::thread(status_monitor_thread);
-  pthread_setname_np(g_monitor_thread.native_handle(), "status_monitor");
 }
 
 static void stop_status_monitor()
 {
   g_monitor_running = false;
-  if (g_monitor_thread.joinable())
-  {
-    g_monitor_thread.join();
-  }
 
   /* Clear depth data points for next run */
   {
@@ -600,11 +535,9 @@ static void stop_status_monitor()
   }
   g_max_depth_recorded = 0;
 
-  /* If not using UI, clear status area and show cursor */
-  detsim::ui::NCursesUI *ui = get_ncurses_ui();
 }
 
-// Search failures must join the monitor before main catches the exception.
+// Search failures must finish telemetry before main catches the exception.
 // Existing explicit stops retain their reporting order on normal/early exits.
 class StatusMonitorScope
 {
@@ -612,31 +545,16 @@ public:
   StatusMonitorScope() { start_status_monitor(); }
   ~StatusMonitorScope()
   {
-    if (g_monitor_thread.joinable())
+    if (g_monitor_running)
       stop_status_monitor();
   }
   StatusMonitorScope(const StatusMonitorScope &) = delete;
   StatusMonitorScope &operator=(const StatusMonitorScope &) = delete;
 };
 
-bool state_to_be_discarded(int index, syscall_info *infos)
+static bool model_budget_exhausted()
 {
-  if (ptmc_state.error_bound <= 0)
-    return true;
-
-  if (index == 0)
-  {
-    uintptr_t raft = eval<uintptr_t>("raft", 0);
-    if (raft == 0)
-      return false; // If we can't evaluate, don't discard
-    int state = eval<int>("((raft_server*)raft)->state", 0);
-    if (state == 2 || state == 3)
-    {
-      return true;
-    }
-  }
-
-  return false;
+  return ptmc_state.error_bound <= 0;
 }
 
 /* auto mode: */
@@ -740,13 +658,14 @@ int exec_bfs()
                    j);
 
       TransitionResult result = state_transition(s, i);
+      poll_status_monitor();
       g_save_time_us += result.save_time.count();
       g_restore_time_us += result.restore_time.count();
       g_save_count++;
       states_searched_this_run++;
       g_states_searched = states_searched_this_run;
 
-      int check_result = check_state();
+      int check_result = result.property_violation;
       if (check_result != 0)
       {
         stop_status_monitor();
@@ -762,7 +681,7 @@ int exec_bfs()
       }
 
       if (result.code != CKPT_DISCARD &&
-          !state_to_be_discarded(i, syscall_info))
+          !model_budget_exhausted())
       {
         bool is_new = !state_set.count(result.new_state.ss_hash);
         if (is_new)
@@ -936,6 +855,7 @@ int do_dfs(hash_type ss_hash, int depth)
       }
 
       TransitionResult result = state_transition(s, i);
+      poll_status_monitor();
       g_save_time_us += result.save_time.count();
       g_restore_time_us += result.restore_time.count();
 
@@ -951,7 +871,7 @@ int do_dfs(hash_type ss_hash, int depth)
       }
 
       g_save_count++;
-      if (check_state() != 0)
+      if (result.property_violation != 0)
       {
         stop_status_monitor();
         detsim::ui::ui_printf("Stopped for illegal state. Searched for %zu "
@@ -966,7 +886,7 @@ int do_dfs(hash_type ss_hash, int depth)
       }
 
       if (result.code != CKPT_DISCARD &&
-          !state_to_be_discarded(i, syscall_info))
+          !model_budget_exhausted())
       {
         LOG_DEBUG("DFS depth %d, tracee %d, choose %d, hash %016lx", depth, i,
                   ptmc_state.choose, result.new_state.ss_hash);
@@ -1113,6 +1033,7 @@ int do_dfs_iterative(hash_type initial_ss_hash, int initial_depth)
       }
 
       TransitionResult result = state_transition(frame.s, i);
+      poll_status_monitor();
       g_save_time_us += result.save_time.count();
       g_restore_time_us += result.restore_time.count();
 
@@ -1129,7 +1050,7 @@ int do_dfs_iterative(hash_type initial_ss_hash, int initial_depth)
       }
 
       g_save_count++;
-      if (check_state() != 0)
+      if (result.property_violation != 0)
       {
         stop_status_monitor();
         detsim::ui::ui_printf("Stopped for illegal state. Searched for %zu "
@@ -1144,7 +1065,7 @@ int do_dfs_iterative(hash_type initial_ss_hash, int initial_depth)
       }
 
       if (result.code != CKPT_DISCARD &&
-          !state_to_be_discarded(i, frame.si_arr))
+          !model_budget_exhausted())
       {
         LOG_DEBUG("DFS depth %d, tracee %d, choose %d, hash %016lx",
                   frame.depth, i, ptmc_state.choose, result.new_state.ss_hash);
@@ -1238,7 +1159,11 @@ int exec_dfs(int depth)
   StateStore::instance().queue_clear();
   start_time = gettime();
 
-  do_dfs_iterative(ptmc_state.running_state.ss_hash, depth);
+  const int stopped = do_dfs_iterative(ptmc_state.running_state.ss_hash, depth);
+  if (stopped) {
+    stop_status_monitor();
+    return stopped;
+  }
 
   stop_status_monitor();
   detsim::ui::ui_printf(
@@ -1317,6 +1242,7 @@ int exec_rand(int depth)
       }
 
       TransitionResult result = state_transition(s, i);
+      poll_status_monitor();
       g_save_count++;
       g_save_time_us += result.save_time.count();
       g_restore_time_us += result.restore_time.count();
@@ -1329,8 +1255,9 @@ int exec_rand(int depth)
       }
       states_searched_this_run++;
 
-      if (check_state() != 0)
+      if (result.property_violation != 0)
       {
+        stop_status_monitor();
         detsim::ui::ui_printf("Stopped for illegal state. Searched for %zu "
                               "sys_states (new: %zu)\n",
                               states_searched_this_run, states_new_this_run);
@@ -1339,7 +1266,7 @@ int exec_rand(int depth)
         detsim::ui::ui_printf("Time elapsed: %lfs, speed = %lf states/s\n",
                               time_used, states_searched_this_run / time_used);
         StateStore::instance().print_stats();
-        break;
+        return 1;
       }
       g_states_searched = states_searched_this_run;
       g_states_new = states_new_this_run;

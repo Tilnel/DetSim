@@ -104,6 +104,8 @@ public:
         ar(waiters_, waiter_map_);
     }
 
+    const std::map<uint64_t, std::vector<FutexWaiter>>& wait_queues() const { return waiters_; }
+
     // Debug output
     void dump_state() const;
 

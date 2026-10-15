@@ -16,8 +16,7 @@
 #include <sys/syscall.h>
 #include <sys/time.h>
 
-/* Raft message parser */
-#include "raft_msg_parser.h"
+#include "plugins.h"
 #define DISPLAY_MAX_LEN 128
 
 /* External syscall name table */
@@ -171,36 +170,15 @@ void format_sendto(char *buf, int pid, hash_type ts_hash,
   char *mem = (char *)read_mem(pid, ts_hash, info.args[1], display_len);
   if (mem)
   {
-    /* Check if this looks like a Raft message (starts with valid type 0-7) */
-    bool is_raft = false;
-    if (display_len >= 4)
-    {
-      int msg_type;
-      memcpy(&msg_type, mem, sizeof(int));
-      if (msg_type >= 0 && msg_type <= 7)
-      {
-        /* Likely a Raft message, try to parse it */
-        std::string raft_desc = raft::parse_raft_message(mem, display_len);
-        if (!raft_desc.empty() &&
-            raft_desc.find("malformed") == std::string::npos)
-        {
-          pos += sprintf(buf + pos, "%p\"%s\"", (void *)info.args[1],
-                         raft_desc.c_str());
-          is_raft = true;
-        }
-      }
-    }
-
-    if (!is_raft)
-    {
-      /* Regular binary content */
-      pos += sprintf(buf + pos, "%p\"", (void *)info.args[1]);
+    std::string description = detsim::plugins::describe_bytes(mem, display_len);
+    pos += sprintf(buf + pos, "%p\"", (void *)info.args[1]);
+    if (!description.empty())
+      pos += sprintf(buf + pos, "%s", description.substr(0, DISPLAY_MAX_LEN).c_str());
+    else
       pos += format_mem_content(buf + pos, mem, display_len);
-      if (requested_len > DISPLAY_MAX_LEN)
-        pos += sprintf(buf + pos, "...(%ld more bytes)",
-                       requested_len - DISPLAY_MAX_LEN);
-      pos += sprintf(buf + pos, "\"");
-    }
+    if (requested_len > DISPLAY_MAX_LEN)
+      pos += sprintf(buf + pos, "...(%ld more bytes)", requested_len - DISPLAY_MAX_LEN);
+    pos += sprintf(buf + pos, "\"");
     free(mem);
   }
   else
@@ -257,32 +235,13 @@ void format_recvfrom(char *buf, int pid, hash_type ts_hash,
     char *mem = (char *)read_mem(pid, ts_hash, info.args[1], display_len);
     if (mem)
     {
-      /* Check if this looks like a Raft message */
-      bool is_raft = false;
-      if (display_len >= 4)
-      {
-        int msg_type;
-        memcpy(&msg_type, mem, sizeof(int));
-        if (msg_type >= 0 && msg_type <= 7)
-        {
-          std::string raft_desc = raft::parse_raft_message(mem, display_len);
-          if (!raft_desc.empty() &&
-              raft_desc.find("malformed") == std::string::npos)
-          {
-            pos += sprintf(buf + pos, "%p\"%s\"", (void *)info.args[1],
-                           raft_desc.c_str());
-            is_raft = true;
-          }
-        }
-      }
-
-      if (!is_raft)
-      {
-        /* Regular binary content */
-        pos += sprintf(buf + pos, "%p\"", (void *)info.args[1]);
+      std::string description = detsim::plugins::describe_bytes(mem, display_len);
+      pos += sprintf(buf + pos, "%p\"", (void *)info.args[1]);
+      if (!description.empty())
+        pos += sprintf(buf + pos, "%s", description.substr(0, DISPLAY_MAX_LEN).c_str());
+      else
         pos += format_mem_content(buf + pos, mem, display_len);
-        pos += sprintf(buf + pos, "\"");
-      }
+      pos += sprintf(buf + pos, "\"");
       if (ret > DISPLAY_MAX_LEN)
         pos += sprintf(buf + pos, "...");
       free(mem);

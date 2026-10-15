@@ -120,30 +120,6 @@ void set_exploration_complete_callback(ExplorationCompleteCallback cb)
  * State Checking
  * ====================================================================== */
 
-extern long expr(const char *e, bool *success);
-
-static int check_state_assertions()
-{
-    hash_type current_hash = ptmc_state.running_state.ss_hash;
-    for (auto &assertion : ptmc_state.assertions)
-    {
-        bool success;
-        long val = expr(assertion.c_str(), &success);
-        LOG_DEBUG("Assertion \"%s\" = %ld (success=%d)", assertion.c_str(), val, success);
-        if (!success)
-            LOG_ERROR("Failed to evaluate expression \"%s\"", assertion.c_str());
-        if (val == false)
-        {
-            return 1;
-        }
-    }
-    for (auto f : ptmc_state.user_checks)
-        if (f())
-            return 1;
-
-    return 0;
-}
-
 /* ======================================================================
  * Multi-Threaded State Transition
  * ====================================================================== */
@@ -317,7 +293,7 @@ int scheduler_exec_bfs()
                 states_searched_this_run++;
                 g_states_searched = states_searched_this_run;
 
-                int check_result = check_state_assertions();
+                int check_result = result.property_violation;
                 if (check_result != 0)
                 {
                     update_stats();
@@ -417,7 +393,7 @@ static int dfs_recursive(int depth, int max_depth, std::set<hash_type> &visited)
         TransitionResult result = state_transition(s, i);
         g_states_searched++;
 
-        int check_result = check_state_assertions();
+        int check_result = result.property_violation;
         if (check_result != 0)
         {
             update_stats();
@@ -533,7 +509,7 @@ int scheduler_exec_rand(int depth)
         TransitionResult result = state_transition(s, proc);
         g_states_searched++;
 
-        int check_result = check_state_assertions();
+        int check_result = result.property_violation;
         if (check_result != 0)
         {
             update_stats();

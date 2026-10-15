@@ -61,3 +61,17 @@
 
 !capture.mk
 !capture_integration.cpp
+
+!framework.mk
+!state_view_integration.cpp
+!plugin_integration.cpp
+!plugin_fixture.cpp
+!runtime_profile.mk
+!runtime_profile_integration.cpp
+!raft_checker_unit.cpp
+
+!native_counter_plugin.cpp
+
+!state_view_layout.c
+
+!fixture_profile.py

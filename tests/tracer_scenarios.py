@@ -42,7 +42,7 @@ class TracerScenarios(unittest.TestCase):
 
     def run_tracer(self, commands, *, name="probe", batch=False, sibling=False,
                    terminate=False, assertions=(), verify_failure_cleanup=False,
-                   fail_storage_sync=False, extra_env=None):
+                   fail_storage_sync=False, extra_env=None, plugins=()):
         work = self.root / (name + ("-batch" if batch else "-interactive"))
         work.mkdir()
         binary = work / name
@@ -53,6 +53,7 @@ class TracerScenarios(unittest.TestCase):
             "Nodes": 1, "Loglevel": 4, "Tracee": [[str(binary), "0"]],
             "Addr": ["192.168.0.1"],
             "Assertions": list(assertions),
+            "Plugins": list(plugins),
         }))
         args = [str(TRACER), "-n", "-c", str(config)]
         if PROFILE:
@@ -214,6 +215,15 @@ finally:
         self.assertNotIn("Complete explore all", output)
         self.assertEqual(code, 0, output)
 
+    def test_search_modes_stop_at_first_property_violation(self):
+        for mode in ("dfs", "rand"):
+            code, output = self.run_tracer("sw 0\n" + mode + " 8\nq\n",
+                                           name=mode + "_probe",
+                                           assertions=["tracee0(counter < 2)"])
+            self.assertEqual(code, 0, output)
+            self.assertEqual(output.count("Stopped for illegal state"), 1, output)
+            self.assertNotIn("Complete explore all", output)
+
     def test_restore_and_replay_preserve_counter_and_state_identity(self):
         def scenario(send):
             send("sw 0")
@@ -235,6 +245,27 @@ finally:
 
         code, output = self.run_tracer(scenario)
         self.assertEqual(code, 0, output)
+
+    def test_native_plugin_history_restore_and_violation_identity(self):
+        plugin = self.root / "counter.so"
+        subprocess.run(["/usr/bin/g++", "-std=c++20", "-shared", "-fPIC",
+                        "-I" + str(ROOT / "src"), str(ROOT / "tests/native_counter_plugin.cpp"),
+                        "-o", str(plugin)], check=True)
+
+        def scenario(send):
+            send("sw 0")
+            self.assertNotIn("illegal state", send("si"))
+            saved = re.findall(r"=> ([0-9a-f]{16})", send("info"))[-1]
+            self.assertIn("Reach illegal state", send("si"))
+            terminal = re.findall(r"=> ([0-9a-f]{16})", send("info"))[-1]
+            for _ in range(2):
+                self.assertIn("Loaded state", send("load " + saved))
+                self.assertIn("counter = 1", send("p counter"))
+                self.assertIn("Reach illegal state", send("si"))
+                self.assertEqual(re.findall(r"=> ([0-9a-f]{16})", send("info"))[-1], terminal)
+        code, output = self.run_tracer(scenario, plugins=[str(plugin)])
+        self.assertEqual(code, 0, output)
+        self.assertIn("counter reached two", output)
 
     def test_automatic_capture_failure_exits_cleanly(self):
         source = self.root / "unsupported.c"

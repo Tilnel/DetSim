@@ -4,6 +4,8 @@
 
 #include "signal_handler.h"
 #include "guest.h"
+#include "runtime_profile.h"
+#include <stdexcept>
 #include "log_wrapper.h"
 #include "state/state_store.h"
 #include <cassert>
@@ -19,7 +21,7 @@
  * ====================================================================== */
 
 SignalHandler::SignalHandler()
-    : fatal_count_(0), ignored_count_(0), special_count_(0)
+    : fatal_count_(0), ignored_count_(0)
 {
 }
 
@@ -38,22 +40,18 @@ SignalResult SignalHandler::handle(const SignalContext& ctx)
             result = handle_fatal(ctx);
             break;
 
-        case SignalCategory::GO_RUNTIME:
-            special_count_++;
-            result = handle_go_sigurg(ctx);
-            break;
-
         case SignalCategory::NON_FATAL:
-            ignored_count_++;
-            result = handle_non_fatal(ctx);
-            break;
-
         case SignalCategory::UNKNOWN:
         default:
-            LOG_WARN("Unknown signal %d from pid %d", ctx.signal, ctx.pid);
-            result.action = SignalAction::CONTINUE;
-            result.should_retry = true;
-            result.message = "Unknown signal - retrying";
+            if (detsim::runtime_profile().ignored_signals.count(ctx.signal)) {
+                ignored_count_++;
+                result.action = SignalAction::SPECIAL;
+                result.should_retry = true;
+                result.message = "Signal suppressed by explicit runtime profile";
+            } else {
+                throw std::runtime_error("Unmodeled signal " + std::to_string(ctx.signal) +
+                    "; configure an explicit RuntimeProfile signal policy");
+            }
             break;
     }
 
@@ -71,11 +69,6 @@ SignalCategory SignalHandler::classify(int signal)
         return SignalCategory::SYSCALL_TRAP;
     }
 
-    // Go runtime preemption signal
-    if (signal == SIGURG) {
-        return SignalCategory::GO_RUNTIME;
-    }
-
     // Fatal signals
     switch (signal) {
         case SIGSEGV:
@@ -86,7 +79,7 @@ SignalCategory SignalHandler::classify(int signal)
             return SignalCategory::FATAL;
     }
 
-    // Non-fatal signals that can be dismissed
+    // Classification does not authorize suppression. The profile must opt in.
     switch (signal) {
         case SIGALRM:
         case SIGCHLD:
@@ -125,37 +118,8 @@ SignalResult SignalHandler::handle_fatal(const SignalContext& ctx)
     // Show diagnostic info
     tracee_backtrace(ctx.pid);
 
-    char msg[256];
-    snprintf(msg, sizeof(msg), "Process crashed with signal %s",
-             strsignal(ctx.signal));
-    result.message = strdup(msg);  // Will be freed by caller
+    result.message = "Process terminated by fatal signal";
 
-    return result;
-}
-
-SignalResult SignalHandler::handle_go_sigurg(const SignalContext& ctx)
-{
-    SignalResult result;
-    result.action = SignalAction::SPECIAL;
-    result.should_retry = true;
-
-    LOG_INFO("Received SIGURG from tracee %d, likely due to Go runtime "
-             "preemption signal. Ignoring and continuing.", ctx.pid);
-
-    result.message = "Go runtime preemption - continuing";
-    return result;
-}
-
-SignalResult SignalHandler::handle_non_fatal(const SignalContext& ctx)
-{
-    SignalResult result;
-    result.action = SignalAction::CONTINUE;
-    result.should_retry = true;
-
-    LOG_DEBUG("Dismissing non-fatal signal %s from pid %d",
-              strsignal(ctx.signal), ctx.pid);
-
-    result.message = "Non-fatal signal dismissed";
     return result;
 }
 

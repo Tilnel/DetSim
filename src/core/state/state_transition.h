@@ -21,6 +21,7 @@ struct TransitionResult {
     std::chrono::microseconds restore_time;
     std::chrono::microseconds save_time;
     enum TransitionResultCode code;
+    bool property_violation = false;
 };
 int state_initialization();
 TransitionResult state_transition(const sys_state &source_state, int process_index);

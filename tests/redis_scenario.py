@@ -12,6 +12,8 @@ import subprocess
 import tempfile
 import time
 
+from fixture_profile import startup_boundary
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -58,6 +60,7 @@ def main():
             "Tracee": [[str(server), "/redis.conf"], [str(client)]],
             "FSMap": [{"Host": str(ROOT / "examples/redis/fs_root"), "Target": "/"}],
             "Loglevel": 2,
+            "RuntimeProfile": {"startup_syscalls": [startup_boundary(server), startup_boundary(client)]},
             "StateStore": {"hot_cache_mb": 32, "warm_cache_mb": 64,
                            "prefetch_window": 0},
         })

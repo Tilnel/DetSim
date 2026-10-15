@@ -116,3 +116,7 @@ examples/**/*.pyc
 /examples/write/write
 /examples/raft/plugins/check.so
 /examples/raft/plugins/choose.so
+
+# Public plugin ABI; no generated artifacts.
+!src/api/
+!src/api/plugin.h

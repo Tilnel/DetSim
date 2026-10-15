@@ -9,7 +9,7 @@ ifneq ($(filter benchmark-redisraft,$(MAKECMDGOALS)),)
 NP ?= 3
 endif
 
-ifneq ($(filter check-accept check-redis check-port check-identity check-capture check-io-boundary,$(MAKECMDGOALS)),)
+ifneq ($(filter check-accept check-redis check-port check-identity check-capture check-io-boundary check-state-view check-plugins check-runtime-profile,$(MAKECMDGOALS)),)
 NP ?= 2
 endif
 
@@ -33,7 +33,7 @@ $(error Select debug or release in separate make invocations)
 endif
 endif
 BUILD_DIR = build/$(MODE)/np$(NP)
-INCLUDES = -I. -Isrc -Isrc/core -Isrc/core/engine -Isrc/core/syscall -Isrc/core/scheduler -Isrc/core/state -Isrc/subsys -Isrc/subsys/fs -Isrc/subsys/net -Isrc/subsys/sync -Isrc/utils -Isrc/ui -Isrc/ui/cli -Ithird_party -Ithird_party/cereal/include -Iexamples/redisraft/plugins
+INCLUDES = -I. -Isrc -Isrc/core -Isrc/core/engine -Isrc/core/syscall -Isrc/core/scheduler -Isrc/core/state -Isrc/subsys -Isrc/subsys/fs -Isrc/subsys/net -Isrc/subsys/sync -Isrc/utils -Isrc/ui -Isrc/ui/cli -Ithird_party -Ithird_party/cereal/include
 PROJECT_CPPFLAGS = $(INCLUDES) -DNP=$(NP)
 CXXFLAGS ?= -std=gnu++20 -fno-stack-protector -O3 -msse4.2 -mavx2 -mbmi -mbmi2 $(if $(filter debug,$(MODE)),-g,)
 CFLAGS ?= -O3 -g
@@ -43,7 +43,7 @@ LDLIBS = -ldwarf -lreadline -ldw -lzstd -lxxhash -lunwind-ptrace -lunwind-x86_64
 SRCS = src/main.cpp\
        src/core/scheduler.cpp src/core/guest.cpp src/core/monitor.cpp src/core/config.cpp src/core/syscall_fmt.cpp src/core/resolve.cpp \
        src/core/scheduler/exploration.cpp \
-       src/core/dwarf.cpp \
+       src/core/dwarf.cpp src/core/plugins.cpp src/core/runtime_profile.cpp src/core/state/state_view.cpp \
        src/core/state/state.cpp src/core/state/page_snapshot.cpp src/core/state/page_capture.cpp src/core/state/xstate.cpp src/core/state/state_store.cpp src/core/state/state_store_packed.cpp src/core/state/sysstate_store.cpp src/core/state/state_transition.cpp src/core/state/serialize.cpp \
        src/core/engine/thread_manager.cpp src/core/engine/signal_handler.cpp src/core/engine/exec_engine.cpp \
        src/core/syscall/dispatcher.cpp src/core/syscall/handlers.cpp \
@@ -53,7 +53,6 @@ SRCS = src/main.cpp\
        src/utils/utils.cpp src/utils/expr.cpp src/utils/expr_ast.cpp \
        src/utils/expr_lexer.cpp src/utils/expr_parser.cpp \
        src/utils/file_lock.cpp \
-       examples/redisraft/plugins/raft_msg_parser.cpp \
        src/ui/ncurses_ui.cpp src/ui/log_wrapper.cpp src/ui/cli/commands.cpp
 
 OBJS = $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SRCS))
@@ -117,7 +116,7 @@ check-build-contracts:
 check: test check-build-contracts
 
 # Optional fragments are absent in the disposable build-contract fixtures.
--include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk tests/futex_snapshot.mk tests/futex.mk tests/storage.mk tests/store_cache.mk tests/store_packed.mk tests/redisraft.mk tests/capture.mk tests/soft_dirty.mk tests/page_snapshot.mk tests/io_boundary.mk
+-include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk tests/futex_snapshot.mk tests/futex.mk tests/storage.mk tests/store_cache.mk tests/store_packed.mk tests/redisraft.mk tests/capture.mk tests/soft_dirty.mk tests/page_snapshot.mk tests/io_boundary.mk tests/framework.mk tests/runtime_profile.mk
 check-integration: check-dwarf check-elf
 
 # This gate executes native programs via ptrace; keep it separate from make check.
@@ -146,6 +145,7 @@ help:
 	@echo 'make check-capture         NP=2 full-versus-optimized snapshot equivalence'
 	@echo 'make check-soft-dirty      Experimental kernel soft-dirty byte oracle'
 	@echo 'make check-page-snapshot   v5/v6 page storage, reads, corruption and reopen'
+	@echo 'make check-state-view check-plugins check-runtime-profile  Generic framework regressions (NP=2)'
 	@echo 'make check-io-boundary     NP=2 virtual FD/socket/pipe/epoll and archive gates'
 	@echo 'make check-identity         NP=2 ordered metadata identity regression'
 	@echo 'make check-port             NP=2 deterministic virtual TCP ports regression'

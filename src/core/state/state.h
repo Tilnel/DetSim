@@ -20,14 +20,14 @@
  * State Data Format (shared with StateStore)
  * ====================================================================== */
 
-inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 7;
-inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 8;
+inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 9;
+inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 10;
 
 /* Packed to avoid alignment padding */
 struct __attribute__((packed)) StateDataHeader
 {
   uint32_t magic;         // 'DSTM' = 0x4453544D
-  uint32_t version;       // 7: flat; 8: pages (typed descriptors + owned I/O state)
+  uint32_t version;       // 9: flat; 10: pages (application-independent machine state)
   uint32_t num_regions;   // number of memory regions
   uint64_t tstate_offset; // offset to serialized tracee_state
   uint64_t tstate_size;   // size of serialized tracee_state
@@ -126,43 +126,6 @@ struct thread_create_info
  * ====================================================================== */
 
 /**
- * @brief Raft consensus checking state
- *
- * Stores Raft-specific state for safety checking during state space
- * exploration. This allows detecting safety violations like:
- * - Multiple leaders elected in the same term
- * - Log inconsistencies
- * - Commit index violations
- */
-struct raft_check_state
-{
-  // Equality comparison for incremental save optimization
-  long current_term = 0;
-  int is_leader = 0;
-  long last_log_term = 0;
-
-  /* Extended state for comprehensive bug detection */
-  long commit_idx = 0;
-  long applied_idx = 0;
-  long last_idx = 0;
-
-  /* Vote integrity checking */
-  long voted_for = -1;
-
-  /* Leader state tracking */
-  long match_idx[3] = {0, 0, 0};
-  long next_idx[3] = {0, 0, 0};
-
-  template <class Archive>
-  void serialize(Archive &ar)
-  {
-    ar(current_term, is_leader, last_log_term, commit_idx, applied_idx,
-       last_idx, voted_for, match_idx[0], match_idx[1], match_idx[2],
-       next_idx[0], next_idx[1], next_idx[2]);
-  }
-};
-
-/**
  * @brief Per-process state for a single tracee (traced process)
  *
  * tracee_state captures all state associated with a single traced process:
@@ -184,9 +147,6 @@ typedef struct tracee_state
   struct timeval tv;
   FileSystemState fs_state;
   SockState sock_state;
-
-  /* Raft consensus checking state - stored per state for BFS correctness */
-  raft_check_state raft_state;
 
   /* FdManager state - saved to preserve fd allocation state */
   FdManager fd_manager_state;
@@ -233,7 +193,7 @@ typedef struct tracee_state
   // Default constructor - value-initialize all members
   tracee_state()
       : si{}, brk(0), tv{0, 0}, fs_state(), sock_state(),
-        raft_state(), threads(), thread_create_records(),
+        threads(), thread_create_records(),
         main_tid(0), current_thread_idx(0), futex_state()
   {
   }
@@ -319,7 +279,10 @@ typedef struct sys_state
   hash_type ts_hash[NP];    // Per-process state hashes
   tracee_state child[NP];   // Per-process detailed state
   int status[NP];           // Per-process status (running/exited/etc)
-  int error_bound = 5;      // Allowed deviation for approximate states
+  int error_bound = 5;      // Model budget; affects allowed successors.
+  bool property_failed = false; // Absorbing property-monitor failure state.
+  std::map<std::string, std::vector<uint8_t>> monitor_states;
+  std::string model_identity; // Plugin/config/environment compatibility identity.
 
   // Default constructor - value-initialize all members
   sys_state() : ss_hash(0), ts_hash{}, child{}, status{}, error_bound(4) {}
@@ -334,7 +297,7 @@ typedef struct sys_state
 
   /* From running processes - save */
   sys_state(const struct syscall_info info[][MAX_THREADS_PER_PROCESS],
-            const sys_state *restored_source = nullptr);  // Per-thread syscall info
+            const sys_state *restored_source = nullptr, bool persist = true);  // Per-thread syscall info
 
   /* From saved state (hash) */
   sys_state(hash_type hash);
@@ -350,6 +313,7 @@ typedef struct sys_state
    * --------------------------------------------------------- */
 
   int save_metadata() const;
+  void commit_metadata();
   hash_type identity_hash() const;
 
   /* ---------------------------------------------------------

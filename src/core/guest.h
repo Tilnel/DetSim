@@ -32,7 +32,6 @@ bool guest_read_exact(pid_t pid, const void* guest, void* host, size_t size);
 bool guest_write_exact(pid_t pid, void* guest, const void* host, size_t size);
 void remove_vdso(int pid);
 int patch_at_random(pid_t pid);
-void patch_cpu_features_elf(pid_t pid);
 
 void show_regs(struct user_regs_struct *regs);
 void tracee_switch_syscall(int pid, int SYS_which, uint64_t rdi, uint64_t rsi,

@@ -1,26 +1,12 @@
-/*
- * Paxos Safety Property Checker (Minimal)
- *
- * For Go Paxos library - simplified version
- * Basic check that just returns success
- */
-
-#include "common.h"
-#include "debug.h"
-#include "monitor.h"
-#include <cstring>
-
-extern "C"
-{
-  // Simple check function - returns 0 for success
-  int check()
-  {
-    // For now, just return success
-    // In a full implementation, we would:
-    // 1. Parse Go runtime state to find Paxos node
-    // 2. Check consensus properties (single leader per view, etc.)
-    // 3. Validate message sequences
-
-    return 0;  // Success
-  }
+#include "api/plugin.h"
+#include <cstdio>
+namespace {
+detsim_verdict unavailable(const detsim_host_v1 *, const detsim_state_view *, detsim_diagnostic diagnostic) {
+  if (diagnostic.capacity) std::snprintf(diagnostic.data, diagnostic.capacity,
+    "Paxos safety projection is not implemented; remove this plugin to run unchecked");
+  return DETSIM_UNAVAILABLE;
 }
+const detsim_plugin_v1 descriptor{DETSIM_PLUGIN_ABI_V1, sizeof(detsim_plugin_v1), "paxos.safety", 1,
+  unavailable, nullptr, nullptr, nullptr, nullptr, nullptr};
+}
+extern "C" const detsim_plugin_v1 *detsim_plugin_entry_v1() { return &descriptor; }

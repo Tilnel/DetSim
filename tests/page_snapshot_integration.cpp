@@ -69,7 +69,7 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> metadata{1,2,3}; user_regs_struct regs{}; regs.rip = 42;
     auto manifest = encode_page_manifest(regions,metadata,"maps",regs,pages);
     auto key = save(manifest); store.wait_for_completion();
-    for (uint32_t unsupported : {5u,6u}) {
+    for (uint32_t unsupported : {5u,6u,7u,8u}) {
       auto older=manifest;
       reinterpret_cast<StateDataHeader*>(older.data())->version=unsupported;
       rejects([&]{SnapshotView::open(save(older));});
@@ -118,7 +118,7 @@ int main(int argc, char** argv) {
     wrong=pages; wrong[0].key=false_page;
     auto corrupt=SnapshotView::open(save(encode_page_manifest(regions,metadata,"maps",regs,wrong)));
     rejects([&]{corrupt->page(0,0);});
-    // Existing v7 files expose the same decoded bytes without conversion.
+    // Existing flat files expose the same decoded bytes without conversion.
     StateDataHeader h{}; h.magic=0x4453544D; h.version=FLAT_SNAPSHOT_VERSION; h.num_regions=regions.size();
     h.tstate_offset=sizeof(h)+regions.size()*sizeof(RegionInfo); h.tstate_size=metadata.size();
     h.maps_offset=h.tstate_offset+h.tstate_size; h.maps_size=4; h.regs_offset=h.maps_offset+4+bytes.size();
@@ -134,7 +134,7 @@ int main(int argc, char** argv) {
     cfg.read_only=true; store.init(cfg); auto reopened=SnapshotView::open(key);
     reopened->read_into(0x1003,output.data(),output.size()); require(output==bytes,"Cold reopen");
     rejects([&]{view->metadata();}); store.shutdown();
-    // Cached v7 bytes and v8 pages must not bypass a poisoned store.
+    // Cached flat bytes and pages must not bypass a poisoned store.
     cfg.read_only=false; cfg.hot_cache_size=65536; cfg.warm_cache_size=65536;
     store.init(cfg);
     const auto legacy_key=save(legacy);
@@ -159,7 +159,7 @@ int main(int argc, char** argv) {
     rejects([&]{SnapshotView::open(legacy_key);});
     rejects([&]{store.shutdown();});
     std::filesystem::remove_all(directory);
-    puts("page_snapshot_integration: PASS (cold/tiny, v7/v8, coverage, bounds, missing/length/key integrity, lifecycle/poison)");
+    puts("page_snapshot_integration: PASS (cold/tiny, flat/pages, coverage, bounds, missing/length/key integrity, lifecycle/poison)");
     return 0;
   } catch (const std::exception& e) {
     fprintf(stderr,"page_snapshot_integration: %s\n",e.what());

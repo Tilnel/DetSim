@@ -1,35 +1,18 @@
-#include "emu.h"
-#include "guest.h"
-
-static struct timeval tv_addmsec(struct timeval tv, int msec)
-{
-  long sec = tv.tv_sec;
-  long usec = tv.tv_usec;
-  usec += msec * 1000;
-  sec += usec / 1000000;
-  usec %= 1000000;
-  return (struct timeval){sec, usec};
-}
-
-extern "C"
-{
-  // Simple choose function for gettimeofday
-  // choice 0: return current time
-  // choice 1: advance time by a small amount
-  choose_out *choose_gettimeofday(int pid, int choice, const choose_in &in)
-  {
-    struct timeval tv = in.now;
-    struct timeval *tv_out = (struct timeval *)malloc(sizeof(*tv_out));
-
-    if (choice == 0)
-      *tv_out = tv;
-    else
-      *tv_out = tv_addmsec(tv, 10);  // Advance 10ms
-
-    choose_out *out = new choose_out();
-    out->args[0] = tv_out;
-    out->len[0] = sizeof(struct timeval);
-    out->rval = 0;
-    return out;
+#include "api/plugin.h"
+#include <cstdio>
+#include <limits>
+namespace {
+detsim_verdict choose_time(const detsim_host_v1 *, const detsim_state_view *, uint32_t,
+ int32_t choice, detsim_time now, uint32_t, detsim_time_choice_v1 *out, detsim_diagnostic diagnostic) {
+  if (choice < 0 || choice > 1 || now.seconds == std::numeric_limits<int64_t>::max()) {
+    if (diagnostic.capacity) std::snprintf(diagnostic.data, diagnostic.capacity, "invalid time choice");
+    return DETSIM_ERROR;
   }
+  int32_t usec = now.microseconds + (choice ? 10000 : 0);
+  *out = {{now.seconds + usec / 1000000, usec % 1000000}, 0};
+  return DETSIM_PASS;
 }
+const detsim_plugin_v1 descriptor{DETSIM_PLUGIN_ABI_V1, sizeof(detsim_plugin_v1), "paxos.timeout-model", 1,
+  nullptr, nullptr, nullptr, nullptr, choose_time, nullptr};
+}
+extern "C" const detsim_plugin_v1 *detsim_plugin_entry_v1() { return &descriptor; }

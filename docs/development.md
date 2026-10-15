@@ -23,7 +23,8 @@ make check-xstate check-exec check-state-io check-mappings # NP=1 state/atom gat
 make check-identity check-port # NP=2 identity and deterministic network state
 make check-capture       # NP=2 full/hinted snapshot byte-equivalence oracle
 make check-soft-dirty    # opt-in experiment: real kernel dirty tracking + byte oracle
-make check-page-snapshot # v7/v8 readers, missing/corrupt pages, reopen and poison gates
+make check-page-snapshot # flat/page readers, missing/corrupt pages, reopen and poison gates
+make check-state-view check-plugins check-runtime-profile # NP=2 generic framework gates
 make check-io-boundary   # NP=2 mixed descriptors, guest-copy faults and native dispatch
 make check-accept        # NP=2 cross-process accept address/length regressions
 make check-redis         # NP=2 fixed-schedule SET/GET with existing Redis debug binary
@@ -120,8 +121,8 @@ enter snapshot state. Loader CPU-feature normalization still logs an unresolved
 symbol (C17). Passing counter/replay tests does not close that gap,
 nor does it prove multithread, cross-process-run or eviction correctness.
 
-Default snapshot format is version 7; older formats are rejected without migration.
-This branch additionally reads opt-in version 8 page manifests, selected with
+Default snapshot format is version 9; older formats are rejected without migration.
+This branch additionally reads opt-in version 10 page manifests, selected with
 `DETSIM_SNAPSHOT_BACKEND=pages`; `verify-pages` adds a full memory oracle.
 See [page snapshots and whole-exploration measurements](page-snapshots.md).
 Private readable mappings are captured; shared/unreadable mappings, overlaps with
@@ -149,6 +150,86 @@ explicit support limits in [the Raft benchmark](redisraft-benchmark.md).
 Before finishing a change, run `git diff --check`, the relevant tests, and a fresh
 build if production/build files changed. Use compiler warnings/static analysis on
 the touched components; do not bury a focused change in whole-project formatting.
+
+## Framework and plugin boundary
+
+`SnapshotView::open(hash)` is the one saved-memory interface for flat and page
+snapshots. Validation, address traversal and owner lifetime are shared; internal
+`FlatMemory` and `PagedMemory` implementations supply immutable chunks. Consumers
+use `read_into` or owned spans, without checking the encoding. `StateView` groups
+these readers by logical process for inspection, independently of the UI cursor.
+It also exposes saved clocks and a read-only expression evaluator. `inspect_json`
+returns schema1 logical-thread/register/resource metadata (no physical IDs or bulk
+payloads); `read_buffer` reads file, pipe, TCP, UDP and pre-accept buffers without
+consuming data or moving offsets. Pending endpoint selectors are lossless decimal
+strings. Named lifecycle fields avoid importing private status headers. Metadata
+is decoded once per view, with lifecycle/poison checks retained on cached queries.
+Stopped-live register/futex inspection is explicitly unavailable. Missing bytes
+fail; saved readers never fall back to live memory. The explicit `stopped_live()`
+view is reserved for environment callbacks before capture.
+
+Public plugins include only `src/api/plugin.h` and export
+`detsim_plugin_entry_v1`. Build the `.so` explicitly. Loading legacy `check()` or
+compiling sources while parsing configuration is unsupported. An example:
+
+```json
+{
+  "Plugins": [{"Path": "./checker.so", "Configuration": {"limit": 4}}],
+  "RuntimeProfile": {
+    "startup_syscalls": [10, 11],
+    "deterministic_at_random": true,
+    "disable_vdso": true,
+    "ignored_signals": []
+  }
+}
+```
+
+Callbacks receive a borrowed host table and opaque read-only views. Configuration
+is available in each checker/environment module's host table. No STL ownership or physical PID crosses
+the C ABI. Plugins are trusted native code: the interface is a contract, not a
+sandbox. Callback results distinguish pass, violation, unavailable and error;
+unavailable data does not count as a passing check.
+
+- `check_state` inspects one snapshot; `check_transition` inspects source, event
+  and target. These cannot modify guest memory or persistent plugin globals.
+- Optional `init_monitor`/`advance_monitor` produce canonical versioned history
+  bytes through a host writer. Monitor bytes are copied/archived per search branch
+  and included in system identity, separately from machine snapshots.
+- `choose_time` reads a stopped-live view and returns a validated time and budget
+  cost. Guest copyout succeeds before clock/budget commit. V1 does not expose
+  arbitrary syscall-output mutation or claim a universal environment-plugin API.
+- Optional byte decoders only affect presentation. A decoder-only plugin does not
+  enter model identity or monitor state.
+
+Every completed transition captures a candidate machine, checks predicates and
+advances monitors before committing metadata, publishing history or deduplicating.
+BFS, DFS, random and manual execution use this boundary. A violation retains a
+replayable terminal product state with a persisted failure bit; terminal nodes
+can be inspected but cannot execute another transition. Monitor callbacks returning
+violation discard partial output and preserve previous history; inspection errors
+abort without publishing a
+successor. Pure predecessor/target comparisons need no monitor state.
+
+Plugin binaries/schema/configuration, target executable contents and semantic
+execution configuration form the model compatibility fingerprint. Executables must remain immutable during a run. Changing cache
+sizes or loading a decoder does not change it. Flat9/page10 and the versioned
+system metadata reject older archives without deleting or migrating stores.
+Changes to kernel-model or inspection semantics require an explicit compatibility
+version bump; fingerprints do not prove equivalence between different implementations.
+
+Symbolic observation currently supports the matching non-PIE main executable.
+Mismatched binaries, PIE/shared-image relocation or unavailable types fail
+explicitly. Raw address reads are independent of symbol availability. Expression
+assignment and increment/decrement are rejected, including dead branches.
+
+The default bootstrap profile explicitly stops after Linux dynamic-loader
+`munmap`; static libc fixtures use `mprotect`, and heterogeneous targets can supply
+one boundary per process. The prelude executes outside exploration and is not a
+proof that arbitrary runtime initialization is deterministic. Its syscall count
+limit cannot interrupt a blocking syscall. Go guessing, unconditional SIGURG
+suppression and the glibc-private CPU-offset patch were removed. Signal delivery
+requires additional saved state; currently fatal signals stop execution, explicitly
+configured ignores suppress, and other signals are unsupported.
 
 ## Where information belongs
 

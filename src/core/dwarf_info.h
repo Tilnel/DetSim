@@ -78,6 +78,10 @@ struct stack_frame
 
 /* Initialize DWARF parsing for the executable */
 void dwarf_init(const char *executable);
+// Identity and fixed-address range of the currently loaded global symbol service.
+const std::string& dwarf_executable_path();
+bool dwarf_fixed_executable();
+bool dwarf_main_image_contains(uint64_t address);
 
 /* Cleanup DWARF resources */
 void dwarf_cleanup(void);

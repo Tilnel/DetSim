@@ -4,7 +4,7 @@
  * This module provides centralized signal handling:
  * - Signal classification (fatal, non-fatal, special)
  * - Signal response determination
- * - Special signal handling (SIGURG for Go runtime)
+ * - Explicit runtime-profile suppression of otherwise unsupported signals
  */
 
 #ifndef __SIGNAL_HANDLER_H
@@ -25,14 +25,13 @@ enum class SignalAction {
     CONTINUE,       // Dismiss and continue execution
     CRASH,          // Fatal signal, stop simulation
     INTERRUPT,      // SIGINT - request interrupt
-    SPECIAL,        // Special handling required (e.g., SIGURG)
+    SPECIAL,        // Suppress an explicitly configured signal and retry
     UNKNOWN
 };
 
 enum class SignalCategory {
     FATAL,          // SIGSEGV, SIGABRT, SIGILL, etc.
-    NON_FATAL,      // Can be dismissed (SIGALRM, SIGCHLD, etc.)
-    GO_RUNTIME,     // SIGURG from Go runtime
+    NON_FATAL,      // Requires an explicit profile policy to suppress
     SYSCALL_TRAP,   // SIGTRAP | 0x80 (syscall entry/exit)
     UNKNOWN
 };
@@ -90,16 +89,13 @@ public:
     // Get human-readable signal description
     const char* get_description(int signal);
 
-    // Special handlers
+    // Fatal stop handling
     SignalResult handle_fatal(const SignalContext& ctx);
-    SignalResult handle_go_sigurg(const SignalContext& ctx);
-    SignalResult handle_non_fatal(const SignalContext& ctx);
 
 private:
     // Track statistics
     int fatal_count_;
     int ignored_count_;
-    int special_count_;
 };
 
 /* ======================================================================

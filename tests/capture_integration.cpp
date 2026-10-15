@@ -98,7 +98,11 @@ int main(int argc, char**)
         sys_state source(info);
         ptmc_state.running_state = source;
         ptmc_state.cursor = 0;
+        ptmc_state.running_state.monitor_states["other-branch"] = {9};
         source.recover_running_state();
+        require(ptmc_state.running_state.monitor_states == source.monitor_states &&
+                ptmc_state.running_state.ss_hash == source.ss_hash,
+                "restore did not select the source monitor/product identity");
         const auto before = StateStore::instance().get_stats();
         sys_state reused(info, &source);
         require(StateStore::instance().get_stats().save_calls == before.save_calls + NP,

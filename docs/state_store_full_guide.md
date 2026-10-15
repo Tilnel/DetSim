@@ -12,9 +12,9 @@
 | `SysStateStore` | 系统状态元数据的追加日志、索引与有界缓存 | `sysstate_store.{h,cpp}` |
 
 源文件均在 `src/core/state/`。`state.cpp` 负责捕获、恢复和语义身份，
-存储层负责保留给定字节。默认程序快照格式是v7；本分支另支持显式选择的v8页
-manifest，两者通过SnapshotView读取。v8页和manifest都用同一个StateStore保存，
-完整图的持久化以completion barrier为界；v7/v8的root hash不同。更旧格式拒绝。
+存储层负责保留给定字节。默认程序快照格式是v9；本分支另支持显式选择的v10页
+manifest，两者通过SnapshotView读取。v10页和manifest都用同一个StateStore保存，
+完整图的持久化以completion barrier为界；v9/v10的root hash不同。更旧格式拒绝。
 详见[页快照契约与测量](page-snapshots.md)。
 
 ## 保存、完成与失败

@@ -1,20 +1,20 @@
 # 页快照分支：实现与全链路测量
 
 分支 `experiment/page-snapshots`。页捕获实现基于 `08ed190`；后续虚拟 I/O 修复
-扩充了元数据，格式升级到7/8，拒绝旧5/6，不迁移或删除旧存储。默认仍生成v7完整快照，
-`DETSIM_SNAPSHOT_BACKEND=pages` 启用新的v8页对象格式。
+扩充了元数据，格式先升级到7/8；通用框架改造后升级到9/10，拒绝旧5/6/7/8，不迁移或删除旧存储。默认仍生成v9完整快照，
+`DETSIM_SNAPSHOT_BACKEND=pages` 启用新的v10页对象格式。
 **主要收益来自表示和去重粒度变化；启用页格式不要求依赖脏页标记。**
 
 ## 行为与持久化
 
-- v8根对象是小manifest：canonical映射、Cereal tracee元数据、GP/XSTATE及
+- v10根对象是小manifest：canonical映射、Cereal tracee元数据、GP/XSTATE及
   按区域/地址排列的页引用。每份页内容用原有StateStore独立保存，不引入父快照链。
 - 页后端默认完整读取支持的私有可读区域，用每个live PID的工作buffer避免
   每次分配/清零整份内存。先做现有rseq归一化，再逐页与上一次不可变页比较；
   **字节相等**才复用已接受的页key。布局/内容变化不会因提示而省略读取。
-- 新增SnapshotView共同读取v7/v8；表达式仅加载涉及的页，直接读到栈上的long。
+- 新增SnapshotView共同读取v9/v10；表达式仅加载涉及的页，直接读到栈上的long。
   maps/元数据检查、范围读取、恢复不再各自解释格式。去掉旧代码中的重复解析分支。
-- v7和v8都保持完整live区域读取，逐页与保存内容比较，只将不同页加入writev。
+- v9和v10都保持完整live区域读取，逐页与保存内容比较，只将不同页加入writev。
   批次持有页owner，淘汰不能使指针悬空；权限、rseq和寄存器恢复保留原契约。
 - 缺页、长度错误、错误内容key及错误manifest范围显式失败。内容key的验证复用
   StateStore已有的保存/加载校验，不对可信不可变buffer重复hash。
@@ -23,7 +23,7 @@
 - 页对象先接受、manifest后接受；冷进程完整读取以completion barrier为界。
   worker实际完成顺序可能不同，没有新增跨sstate与snapshot store的事务保证。
 
-v8在格式内身份确定，**v7/v8 hash不相等**。对照比较解码后的元数据、maps、
+v10在格式内身份确定，**v9/v10 hash不相等**。对照比较解码后的元数据、maps、
 GP/XSTATE、区域属性和全部地址字节，不能用跨格式hash相等作为验收。
 物理TID、跨运行canonicalization和其他原有正确性缺口没有在本次关闭。
 
@@ -41,7 +41,7 @@ baseline读取到clear_refs之间的异步写入窗口未解决，pinned/AIO/设
 
 ## 验证
 
-- `check-page-snapshot`：v7/v8、跨页/相邻区域、cold/tiny缓存、缺页、错误长度和
+- `check-page-snapshot`：flat/pages、跨页/相邻区域、cold/tiny缓存、缺页、错误长度和
   内容key、错误manifest覆盖、持有owner、关闭/reopen、暖缓存sync失败拒绝。
   另以fork+exec后的全新进程在writer barrier后读取全部页，不借用进程内缓存。
 - NP2 `check-capture`：同一组真实ptrace进程跨格式逐字段/逐字节对照，包含
@@ -113,3 +113,5 @@ python3 tests/page_snapshot_benchmark.py --repeats 3 --depth 12
 目录；原版二进制是改造前保存的NP3 tracer。runner另以深度8验证所有模式入口。
 
 本页性能数字来自 I/O 修复前的 v5/v6 实现（commit `1c4e8aa`），不能直接作为 v7/v8 的测量结果。
+
+当前两种格式通过同一个 SnapshotView 读取；FlatMemory/PagedMemory 仅负责提供不可变 chunk。应用投影与 monitor 状态不混入机器快照，后者保存在版本化系统状态中。历史性能数据的格式和语义以各节标注为准。

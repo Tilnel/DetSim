@@ -1,41 +1,30 @@
 #include "emu.h"
 #include "guest.h"
 #include "monitor.h"
-#include <sys/syscall.h>
+#include "plugins.h"
+#include "state/state_view.h"
+#include <cerrno>
+#include <stdexcept>
 
-/* From scheduler.cpp */
-extern void apply_choose(const syscall_info &info, choose_out *out);
-
-choose_func choose_syswhat[450] = {};
 int choose_many[450] = {};
-
 int emu_gettimeofday(struct timeval *tv, struct timezone *tz)
 {
-  /* Ignore tz */
-  int index = ptmc_state.cursor;
-  // ptmc_state.time[index].tv_sec += 1; /* Simulate time passing */
-  struct timeval tracee_tv = ptmc_state.time[index];
-
-  if (ptmc_state.n_choose == 0)
+  int node = ptmc_state.cursor;
+  timeval result = ptmc_state.time[node];
+  unsigned cost = 0;
+  if (ptmc_state.n_choose != 0)
   {
-    // LOG_INFO("gettimeofday: returning simulated time %ld.%06ld", tracee_tv.tv_sec,
-    //          tracee_tv.tv_usec);
-    if (tv && !guest_write_exact(ptmc_state.pids[index], tv, &tracee_tv, sizeof(tracee_tv)))
-      return -EFAULT;
-    return 0;
+    if (ptmc_state.error_bound < 0) throw std::runtime_error("negative model budget");
+    auto choice = detsim::plugins::choose_time(detsim::StateView::stopped_live(), node,
+      ptmc_state.choose, result, static_cast<unsigned>(ptmc_state.error_bound));
+    result = {static_cast<time_t>(choice.value.seconds), choice.value.microseconds};
+    cost = choice.budget_cost;
   }
-
-  choose_in in(ptmc_state.time[index]);
-  choose_func choose = choose_syswhat[SYS_gettimeofday];
-  choose_out *out = choose(ptmc_state.pids[index], ptmc_state.choose, in);
-
-  syscall_info info;
-  info.args[0] = (uintptr_t)tv;
-  info.args[1] = (uintptr_t)tz;
-  apply_choose(info, out);
-
-  ptmc_state.time[index] = *(struct timeval *)out->args[0];
-  int rval = out->rval;
-  delete out;
-  return rval;
+  /* Copy first: a rejected guest pointer must not consume model budget/time. */
+  if (tv && !guest_write_exact(ptmc_state.pids[node], tv, &result, sizeof(result))) return -EFAULT;
+  const struct timezone zero{};
+  if (tz && !guest_write_exact(ptmc_state.pids[node], tz, &zero, sizeof(zero))) return -EFAULT;
+  ptmc_state.time[node] = result;
+  ptmc_state.error_bound -= static_cast<int>(cost);
+  return 0;
 }

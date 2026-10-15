@@ -12,6 +12,7 @@
 
 #include "guest.h"
 #include <climits>
+#include <stdexcept>
 #include "monitor.h"
 #include "dwarf_info.h"
 #include <cstdint>
@@ -107,156 +108,52 @@ def_tracee_get(rdi);
 
 void remove_vdso(int pid)
 {
-  size_t pos;
-  int zeroCount;
-  long val;
-
-  errno = 0;
-  pos = (size_t)ptrace(PTRACE_PEEKUSER, pid, sizeof(long) * RSP, NULL);
-  if (errno != 0) {
-    LOG_ERROR("remove_vdso: PTRACE_PEEKUSER failed for pid %d: %s", 
-              pid, strerror(errno));
-    return;
-  }
-
-  /* skip to auxiliary vector */
-  zeroCount = 0;
-  while (zeroCount < 2)
-  {
+  user_regs_struct regs{};
+  if (ptrace(PTRACE_GETREGS, pid, nullptr, &regs) < 0)
+    throw std::runtime_error("Cannot read initial registers for auxv normalization");
+  auto read_word = [pid](uintptr_t address) {
     errno = 0;
-    val = ptrace(PTRACE_PEEKDATA, pid, pos += 8, NULL);
-    if (errno != 0) {
-      LOG_ERROR("remove_vdso: PTRACE_PEEKDATA failed at %p: %s",
-                (void*)pos, strerror(errno));
-      return;
-    }
-    if (val == 0)
-      zeroCount++;
+    long word = ptrace(PTRACE_PEEKDATA, pid, address, nullptr);
+    if (errno) throw std::runtime_error("Cannot read initial stack auxiliary vector");
+    return uintptr_t(word);
+  };
+  uintptr_t argc = read_word(regs.rsp);
+  if (argc > 1048576) throw std::runtime_error("Invalid initial stack argument count");
+  uintptr_t pos = regs.rsp + (argc + 2) * sizeof(uintptr_t);
+  size_t environment_count = 0;
+  while (read_word(pos)) {
+    if (++environment_count > 1048576)
+      throw std::runtime_error("Unterminated initial stack environment");
+    pos += sizeof(uintptr_t);
   }
-
-  /* search the auxiliary vector for AT_SYSINFO_EHDR... */
-  errno = 0;
-  val = ptrace(PTRACE_PEEKDATA, pid, pos += 8, NULL);
-  if (errno != 0) {
-    LOG_ERROR("remove_vdso: PTRACE_PEEKDATA failed at %p: %s",
-              (void*)pos, strerror(errno));
-    return;
-  }
-  
-  while (1)
-  {
-    if (val == AT_NULL)
-      break;
-    if (val == AT_SYSINFO_EHDR)
-    {
-      /* ... and overwrite it */
-      errno = 0;
-      ptrace(PTRACE_POKEDATA, pid, pos, AT_IGNORE);
-      if (errno != 0) {
-        LOG_ERROR("remove_vdso: PTRACE_POKEDATA failed at %p: %s",
-                  (void*)pos, strerror(errno));
-      }
-      break;
-    }
-    pos += 16;
-    errno = 0;
-    val = ptrace(PTRACE_PEEKDATA, pid, pos, NULL);
-    if (errno != 0) {
-      LOG_ERROR("remove_vdso: PTRACE_PEEKDATA failed at %p: %s",
-                (void*)pos, strerror(errno));
+  pos += sizeof(uintptr_t);
+  for (size_t count = 0; count < 256; ++count, pos += sizeof(Elf64_auxv_t)) {
+    auto type = read_word(pos);
+    if (type == AT_NULL) return; // A static executable need not expose a vDSO.
+    if (type == AT_SYSINFO_EHDR) {
+      if (ptrace(PTRACE_POKEDATA, pid, pos, AT_IGNORE) < 0)
+        throw std::runtime_error("Cannot disable initial stack vDSO entry");
       return;
     }
   }
+  throw std::runtime_error("Unterminated initial stack auxiliary vector");
 }
 
-/* 
- * 定位栈上的 AT_RANDOM
- * 
- * execve 后的栈布局（从高地址到低地址）：
- *   argv[n] = NULL
- *   argv[n-1] ... argv[0]
- *   envp[...] ... envp[0] = NULL
- *   auxv[...] (AT_NULL terminated)
- *   
- * auxv 格式：{a_type, a_val} 的数组
- * AT_RANDOM (25) 的 a_val 指向 16 字节随机数据
- */
 int patch_at_random(pid_t pid) {
-    struct user_regs_struct regs;
-    
-    if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) < 0) {
-        perror("PTRACE_GETREGS");
-        return -1;
-    }
-    
-    /* x86_64: rsp 指向 argc（如果直接 execve）或返回地址（如果通过 libc） */
-    unsigned long stack_top = regs.rsp;
-    LOG_INFO("[*] Stack top (RSP): 0x%lx", stack_top);
-    
-    /* 
-     * 扫描栈找到 auxv 向量
-     * 策略：从 stack_top 向下扫描，寻找 AT_RANDOM (25) 的 a_type
-     * 或者通过 /proc/pid/auxv 直接读取（更简单可靠）
-     */
-    
-    char auxv_path[64];
-    snprintf(auxv_path, sizeof(auxv_path), "/proc/%d/auxv", pid);
-    
-    FILE *f = fopen(auxv_path, "rb");
-    if (!f) {
-        perror("fopen auxv");
-        return -1;
-    }
-    
-    Elf64_auxv_t auxv;
-    unsigned long random_addr = 0;
-    
-    LOG_INFO("[*] Reading auxv from %s", auxv_path);
-    while (fread(&auxv, sizeof(auxv), 1, f) == 1) {
-        if (auxv.a_type == AT_RANDOM) {
-            random_addr = auxv.a_un.a_val;
-            LOG_INFO("[+] Found AT_RANDOM: addr = 0x%lx", random_addr);
-            break;
-        }
-        if (auxv.a_type == AT_NULL) break;
-    }
-    fclose(f);
-    
-    if (!random_addr) {
-        LOG_ERROR("[-] AT_RANDOM not found in auxv");
-        return -1;
-    }
-    
-    /* 读取原始随机值 */
-    unsigned long orig[2];
-    tracee_read_mem(pid, (void *)random_addr, orig, 16);
-    LOG_INFO("[*] Original AT_RANDOM: 0x%016lx%016lx", orig[0], orig[1]);
-    
-    /* 写入确定性随机值 */
-    unsigned long newval[2] = { DETERMINISTIC_RANDOM_0, DETERMINISTIC_RANDOM_1 };
-    
-    tracee_write_mem(pid, (void *)random_addr, newval, 16);
-    
-    return 0;
-}
-
-void patch_cpu_features_elf(pid_t pid) {
-    unsigned long addr = dwarf_get_global_addr("_dl_x86_cpu_features");
-    if (!addr) {
-      LOG_ERROR("[-] Symbol not found");
-      return;
-    }
-    
-    LOG_INFO("[+] _dl_x86_cpu_features at 0x%lx", addr);
-    
-    unsigned long target = addr + 24;
-    unsigned long current = ptrace(PTRACE_PEEKDATA, pid, target, NULL);
-    
-    unsigned long fixed = (current & ~0x00000000FF000000UL) | 0x0000000000000000UL;
-    
-    ptrace(PTRACE_POKEDATA, pid, target, fixed);
-    
-    LOG_INFO("[+] Patched 0x%lx: 0x%lx -> 0x%lx", target, current, fixed);
+  char auxv_path[64];
+  snprintf(auxv_path, sizeof(auxv_path), "/proc/%d/auxv", pid);
+  FILE* input = fopen(auxv_path, "rb");
+  if (!input) return -1;
+  Elf64_auxv_t entry{};
+  uintptr_t address = 0;
+  while (fread(&entry, sizeof(entry), 1, input) == 1) {
+    if (entry.a_type == AT_RANDOM) { address = entry.a_un.a_val; break; }
+    if (entry.a_type == AT_NULL) break;
+  }
+  fclose(input);
+  if (!address) return -1;
+  const uint64_t value[2] = {DETERMINISTIC_RANDOM_0, DETERMINISTIC_RANDOM_1};
+  return guest_write_exact(pid, reinterpret_cast<void*>(address), value, sizeof(value)) ? 0 : -1;
 }
 
 /* ======================================================================
