@@ -52,9 +52,9 @@ runner 只依赖 Python 标准库及已有编译器。不会下载依赖、修�
 | C | GCC14.2 | 通过 | 标记及退出0，搜索完成 |
 | C++ std | GCC14.2 | 通过 | 标记及退出0，搜索完成 |
 | Rust std | rustc1.51.0 | 通过 | full/pages 已完成输出检查及退出0 |
-| Go | gccgo14.2（非标准 gc） | 通过 | pselect6 已支持；现暴露默认虚拟 nanotime 为0，未完成准入 |
-| Python | CPython3.13.5，`-I -S` | 通过 | 已捕获标准库；DFS 内存回退已修复，下一阻塞为 getdents64(217) |
-| Java | OpenJDK21.0.12.1 | 通过 | 已越过链接遍历；现为动态库加载失败，正在验证文件身份问题；条件目标 |
+| Go | gccgo14.2（非标准 gc） | 通过 | pages 已完成输出/退出及3x重放；full 探索完成但全链路验收仍待完成 |
+| Python | CPython3.13.5，`-I -S` | 通过 | 已越过 getdents64；当前因字节码缓存刷新请求 rename(82) |
+| Java | OpenJDK21.0.12.1 | 通过 | 文件身份已修复；当前需补捕获的系统动态库依赖；条件目标 |
 
 这些版本是本机实测，不代表整个语言、其他版本或所有库已受支持。Java 保留正常 JVM/JIT，只显式限制 heap/code cache/class space；没有把 JVM 私有结构补丁放进框架。标准 gc Go 的单独准入目标尚待可用工具链；不能用 gccgo 结果代替它。
 
@@ -105,3 +105,10 @@ DFS 不再为每层祖先长期持有完整文件系统内容。64MiB VFS、44�
 runner新增 `--memory-mb`，默认仍2048，报告保留实际限额；gccgo full工作集实验
 显式使用4096，90秒只走到约100状态而非分配失败，不能算通过。所有成功搜索
 现在额外重放终点前驱三次，保留 `completion.json`；bounded/timeout仍非绿色。
+
+
+kernelv15 增加 getdents64、统一非零 inode 和可配置时钟原点（默认1秒），以及
+Linux已忽略的两个历史mmap标志。getdents原生故障/填充矩阵、真实目录游标恢复、
+两份最小共享库分别加载及默认/零/自定义时钟测试通过。gccgo pages已到正常终点
+并3x恢复重放；full原始探索也到exit0，但原试验驱动丢失，不能据此补造完整验收。
+Python下一步先修输入文件mtime被抹成0的问题，再判断是否仍需rename语义。

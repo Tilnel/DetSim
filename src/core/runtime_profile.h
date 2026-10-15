@@ -5,6 +5,7 @@
 #include <set>
 #include <vector>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 namespace detsim {
@@ -17,6 +18,7 @@ struct RuntimeProfile {
   bool deterministic_at_random;
   bool disable_vdso;
   std::set<int> ignored_signals;
+  int64_t initial_time_us;
 };
 const RuntimeProfile& runtime_profile();
 std::string runtime_profile_identity();

@@ -22,6 +22,7 @@ void *memcpy_guest2host(void *dest, const void *src, size_t n);
  */
 long emu_vfs_openat(int dirfd, const char *path, int flags, mode_t mode);
 long emu_vfs_lseek(int fd, off_t offset, int whence);
+long emu_vfs_getdents64(int fd, void* buffer, unsigned int count);
 long emu_vfs_stat(const char *path, struct stat *statbuf);
 long emu_vfs_statat(int dirfd, const char* path, struct stat* statbuf, int flags);
 long emu_vfs_accessat(int dirfd, const char* path, int mode, int flags);
@@ -110,7 +111,7 @@ struct OpenFileDescription
   // The absolute path of the file in the VFS.
   std::string path;
 
-  // The current read/write offset into the file's content.
+  // Byte offset for files; next ordinal cookie for captured directory entries.
   off_t offset;
 
   template <class Archive>
@@ -182,6 +183,7 @@ class FileSystemState
   long do_readlink(const std::string& path, std::string& target);
   void capture_executable(const std::string& path);
   int do_fstat(int fd, struct stat *statbuf);
+  long do_getdents64(int fd, void* buffer, unsigned int count, pid_t pid);
 
   // Initialize VFS from host mappings (may load files into memory)
   void init_from_mappings(

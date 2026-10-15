@@ -11,6 +11,7 @@
 #include "guest.h"
 #include "io.h"
 #include "state_store.h"
+#include "utils.h"
 #include <mutex>
 #include <algorithm>
 #include <cstring>
@@ -730,7 +731,9 @@ off_t FileSystemState::do_lseek(int fd, off_t offset, int whence)
   {
     case SEEK_SET: break;
     case SEEK_CUR: base = ofd.offset; break;
-    case SEEK_END: base = node.content.size(); break;
+    case SEEK_END:
+      if (S_ISDIR(node.metadata.st_mode)) return -EINVAL;
+      base = node.content.size(); break;
     default: return -EINVAL;
   }
   if (__builtin_add_overflow(base, offset, &new_offset))
@@ -745,7 +748,24 @@ off_t FileSystemState::do_lseek(int fd, off_t offset, int whence)
   return new_offset;
 }
 
-static void copy_vfs_stat(const VFSNode& node, struct stat* statbuf)
+// Captured paths are the supported object identity: hard links, rename and
+// unlink are not modeled. Recompute against the complete saved namespace so
+// creation never renumbers old objects and collisions cannot depend on history.
+static std::map<std::string, uint64_t> vfs_inodes(const std::map<std::string, VFSNode>& filesystem)
+{
+  std::map<std::string, uint64_t> result;
+  std::map<uint64_t, std::string> owners;
+  for (const auto& [path, node] : filesystem) {
+    uint64_t inode = XXHash64::hash(path.data(), path.size());
+    if (!inode) inode = 1;
+    if (!owners.emplace(inode, path).second)
+      throw std::runtime_error("Captured VFS path inode collision");
+    result.emplace(path, inode);
+  }
+  return result;
+}
+
+static void copy_vfs_stat(const VFSNode& node, uint64_t inode, struct stat* statbuf)
 {
 #ifdef FSSTATE_DETAILED_METADATA
   memcpy(statbuf, &node.metadata, sizeof(struct stat));
@@ -755,6 +775,7 @@ static void copy_vfs_stat(const VFSNode& node, struct stat* statbuf)
   statbuf->st_size = node.metadata.st_size;
   statbuf->st_mode = node.metadata.st_mode;
 #endif
+  statbuf->st_ino = inode;
 }
 
 int FileSystemState::do_stat(const std::string &path, struct stat *statbuf, bool follow)
@@ -770,7 +791,7 @@ int FileSystemState::do_stat(const std::string &path, struct stat *statbuf, bool
     return -ENOENT;
   }
 
-  copy_vfs_stat(it->second, statbuf);
+  copy_vfs_stat(it->second, vfs_inodes(filesystem).at(checked), statbuf);
   return 0;
 }
 
@@ -789,8 +810,107 @@ int FileSystemState::do_fstat(int fd, struct stat *statbuf)
   const auto node = filesystem.find(it->second.path);
   if (node == filesystem.end())
     throw std::runtime_error("Open descriptor has no captured payload");
-  copy_vfs_stat(node->second, statbuf);
+  copy_vfs_stat(node->second, vfs_inodes(filesystem).at(node->first), statbuf);
   return 0;
+}
+
+long FileSystemState::do_getdents64(int fd, void* buffer, unsigned int count, pid_t pid)
+{
+  if (!fd_manager_ || !fd_manager_->is_allocated(fd)) return -EBADF;
+  const auto opened = open_files.find(fd);
+  if (opened == open_files.end()) return -ENOTDIR;
+  auto& description = opened->second;
+  const auto node = filesystem.find(description.path);
+  if (node == filesystem.end()) throw std::runtime_error("Directory descriptor has no captured payload");
+  if (!S_ISDIR(node->second.metadata.st_mode)) return -ENOTDIR;
+  if (description.offset < 0) throw std::runtime_error("Negative captured directory cursor");
+  const auto inodes = vfs_inodes(filesystem);
+  struct Entry { std::string name, path; };
+  const auto slash = description.path.find_last_of('/');
+  const std::string parent = slash == 0 ? "/" : description.path.substr(0, slash);
+  std::vector<Entry> entries{{".", description.path}, {"..", parent}};
+  const std::string prefix = description.path == "/" ? "/" : description.path + "/";
+  for (auto it = filesystem.lower_bound(prefix); it != filesystem.end() && it->first.starts_with(prefix); ++it) {
+    const auto name = it->first.substr(prefix.size());
+    if (!name.empty() && name.find('/') == std::string::npos) {
+      // Validate the complete stream before writing even its dot entries.
+      // Captured mapping targets can bypass pathname lookup's NAME_MAX check;
+      // narrowing an oversized record first would wrap its length/count bound.
+      if (name.size() > NAME_MAX || name.find('\0') != std::string::npos)
+        throw std::runtime_error("Invalid captured directory entry name");
+      entries.push_back({name, it->first});
+    }
+  }
+  if (uint64_t(description.offset) >= entries.size()) return 0;
+  const uintptr_t start = reinterpret_cast<uintptr_t>(buffer);
+  // The reserved control page must never be overwritten, even by a later
+  // partial record. Count is the raw unsigned x86-64 syscall argument.
+  if (count && start < scratch_page + 4096 &&
+      (count > UINTPTR_MAX - start || start + count > scratch_page))
+    throw std::runtime_error("getdents64 output overlaps reserved scratch page");
+  std::vector<maps_item> maps;
+  auto scalar = [&](uintptr_t address, const auto& value) {
+    constexpr size_t size = sizeof(value);
+    if (size > UINTPTR_MAX - address) return false;
+    if (address % 4096 + size > 4096) {
+      if (maps.empty()) {
+        auto file = fileutils::open_cfile("/proc/" + std::to_string(pid) + "/maps", "r");
+        if (!file) throw std::runtime_error("Cannot inspect directory scalar mappings");
+        get_maps_item(maps, file.get());
+        if (ferror(file.get()) || maps.empty()) throw std::runtime_error("Cannot read directory scalar mappings");
+      }
+      auto cursor = address;
+      for (const auto& map : maps) {
+        if (map.end <= cursor) continue;
+        if (map.start > cursor || map.flags[1] != 'w') break;
+        cursor = std::min<uint64_t>(map.end, address + size);
+        if (cursor == address + size) break;
+      }
+      if (cursor != address + size) return false;
+    }
+    return guest_write_exact(pid, reinterpret_cast<void*>(address), &value, size);
+  };
+  int remaining = static_cast<int32_t>(count);
+  size_t written = 0, previous = 0;
+  long error = 0;
+  while (uint64_t(description.offset) < entries.size()) {
+    const auto& entry = entries[description.offset];
+    const uint16_t length = (19 + entry.name.size() + 1 + 7) & ~size_t(7);
+    if (length > remaining) { error = -EINVAL; break; }
+    const uintptr_t address = start + written;
+    // Match access_ok's range check without requiring padding to be mapped.
+    if (address < start || address >= (uint64_t(1) << 47) || length > (uint64_t(1) << 47) - address) {
+      error = -EFAULT; break;
+    }
+    const uint64_t cookie = description.offset;
+    const uint64_t inode = inodes.at(entry.path);
+    const auto mode = filesystem.at(entry.path).metadata.st_mode;
+    const uint8_t type = S_ISDIR(mode) ? DT_DIR : S_ISREG(mode) ? DT_REG : S_ISLNK(mode) ? DT_LNK : DT_UNKNOWN;
+    const uint8_t zero = 0;
+    // Linux 6.12 filldir64: previous d_off, inode, reclen, type,
+    // name terminator, name; final d_off is stored on syscall completion.
+    if (!scalar(address - previous + 8, cookie) || !scalar(address, inode) ||
+        !scalar(address + 16, length) || !scalar(address + 18, type) ||
+        !scalar(address + 19 + entry.name.size(), zero) ||
+        !guest_write_exact(pid, reinterpret_cast<void*>(address + 19), entry.name.data(), entry.name.size())) {
+      error = -EFAULT; break;
+    }
+    ++description.offset;
+    previous = length;
+    written += length;
+    remaining -= length;
+  }
+  if (previous) {
+    const uint64_t cookie = description.offset;
+    if (!scalar(start + written - previous + 8, cookie)) return -EFAULT;
+    return written;
+  }
+  return error;
+}
+
+long emu_vfs_getdents64(int fd, void* buffer, unsigned int count)
+{
+  return ptmc_state.fs_states[ptmc_state.cursor].do_getdents64(fd, buffer, count, ptmc_state.pids[ptmc_state.cursor]);
 }
 
 int FileSystemState::do_chdir(const std::string &path)

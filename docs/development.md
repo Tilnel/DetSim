@@ -44,6 +44,7 @@ make check-vfs-content   # immutable file payloads, cold references and branch i
 make check-page-snapshot # flat/page readers, missing/corrupt pages, reopen and poison gates
 make check-syscall-policy check-process-state # NP=2 closed syscall/model gates
 make check-state-view check-plugins check-runtime-profile # NP=2 generic framework gates
+make check-getdents      # NP=2 directory stream ABI, inode identity and partial faults
 make check-io-boundary   # NP=2 mixed descriptors, guest-copy faults and native dispatch
 make check-accept        # NP=2 cross-process accept address/length regressions
 make check-redis         # NP=2 fixed-schedule SET/GET with existing Redis debug binary
@@ -618,7 +619,7 @@ COMPLETED, STOPPED or THREAD_EXITED events. Only COMPLETED has a valid return
 value. Fatal stops clear stale syscall metadata. StateView exposes nullable
 pending result/deadline; CLI history labels pending calls without printing a
 fictional return. ABI1 shared objects must be rebuilt and adapted to phases.
-Flat27/page28 and kernel modelv14 reject incompatible execution contexts.
+Flat27/page28 and kernel modelv15 reject incompatible execution contexts.
 
 Pending I/O keeps its numeric descriptor stable: close, F_SETFL and FIONBIO on a
 referenced FD reject before mutation, pending a true pinned-open-resource model.
@@ -697,3 +698,17 @@ Captured symlinks now resolve component by component with a40-link limit and
 NAME_MAX checking. Relative targets and dotdot preserve traversal order; open
 stores the resolved path. readlink/lstat and O_NOFOLLOW/O_EXCL retain their own
 final-component semantics. No host pathname lookup occurs during exploration.
+
+
+RuntimeProfile.initial_time_us defaults to1000000 and may explicitly be zero.
+It is a deterministic initial machine-clock value included in model identity,
+not automatic elapsed-time progression. Negative, fractional and overflowing
+ktime-range values reject. REALTIME and MONOTONIC still share the existing axis.
+
+getdents64 enumerates saved immediate children with independent saved FD cursors,
+dot entries and lexical order. Record padding remains untouched and native
+partial-fault effects are preserved. Cookies are ordinal and insertion-sensitive;
+rewind enumerates the new saved directory. Directory SEEK_END rejects. Stable
+nonzero path-derived inode values are shared by stat/lstat/fstat/getdents, with
+namespace-wide collision rejection. Rename/hardlink semantics remain unsupported;
+imported host hardlinks are separate path objects. Kernelv15, layout27/28.

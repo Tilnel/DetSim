@@ -228,6 +228,16 @@ int main(int argc, char** argv) {
   std::string default_identity = detsim::runtime_profile_identity();
   require(json::parse(default_identity).at("rseq")=="unavailable-enosys",
           "runtime identity omits rseq availability contract");
+  require(detsim::runtime_profile().initial_time_us == 1000000, "default machine clock origin is nonzero");
+  detsim::configure_runtime_profile({{"initial_time_us", 1234567}});
+  require(detsim::runtime_profile().initial_time_us == 1234567 &&
+          detsim::runtime_profile_identity() != default_identity, "clock origin enters execution identity");
+  detsim::configure_runtime_profile({{"initial_time_us", 0}});
+  require(detsim::runtime_profile().initial_time_us == 0, "explicit zero origin remains reproducible");
+  require(rejected({{"initial_time_us", -1}}), "negative origin rejected");
+  require(rejected({{"initial_time_us", 1.5}}), "fractional origin rejected");
+  require(rejected({{"initial_time_us", uint64_t(-1)}}), "overflowing origin rejected");
+  detsim::configure_runtime_profile(json::object());
   std::vector<int> boundaries(NP, SYS_mprotect);
   detsim::configure_runtime_profile({{"startup_syscalls", boundaries}});
   require(detsim::startup_syscall_for_node(0) == SYS_mprotect, "per-node startup boundary");

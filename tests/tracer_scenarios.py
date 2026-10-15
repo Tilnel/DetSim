@@ -42,7 +42,7 @@ class TracerScenarios(unittest.TestCase):
 
     def run_tracer(self, commands, *, name="probe", batch=False, sibling=False,
                    terminate=False, assertions=(), verify_failure_cleanup=False,
-                   fail_storage_sync=False, extra_env=None, plugins=(), tracee_args=("0",)):
+                   fail_storage_sync=False, extra_env=None, plugins=(), tracee_args=("0",), runtime_profile=None, fsmap=()):
         work = self.root / (name + ("-batch" if batch else "-interactive"))
         work.mkdir()
         binary = work / name
@@ -54,6 +54,8 @@ class TracerScenarios(unittest.TestCase):
             "Addr": ["192.168.0.1"],
             "Assertions": list(assertions),
             "Plugins": list(plugins),
+            "RuntimeProfile": runtime_profile or {},
+            "FSMap": list(fsmap),
         }))
         args = [str(TRACER), "-n", "-c", str(config)]
         if PROFILE:
@@ -329,6 +331,132 @@ int main(void) {
                 extra_env={"DETSIM_SNAPSHOT_BACKEND": backend})
             self.assertEqual(code, 0, output)
             self.assertIn("has exited with status 0", output)
+
+    def test_virtual_clock_origin(self):
+        source = self.root / "clock_origin.c"
+        source.write_text(r"""
+#include <time.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <stdlib.h>
+int main(int argc, char **argv) {
+    (void)argc;
+    long expected = strtol(argv[1], 0, 10);
+    struct timespec mono, real;
+    if (syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &mono) ||
+        syscall(SYS_clock_gettime, CLOCK_REALTIME, &real)) return 70;
+    if (mono.tv_sec*1000000 + mono.tv_nsec/1000 != expected ||
+        real.tv_sec*1000000 + real.tv_nsec/1000 != expected) return 71;
+    return 0;
+}
+""")
+        subprocess.run(shlex.split(os.environ.get("CC", "/usr/bin/gcc")) +
+            ["-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie", str(source),
+             "-o", str(self.root / "probe")], check=True)
+        for backend in ("full", "pages"):
+            for expected, profile in ((1000000, None), (0, {"initial_time_us": 0}),
+                                      (1234567, {"initial_time_us": 1234567})):
+                with self.subTest(backend=backend, expected=expected):
+                    code, output = self.run_tracer("sw 0\nbfs\nsi\nq\n",
+                        name=f"clock_{backend}_{expected}", runtime_profile=profile,
+                        tracee_args=[str(expected)], extra_env={"DETSIM_SNAPSHOT_BACKEND": backend})
+                    self.assertEqual(code, 0, output)
+                    self.assertIn("has exited with status 0", output)
+
+    def test_dynamic_library_file_identity(self):
+        libraries = []
+        # Minimal DSOs isolate file identity: no CRT/BSS tail beyond file backing.
+        # SIGBUS-backed mappings have their own explicit unsupported-policy test.
+        for value in (11, 22):
+            source = self.root / f"library{value}.c"
+            source.write_text(f"int answer(void) {{ return {value}; }}\n")
+            library = self.root / f"library{value}.so"
+            subprocess.run(shlex.split(os.environ.get("CC", "/usr/bin/gcc")) +
+                ["-shared", "-fPIC", "-nostartfiles", str(source), "-o", str(library)], check=True)
+            libraries.append(library)
+        source = self.root / "libraries.c"
+        source.write_text(r"""
+#include <dlfcn.h>
+int main(int argc, char **argv) {
+    (void)argc;
+    void *one = dlopen(argv[1], RTLD_NOW|RTLD_LOCAL);
+    if (!one) return 70;
+    int (*first)(void) = (int (*)(void))dlsym(one, "answer");
+    if (!first || first() != 11) return 71;
+    void *two = dlopen(argv[2], RTLD_NOW|RTLD_LOCAL);
+    if (!two) return 72;
+    int (*second)(void) = (int (*)(void))dlsym(two, "answer");
+    if (!second || second() != 22 || first() != 11) return 73;
+    return 0;
+}
+""")
+        subprocess.run(shlex.split(os.environ.get("CC", "/usr/bin/gcc")) +
+            ["-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie", str(source),
+             "-ldl", "-o", str(self.root / "probe")], check=True)
+        subprocess.run([str(self.root / "probe"), *map(str, libraries)], check=True, timeout=5)
+        mappings = [{"Host": str(path), "Target": str(path)} for path in libraries]
+        for backend in ("full", "pages"):
+            code, output = self.run_tracer("sw 0\nbfs\nsi\nq\n", name="libraries_" + backend,
+                tracee_args=list(map(str, libraries)), fsmap=mappings,
+                extra_env={"DETSIM_SNAPSHOT_BACKEND": backend})
+            self.assertEqual(code, 0, output)
+            self.assertIn("has exited with status 0", output)
+
+    def test_directory_cursor_restore(self):
+        directory = self.root / "listing"
+        directory.mkdir()
+        (directory / "entry").write_text("captured input")
+        source = self.root / "directory.c"
+        source.write_text(r"""
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <string.h>
+#include <unistd.h>
+volatile int observed;
+static char bytes[64];
+int main(int argc, char **argv) {
+    (void)argc;
+    int fd = open(argv[1], O_RDONLY|O_DIRECTORY);
+    if (fd < 0) return 70;
+    if (syscall(SYS_getdents64, fd, bytes, 24) != 24 || strcmp(bytes+19, ".")) return 71;
+    if (syscall(SYS_getdents64, fd, bytes, 24) != 24 || strcmp(bytes+19, "..")) return 72;
+    observed=2; write(1, "directory", 9);
+    if (lseek(fd, 0, SEEK_SET) != 0 || syscall(SYS_getdents64, fd, bytes, 24) != 24 || strcmp(bytes+19, ".")) return 73;
+    observed=3; write(1, "rewound", 7);
+    close(fd); return 0;
+}
+""")
+        subprocess.run(shlex.split(os.environ.get("CC", "/usr/bin/gcc")) +
+            ["-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie", str(source),
+             "-o", str(self.root / "probe")], check=True)
+        subprocess.run([str(self.root / "probe"), str(directory)], check=True, timeout=5,
+                       stdout=subprocess.DEVNULL)
+
+        def scenario(send):
+            send("sw 0"); send("si")
+            self.assertRegex(send("si"), r"getdents64.*= 24")
+            saved = re.findall(r"=> ([0-9a-f]{16})", send("info"))[-1]
+            successor = None
+            for attempt in range(4):
+                if attempt:
+                    self.assertIn("Loaded state", send("load " + saved))
+                self.assertRegex(send("si"), r"getdents64.*= 24")
+                send("si")
+                self.assertIn("observed = 2", send("p observed"))
+                actual = re.findall(r"=> ([0-9a-f]{16})", send("info"))[-1]
+                if successor is None:
+                    successor = actual
+                self.assertEqual(actual, successor)
+            for _ in range(3):
+                send("si")
+            self.assertIn("observed = 3", send("p observed"))
+            send("si"); send("si")
+            self.assertIn("has exited with status 0", send("si"))
+        for backend in ("full", "pages"):
+            code, output = self.run_tracer(scenario, name="directory_" + backend,
+                tracee_args=[str(directory)], fsmap=[{"Host": str(directory), "Target": str(directory)}],
+                extra_env={"DETSIM_SNAPSHOT_BACKEND": backend})
+            self.assertEqual(code, 0, output)
 
     def test_interactive_initial_state_and_clean_exit(self):
         code, output = self.run_tracer("sw 0\np counter\nq\n")

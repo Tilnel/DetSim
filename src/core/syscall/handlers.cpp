@@ -241,6 +241,11 @@ int handle(pid_t pid, syscall_info &info) {
                 info.nr == SYS_faccessat2 ? static_cast<int>(info.args[3]) : 0);
             tracee_set_rax(pid,result); info.rval=result; return CKPT_YES;
         }
+        case SYS_getdents64: {
+            const long result=emu_vfs_getdents64(static_cast<int>(info.args[0]),
+                reinterpret_cast<void*>(info.args[1]),static_cast<unsigned int>(info.args[2]));
+            tracee_set_rax(pid,result);info.rval=result;return CKPT_YES;
+        }
         case SYS_readlink:
         case SYS_readlinkat: {
             const bool at = info.nr == SYS_readlinkat;

@@ -223,6 +223,17 @@ int main() {
         check(!result.rejected && result.value == -EINVAL,
               "zero-length file mmap with valid descriptor returns EINVAL");
         ptmc_state.fd_managers[0]->release_fd(virtual_file);
+        for (int legacy : {MAP_DENYWRITE, MAP_EXECUTABLE, MAP_DENYWRITE|MAP_EXECUTABLE}) {
+            void* native=mmap(nullptr,4096,PROT_READ|PROT_WRITE,
+                MAP_PRIVATE|MAP_ANONYMOUS|legacy,-1,0);
+            check(native!=MAP_FAILED,"native obsolete mmap flags are ignored");
+            if (native!=MAP_FAILED) munmap(native,4096);
+            const auto ignored=execute(dispatcher,child,SYS_mmap,
+                {0,4096,PROT_READ|PROT_WRITE,uint64_t(MAP_PRIVATE|MAP_ANONYMOUS|legacy),uint64_t(-1),0});
+            check(!ignored.rejected && ignored.value>0,"obsolete mmap flags preserve private mapping behavior");
+            if (!ignored.rejected && ignored.value>0)
+                execute(dispatcher,child,SYS_munmap,{uint64_t(ignored.value),4096,0,0,0,0});
+        }
         const auto mapping = execute(dispatcher, child, SYS_mmap,
                                      {0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
                                       uint64_t(-1), 0});

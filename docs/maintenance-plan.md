@@ -1170,3 +1170,31 @@ blockedthreads; Java bothbackendsexit6 after libjvm dlopen (fileidentityhypothes
 No newruntimegreen exceptRust. Next generic fixes: initialvirtualclock profile,
 consistent file inode identity/getdents64, then actual next blockers. Logs:
 /tmp/detsim-iteration4-{final-np1,final-np2,runtime-audit,runner,check}.log.
+
+## Runtime iteration5: directory/identity/time (2026-10-16)
+
+Changes: native-ABI getdents64 with saved cursor, stable nonzero path inode shared
+by metadata interfaces with collision checks, initial_time_us profile default1s,
+and admission of ignored MAP_DENYWRITE/EXECUTABLE. No new snapshot fields; kernelv15,
+layout27/28. No automatic clock advance or host FS fallback.
+
+RED: missing getdents217, zero-clock runtime/native test, zero-inode tinyDSO
+misidentification, legacy mmapflags rejection. GREEN:24native scenarios (directory
+restore3x full/pages, sixclockorigin profiles, distinctDSOs),12case rows and strict
+runner completion replays; makecheck9/10; NP2getdents/IO/runtime-profile/syscall
+policy gates. Native protections0..72byte getdents fault matrix preservespadding;
+review caught long-name reclen overflow, fixed256/65536/NUL namespace rejection
+beforeoutput/cursor. Independent getdents/clock review approves. GCC diagnostics,
+Python compile and gitdiffcheck pass; production NP1/NP2 builds pass.
+
+Artifacts: /tmp/detsim-iteration5-{gates,cases,check,native-green}.log,
+/tmp/detsim-clock-inode-{red,green}.log, /tmp/detsim-mmap-legacy-red.log.
+Detached runtime jobs retain PID/status records under build/case-jobs to survive
+API continuation. gccgo pages build/cases/run-wdlz2ra9 results pass native/control/
+search/zeroexit+3xterminalreplay,235visited. Original full tracer (driver lost at
+model handover) did continue and complete233states/exit0,417.95s includinghistory,
+then cleanup; because it lacks final controlled replay it is NOT countedpassed.
+Python build/cases/run-p_yrccpj reachesrename82; source timestamp1786363619 matches
+pyc header, but current modelstatmtime0 explains unnecessary regeneration. Java
+build/cases/run-7g51scz3 reaches55states thenexit6: libstdc++.so.6 notincapturedrootfs.
+Continue those actual blockers, not artificial success or skipping runtime work.

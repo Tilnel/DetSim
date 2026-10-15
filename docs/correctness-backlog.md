@@ -448,3 +448,33 @@ needs an explicit generic profile decision.4GiB full run avoids earlierallocatio
 failure but hits90s bound, not successful admission. Java reaches dlopen(libjvm)
 then exits6 with undefined JNI_CreateJavaVM; zero virtual inode metadata is the
 next concrete hypothesis. Neither result is counted green.
+
+### Directory streams, file identity and clock origin
+
+getdents64 now enumerates saved names/types with independent serialized ordinal
+FD cookies. Native field ordering, untouched padding and completed-record partial
+fault behavior are covered, including21/46 writable-byte boundary successes.
+Malformed long/NUL namespace names reject before mutation. stat/lstat/fstat and
+dirent share nonzero path-derived inodes and reject namespace-wide collisions.
+This models path objects while rename/hardlink remain unsupported; it is not
+host-hardlink fidelity. Directory insertion may affect ordinal scan position.
+
+A real two-DSO native regression proved zero inode caused the loader to reuse
+an unrelated loaded object; current minimal DSOs load independently. Fixture
+omits CRT to isolate identity from SIGBUS-backed EOF-tail support, still rejected.
+Linux-ignored MAP_DENYWRITE/EXECUTABLE flags have native and model oracles.
+
+Virtual initial_time_us defaults to1s and is explicitly configurable including0;
+its value enters model identity. This fixes gccgo's fatal zero nanotime without
+automatic time advance or runtime-private patches. Kernelv15, layout27/28.
+24 native scenarios,12case rows, getdents/IO/syscall-policy/runtime-profile gates
+pass, with independent review and native RED/GREEN evidence.
+
+Python now reaches rename82 because current minimal stat drops imported mtime,
+invalidating bytecode caches whose header timestamps actually match host sources.
+Preserving semantic mtime is the next direct input-fidelity fix. gccgo pages
+completes+3x replay (235visited); full raw run reaches exit0 but original driver
+was lost, so full checked-replay admission remains unproven. History rendering
+also rereads large snapshots after exploration and in info, a measured next
+control-chain cost. Java advances beyond libjvm identity to missing captured
+libstdc++ dependency, still non-green rather than JVM admission.

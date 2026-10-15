@@ -471,6 +471,10 @@ static void init_tracee_state(int index)
   int pid = pids[index];
   int wstatus = 0;
   const auto& profile = detsim::runtime_profile();
+  // A deterministic machine clock origin, configurable independently of the
+  // target. Nonzero by default; this is not automatic elapsed-time advancement.
+  ptmc_state.time[index] = {profile.initial_time_us / 1000000,
+                           profile.initial_time_us % 1000000};
   const int stop_nr = detsim::startup_syscall_for_node(index);
   LOG_INFO("Startup prelude boundary: syscall %d (limit %zu)",
            stop_nr, profile.startup_syscall_limit);

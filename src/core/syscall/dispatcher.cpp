@@ -152,6 +152,7 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         case SYS_lstat:
         case SYS_readlink:
         case SYS_readlinkat:
+        case SYS_getdents64:
         case SYS_access:
         case SYS_faccessat:
         case SYS_faccessat2:
@@ -167,7 +168,7 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         case SYS_socketpair: case SYS_shutdown:
         case SYS_ppoll: case SYS_select:
         case SYS_sendfile: case SYS_splice: case SYS_tee: case SYS_vmsplice: case SYS_copy_file_range:
-        case SYS_getdents: case SYS_getdents64: case SYS_ftruncate:
+        case SYS_getdents: case SYS_ftruncate:
         case SYS_fchdir: case SYS_flock: case SYS_sync: case SYS_syncfs:
         case SYS_readahead: case SYS_fadvise64:
         case SYS_eventfd: case SYS_eventfd2:
@@ -390,6 +391,7 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
         case SYS_lstat:
         case SYS_readlink:
         case SYS_readlinkat:
+        case SYS_getdents64:
         case SYS_access:
         case SYS_faccessat:
         case SYS_faccessat2:
@@ -464,7 +466,10 @@ void SyscallDispatcher::handle_mmap_enter(pid_t pid, syscall_info& info)
         return;
     }
     const int flags=static_cast<int>(info.args[3]);
-    constexpr int supported_flags=MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED|MAP_FIXED_NOREPLACE|MAP_STACK|MAP_NORESERVE;
+    // Linux ignores these historical loader flags; admitting them does not
+    // introduce shared mappings or change the captured backing contract.
+    constexpr int supported_flags=MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED|MAP_FIXED_NOREPLACE|
+        MAP_STACK|MAP_NORESERVE|MAP_DENYWRITE|MAP_EXECUTABLE;
     if (!(flags&MAP_PRIVATE) || (flags&~supported_flags) ||
         (info.args[2] && !(info.args[2]&PROT_READ)) ||
         (!info.args[2] && !(flags&MAP_ANONYMOUS)) ||
