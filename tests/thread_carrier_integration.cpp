@@ -54,6 +54,7 @@ static void run_case(bool syscall_exit)
             PROT_READ | PROT_WRITE | PROT_EXEC, MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
         if (page == MAP_FAILED) _exit(3);
         std::memset(page, 0xa5, 4096);
+        if (syscall(SYS_set_robust_list, nullptr, 24)) _exit(91);
         if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr)) _exit(4);
         asm volatile("int3");
         syscall(SYS_getpid);

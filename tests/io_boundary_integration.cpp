@@ -90,6 +90,18 @@ static long execute(SyscallDispatcher& dispatcher,pid_t pid,int number,
     ptrace(PTRACE_SETREGS,pid,nullptr,&original);
     return static_cast<long>(registers.rax);
 }
+static bool mapping_entry_rejected(SyscallDispatcher& dispatcher,pid_t pid,int number,
+                                   uint64_t address,uint64_t length,uint64_t operation) {
+    user_regs_struct before{},after{};
+    if(ptrace(PTRACE_GETREGS,pid,nullptr,&before)) throw std::runtime_error("read admission registers");
+    syscall_info info{};info.nr=number;info.args[0]=address;info.args[1]=length;info.args[2]=operation;
+    bool rejected=false;
+    try {dispatcher.on_enter(pid,number,info);}
+    catch(const std::runtime_error&) {rejected=true;}
+    if(ptrace(PTRACE_GETREGS,pid,nullptr,&after)) throw std::runtime_error("read rejected registers");
+    if(memcmp(&before,&after,sizeof before)) throw std::runtime_error("mapping admission changed registers");
+    return rejected;
+}
 int main() {
     pid_t children[NP]{};
     try {
@@ -155,7 +167,106 @@ int main() {
         iovec change_local{&replacement,1},change_remote{reinterpret_cast<void*>(mapping),1};
         check(process_vm_writev(children[0],&change_local,1,&change_remote,1,0)==-1,
               "virtual mmap restores read-only protection");
+        check(mapping_entry_rejected(dispatcher,children[0],SYS_madvise,mapping,4096,MADV_DONTNEED),
+              "virtual file mapping cannot be discarded as host-anonymous memory");
+        check(mapping_entry_rejected(dispatcher,children[0],SYS_mprotect,mapping,4096,PROT_NONE),
+              "virtual file mapping cannot become an anonymous guard");
+        check(process_vm_readv(children[0],&map_local,1,&map_remote,1,0)==12 &&
+              !memcmp(mapped_bytes,"mapping-data",12),"rejected virtual mapping mutation preserves bytes");
         execute(dispatcher,children[0],SYS_munmap,{uint64_t(mapping),4096,0,0,0,0});
+        // Keep the logical backing provenance despite the anonymous host VMA.
+        // Exercise page-rounded holes and replacement mappings through real
+        // syscall entry/exit, not direct interval bookkeeping alone.
+        std::vector<char> file_pages(3*4096,'v');
+        check(fs.do_lseek(mapped,0,SEEK_SET)==0 &&
+              fs.do_write(mapped,file_pages.data(),file_pages.size())==long(file_pages.size()),
+              "prepare three-page virtual file");
+        const long range=execute(dispatcher,children[0],SYS_mmap,
+            {0,3*4096,PROT_READ|PROT_WRITE,MAP_PRIVATE,uint64_t(mapped),0});
+        check(range>0 && fs.virtual_file_mappings==std::map<uint64_t,uint64_t>{{uint64_t(range),uint64_t(range)+3*4096}},
+              "virtual mapping provenance records exact rounded interval");
+        const auto mapped_archive=archive(fs);
+        FileSystemState copied_fs=fs;
+        copied_fs.remove_virtual_file_mapping(range,range+4096);
+        check(fs.overlaps_virtual_file_mapping(range,range+4096) &&
+              !copied_fs.overlaps_virtual_file_mapping(range,range+4096) && archive(copied_fs)!=mapped_archive,
+              "virtual mapping provenance is branch-isolated semantic state");
+        FileSystemState restored_fs;
+        std::istringstream mapping_input(mapped_archive);
+        {cereal::BinaryInputArchive input(mapping_input);input(restored_fs);}
+        restored_fs.set_fd_manager(ptmc_state.fd_managers[0]);
+        fs=restored_fs;
+        check(archive(fs)==mapped_archive &&
+              mapping_entry_rejected(dispatcher,children[0],SYS_madvise,range,4096,MADV_DONTNEED) &&
+              mapping_entry_rejected(dispatcher,children[0],SYS_mprotect,range,4096,PROT_NONE),
+              "deserialized mapping provenance restores both admission restrictions");
+        check(execute(dispatcher,children[0],SYS_mmap,
+                  {uint64_t(range),4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,uint64_t(-1),0})==-EEXIST &&
+              archive(fs)==mapped_archive,"failed anonymous replacement preserves virtual mapping provenance");
+        check(execute(dispatcher,children[0],SYS_mmap,
+                  {uint64_t(range)+1,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,uint64_t(-1),0})==-EINVAL &&
+              archive(fs)==mapped_archive,"failed fixed mmap preserves virtual mapping provenance");
+        check(execute(dispatcher,children[0],SYS_munmap,{uint64_t(range)+1,4096,0,0,0,0})==-EINVAL &&
+              archive(fs)==mapped_archive,"failed munmap preserves virtual mapping provenance");
+        check(execute(dispatcher,children[0],SYS_munmap,{uint64_t(range)+4096,1,0,0,0,0})==0 &&
+              fs.virtual_file_mappings==std::map<uint64_t,uint64_t>{
+                  {uint64_t(range),uint64_t(range)+4096},
+                  {uint64_t(range)+8192,uint64_t(range)+12288}},
+              "partial munmap splits virtual provenance with kernel page rounding");
+        check(execute(dispatcher,children[0],SYS_mmap,
+                  {uint64_t(range),1,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,uint64_t(-1),0})==range &&
+              !fs.overlaps_virtual_file_mapping(range,range+4096) &&
+              fs.overlaps_virtual_file_mapping(range+8192,range+12288),
+              "successful anonymous fixed mmap removes only replaced provenance");
+        const char dirty='d';copy_to(children[0],reinterpret_cast<void*>(range),&dirty,1);
+        check(execute(dispatcher,children[0],SYS_madvise,{uint64_t(range),4096,MADV_DONTNEED,0,0,0})==0,
+              "genuinely anonymous replacement accepts discard");
+        char zero=1;
+        check(guest_read_exact(children[0],reinterpret_cast<void*>(range),&zero,1) && zero==0,
+              "anonymous discard uses kernel zero-fill semantics");
+        check(execute(dispatcher,children[0],SYS_mprotect,{uint64_t(range),4096,PROT_NONE,0,0,0})==0 &&
+              execute(dispatcher,children[0],SYS_mprotect,{uint64_t(range),4096,PROT_READ|PROT_WRITE,0,0,0})==0,
+              "genuinely anonymous replacement accepts guard protection");
+        check(execute(dispatcher,children[0],SYS_mmap,
+                  {uint64_t(range)+4096,4096,PROT_READ,MAP_PRIVATE|MAP_FIXED,uint64_t(mapped),4096})==range+4096 &&
+              fs.virtual_file_mappings==std::map<uint64_t,uint64_t>{{uint64_t(range)+4096,uint64_t(range)+12288}},
+              "virtual fixed mmap restores and canonically merges backing provenance");
+        check(fs.do_close(mapped)==0 &&
+              mapping_entry_rejected(dispatcher,children[0],SYS_madvise,range+4096,4096,MADV_DONTNEED),
+              "closing virtual descriptor does not lose mapping provenance");
+        check(execute(dispatcher,children[0],SYS_munmap,{uint64_t(range),12288,0,0,0,0})==0 &&
+              fs.virtual_file_mappings.empty(),"complete munmap removes remaining backing provenance");
+        // brk shrink removes VMAs even if a MAP_FIXED virtual-file mapping
+        // replaced part of the grown heap. Snapshot capture normally refreshes
+        // child.brk between transitions; this dispatcher fixture does so explicitly.
+        const uint64_t old_break=execute(dispatcher,children[0],SYS_brk,{0,0,0,0,0,0});
+        const uint64_t heap_page=(old_break+4095)&~uint64_t(4095);
+        const uint64_t grown_break=heap_page+8192;
+        ptmc_state.running_state.child[0].brk=old_break;
+        check(uint64_t(execute(dispatcher,children[0],SYS_brk,{grown_break,0,0,0,0,0}))==grown_break,
+              "grow heap for fixed virtual mapping");
+        ptmc_state.running_state.child[0].brk=grown_break;
+        const int heap_file=fs.do_open("/mapped",O_RDONLY,0);
+        check(execute(dispatcher,children[0],SYS_mmap,
+                  {heap_page+4096,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_FIXED,uint64_t(heap_file),0})==long(heap_page+4096) &&
+              fs.overlaps_virtual_file_mapping(heap_page+4096,grown_break),
+              "virtual fixed mapping inside grown heap records provenance");
+        const auto heap_archive=archive(fs);
+        check(uint64_t(execute(dispatcher,children[0],SYS_brk,{0,0,0,0,0,0}))==grown_break &&
+              archive(fs)==heap_archive,"query brk preserves virtual provenance");
+        check(uint64_t(execute(dispatcher,children[0],SYS_brk,{1,0,0,0,0,0}))==grown_break &&
+              archive(fs)==heap_archive,"failed brk preserves virtual provenance");
+        check(uint64_t(execute(dispatcher,children[0],SYS_brk,{old_break,0,0,0,0,0}))==old_break &&
+              fs.virtual_file_mappings.empty(),"brk shrink removes virtual provenance with removed heap pages");
+        ptmc_state.running_state.child[0].brk=old_break;
+        check(uint64_t(execute(dispatcher,children[0],SYS_brk,{grown_break,0,0,0,0,0}))==grown_break &&
+              !fs.overlaps_virtual_file_mapping(heap_page+4096,grown_break),
+              "regrown heap has no stale virtual backing provenance");
+        ptmc_state.running_state.child[0].brk=grown_break;
+        check(uint64_t(execute(dispatcher,children[0],SYS_brk,{old_break,0,0,0,0,0}))==old_break,
+              "restore original heap extent");
+        ptmc_state.running_state.child[0].brk=old_break;
+        fs.do_close(heap_file);
         fs.ensure_dir_exists("/");fs.ensure_dir_exists("/dir");
         const int directory=fs.do_open("/dir",O_RDONLY|O_DIRECTORY,0);
         const char relative[]="child";

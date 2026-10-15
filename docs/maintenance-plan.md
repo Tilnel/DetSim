@@ -849,3 +849,51 @@ Full rseq critical-section semantics are explicitly outside this environment.
 Auxv size/alignment hints are retained; the model is syscall-unavailable, not a
 claim to reproduce every property of CONFIG_RSEQ=n. Full pthread support remains
 blocked by additional generic Linux task/futex/signal lifecycle work.
+
+## Pthread lifecycle delivery (2026-10-16)
+
+Changes span thread_pool/control/state.h (logical robust registration and non-PI
+owner-death), dispatcher/handlers/fsstate (anonymous discard and archived virtual
+file mapping provenance), state_transition (startup ABI and owned-thread cleanup),
+StateView, and focused native regressions. Reuses ordinary memory snapshots,
+FutexState shared/private queues and existing mapping restore. Removes the old
+blanket nonempty robust-list rejection and leader-only termination wait; no
+pthread-private layout patches or new dependency are introduced.
+
+Reproduced failures before the fixes:
+- set_robust_list rejected as syscall273; pthread exit later rejected madvise28.
+- Virtual file mmap appeared anonymous in /proc and wrongly admitted discard and
+  guard conversion; brk shrink also left stale provenance.
+- The real pthread workload reached exit0 but tracer q hung. strace showed kill
+  followed by leader-only wait while a retained ptraced worker remained unreaped.
+
+Verification with CC=/usr/bin/gcc and CXX=/usr/bin/g++:
+- `make check`: nine component and ten build-contract tests pass.
+- `make NP=1 -j4 check-thread-robust check-thread-lifecycle check-thread-control
+  check-thread-carrier check-thread-identity check-thread-tid
+  check-thread-signal-mask check-futex check-futex-snapshot check-exec
+  check-state-io check-mappings check-page-snapshot check-scenarios` passes.
+  Robust4 backend/cache variants include eight native owner-death oracles,
+  pending-zero wake, PI preflight, group ordering/aliasing and bootstrap adoption.
+- `make NP=2 -j4 check-runtime-profile check-syscall-policy check-process-state
+  check-capture check-state-view check-plugins check-io-boundary check-accept
+  check-redis` passes. Provenance is checked in real mmap/munmap/brk operations,
+  branch copy/archive and full-process persisted restore plus discard rejection.
+- Fifteen native scenarios pass. The new libc pthread workload checks three
+  create/join generations, TLS isolation, robust EOWNERDEAD recovery and mutex/
+  condition wait/signal. Full/pages x normal/SIGTERM cleanup all end correctly
+  with every retained physical TID gone. Unrelated-sibling gates still pass.
+- Startup group/session escape regression passes; the final scenario gate was
+  rerun after this fix. Strict GCC syntax checks and git diff --check pass;
+  dispatcher syntax suppresses only pre-existing unused-parameter warnings.
+  Independent read-only design and final review found no remaining blockers.
+- NP1/NP2/NP3 production builds pass. Raft depth8 full/pages both visit2,582 states
+  with1,347new; single-run throughput372/521 states/s. Artifacts
+  build/pthread-lifecycle-raft{,-pages}. These samples do not prove performance
+  equivalence. The standalone pthread/strace artifacts are in build/pthread-lifecycle.
+
+Flat21/page22 and kernel modelv9 carry the new state contract. Remaining limits:
+PI/timed futexes, cancellation, asynchronous delivery, full rseq semantics,
+mutable file coherence, broader madvise behavior, process trees and exhaustive
+thread/shared-memory interleavings. Successful pthread scenarios certify their
+controlled paths, not unrestricted pthread or Go runtime support.

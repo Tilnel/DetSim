@@ -11,6 +11,9 @@
 #include <sys/ptrace.h>
 #include <sys/user.h>
 #include <vector>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 void verify_stopped_thread_set(pid_t main_pid, std::span<const pid_t> expected)
 {
@@ -34,6 +37,7 @@ void verify_stopped_thread_set(pid_t main_pid, std::span<const pid_t> expected)
     for (pid_t tid : threads) {
         require_no_pending_signals(tid);
         require_no_rseq(tid);
+        require_no_native_robust_list(tid);
     }
     // Detect a concurrent clone/exit between enumeration and register checks.
     if (get_thread_list(main_pid) != threads)
@@ -87,4 +91,20 @@ void require_no_rseq(pid_t tid)
     throw std::runtime_error("Cannot inspect thread rseq registration: PTRACE_GET_RSEQ_CONFIGURATION is required");
   if (configuration.rseq_abi_pointer || configuration.rseq_abi_size)
     throw std::runtime_error("Unsupported active rseq registration in rseq-unavailable model");
+}
+
+uint64_t read_thread_robust_list(pid_t tid)
+{
+    robust_list_head* head = nullptr;
+    size_t length = 0;
+    if (syscall(SYS_get_robust_list, tid, &head, &length) != 0 ||
+        length != sizeof(robust_list_head))
+        throw std::runtime_error("Cannot inspect native thread robust-list registration");
+    return reinterpret_cast<uint64_t>(head);
+}
+
+void require_no_native_robust_list(pid_t tid)
+{
+    if (read_thread_robust_list(tid))
+        throw std::runtime_error("Thread carrier has unadopted native robust-list registration");
 }

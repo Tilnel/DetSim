@@ -14,5 +14,7 @@ void write_thread_signal_mask(pid_t tid, uint64_t mask);
 void require_no_pending_signals(pid_t tid);
 // The modeled kernel never supports rseq; active native registration is an error.
 void require_no_rseq(pid_t tid);
+uint64_t read_thread_robust_list(pid_t tid);
+void require_no_native_robust_list(pid_t tid);
 
 #endif

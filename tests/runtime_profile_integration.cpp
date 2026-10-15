@@ -107,6 +107,32 @@ static void check_startup_exit_diagnostic() {
   cleanup();
 }
 alignas(32) static std::array<unsigned char,32> startup_rseq_area{};
+static void check_startup_group_isolation() {
+  const auto parent_group=getpgrp();
+  for (int number : {SYS_setpgid,SYS_setsid}) {
+    const pid_t pid=fork();require(pid>=0,"fork group prelude fixture");
+    if (!pid) {
+      if (setpgid(0,0) || ptrace(PTRACE_TRACEME,0,nullptr,nullptr)) _exit(109);
+      asm volatile("int3");
+      syscall(number,0,parent_group);_exit(110);
+    }
+    auto cleanup=[&] {kill(pid,SIGKILL);waitpid(pid,nullptr,0);};
+    try {
+      int status=0;
+      require(waitpid(pid,&status,0)==pid && WIFSTOPPED(status),"group prelude stop");
+      require(ptrace(PTRACE_SETOPTIONS,pid,nullptr,PTRACE_O_TRACESYSGOOD|PTRACE_O_EXITKILL)==0,
+              "group prelude options");
+      bool refused=false;
+      try {extract_one_syscall(pid);}
+      catch(const std::runtime_error& error) {
+        refused=std::string(error.what()).find("owned process group")!=std::string::npos;
+      }
+      require(refused && getpgid(pid)==pid,"prelude changed process group before rejection");
+    } catch (...) {cleanup();throw;}
+    cleanup();
+  }
+}
+static uint64_t startup_robust_head[3]{},startup_robust_out=0,startup_robust_length=0;
 static uint32_t startup_tid_word=0xaabbccdd;
 static volatile long startup_tid_result=0;
 static uint64_t startup_new_mask=uint64_t{1}<<(SIGUSR2-1),startup_old_mask=0;
@@ -123,10 +149,13 @@ static void check_startup_tid_contract() {
     auto* code=reinterpret_cast<unsigned char*>(scratch_page+0xff0);code[0]=0x0f;code[1]=0x05;
     const uint64_t inherited=uint64_t{1}<<(SIGUSR1-1);
     if (syscall(SYS_rt_sigprocmask,SIG_SETMASK,&inherited,nullptr,8)) _exit(106);
+    if (syscall(SYS_set_robust_list,nullptr,24)) _exit(108);
     if (ptrace(PTRACE_TRACEME,0,nullptr,nullptr)) _exit(105);
     asm volatile("int3");
     syscall(SYS_rseq,startup_rseq_area.data(),32,0,RSEQ_SIG);
     syscall(SYS_rseq,reinterpret_cast<void*>(1),UINT32_MAX,UINT32_MAX,0);
+    syscall(SYS_set_robust_list,startup_robust_head,24);
+    syscall(SYS_get_robust_list,0,&startup_robust_out,&startup_robust_length);
     startup_tid_result=syscall(SYS_set_tid_address,&startup_tid_word);
     syscall(SYS_gettid);syscall(SYS_getpid);
     syscall(SYS_rt_sigprocmask,SIG_BLOCK,&startup_new_mask,&startup_old_mask,8);_exit(0);
@@ -150,6 +179,18 @@ static void check_startup_tid_contract() {
     require(ptrace(PTRACE_GET_RSEQ_CONFIGURATION,pid,reinterpret_cast<void*>(sizeof(rseq_configuration)),
                    &rseq_configuration)==sizeof(rseq_configuration) && !rseq_configuration.rseq_abi_pointer,
             "prelude leaked a native rseq registration");
+    const auto robust_set=extract_one_syscall(pid),robust_get=extract_one_syscall(pid);
+    uint64_t robust_out=0,robust_size=0;
+    require(robust_set.nr==SYS_set_robust_list && robust_set.rval==0 &&
+            robust_get.nr==SYS_get_robust_list && robust_get.rval==0 &&
+            guest_read_exact(pid,&startup_robust_out,&robust_out,sizeof(robust_out)) &&
+            guest_read_exact(pid,&startup_robust_length,&robust_size,sizeof(robust_size)) &&
+            robust_out==reinterpret_cast<uint64_t>(startup_robust_head) && robust_size==24 &&
+            ptmc_state.running_state.child[0].threads[0].robust_list_head==robust_out,
+            "prelude robust-list registration or query lost logical state");
+    void* actual_robust=nullptr;size_t actual_length=0;
+    require(syscall(SYS_get_robust_list,pid,&actual_robust,&actual_length)==0 && !actual_robust,
+            "prelude installed actual host robust list");
     auto registration=extract_one_syscall(pid);
     require(registration.nr==SYS_set_tid_address && registration.rval==uint64_t(logical_process_id(0)),
             "prelude set_tid_address returned a fabricated or physical TID");
@@ -229,5 +270,6 @@ int main(int argc, char** argv) {
   check_initial_auxv(argv[0]);
   check_startup_exit_diagnostic();
   check_startup_tid_contract();
+  check_startup_group_isolation();
   std::puts("PASS explicit runtime startup, ELF normalization and signal policy");
 }

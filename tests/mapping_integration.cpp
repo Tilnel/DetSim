@@ -87,6 +87,7 @@ int main(int argc, char** argv)
             auto* code = reinterpret_cast<unsigned char*>(scratch_page + 0xff0);
             code[0] = 0x0f; code[1] = 0x05;
             if (mprotect(page, 8192, PROT_READ)) _exit(3);
+            if (syscall(SYS_set_robust_list, nullptr, 24)) _exit(91);
             if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr)) _exit(4);
             asm volatile("int3");
             _exit(0);
@@ -139,6 +140,13 @@ int main(int argc, char** argv)
         for (auto byte : sparse_copy) require(byte == 37, "sparse region restore omitted bytes");
         printf("Sparse restore: read=%lu write=%lu compared=%lu written=%lu\n",
                sparse_stats.read_bytes, sparse_stats.write_bytes, sparse_stats.pages_compared, sparse_stats.pages_written);
+        require(tracee_do_syscall(child,SYS_madvise,reinterpret_cast<uintptr_t>(page),8192,
+                                 MADV_DONTNEED,0,0,0)==0,"discard anonymous readonly pages");
+        unsigned char discarded=99;
+        require(guest_read_exact(child,page,&discarded,1) && discarded==0 &&
+                protection(child,reinterpret_cast<uintptr_t>(page))==PROT_READ,
+                "discard did not zero bytes while retaining permission");
+        restore();
         mutate(); restore(); mutate(); restore();
         require(tracee_do_syscall(child, SYS_mprotect, reinterpret_cast<uintptr_t>(page), 8192,
                                  PROT_READ | PROT_WRITE, 0, 0, 0) == 0, "writable saved permission");

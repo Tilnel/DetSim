@@ -203,6 +203,81 @@ finally:
         self.assertIn("has exited with status 0", output)
         self.assertEqual(code, 0, output)
 
+    def test_pthread_tls_join_owner_death_and_condition_wait(self):
+        source = self.root / "pthread_probe.c"
+        source.write_text(r"""
+#include <pthread.h>
+#include <stdint.h>
+#include <errno.h>
+static _Thread_local int tls = 11;
+static pthread_mutex_t robust;
+static pthread_mutex_t gate = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t condition = PTHREAD_COND_INITIALIZER;
+static int ready;
+volatile int counter, recoveries;
+static void *owner(void *arg) {
+    if (tls != 11 || pthread_mutex_lock(&robust)) return (void *)-1;
+    tls = 77 + (int)(intptr_t)arg;
+    ++counter;
+    return (void *)(intptr_t)tls; /* Deliberately retain robust mutex ownership. */
+}
+static void *notifier(void *arg) {
+    (void)arg;
+    if (pthread_mutex_lock(&gate)) return (void *)-1;
+    ready = 1;
+    ++counter;
+    if (pthread_cond_signal(&condition) || pthread_mutex_unlock(&gate)) return (void *)-1;
+    return 0;
+}
+int main(void) {
+    pthread_mutexattr_t attr;
+    if (pthread_mutexattr_init(&attr) || pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST) ||
+        pthread_mutex_init(&robust, &attr) || pthread_mutexattr_destroy(&attr)) return 2;
+    for (intptr_t i = 0; i < 3; ++i) {
+        pthread_t thread; void *result = 0;
+        if (pthread_create(&thread, 0, owner, (void *)i) || pthread_join(thread, &result)) return 3;
+        if ((intptr_t)result != 77 + i || tls != 11) return 4;
+        if (pthread_mutex_lock(&robust) != EOWNERDEAD) return 5;
+        ++recoveries;
+        if (pthread_mutex_consistent(&robust) || pthread_mutex_unlock(&robust)) return 6;
+    }
+    pthread_t thread; void *result = 0;
+    if (pthread_mutex_lock(&gate) || pthread_create(&thread, 0, notifier, 0)) return 7;
+    while (!ready) if (pthread_cond_wait(&condition, &gate)) return 8;
+    if (pthread_mutex_unlock(&gate) || pthread_join(thread, &result) || result) return 9;
+    return counter != 4 || recoveries != 3;
+}
+""")
+        subprocess.run(shlex.split(os.environ.get("CC", "/usr/bin/gcc")) +
+                       ["-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie", "-pthread",
+                        str(source), "-o", str(self.root / "probe")], check=True)
+        subprocess.run([str(self.root / "probe")], check=True, timeout=10)
+        for backend in ("full", "pages"):
+            for terminate in (False, True):
+                with self.subTest(backend=backend, terminate=terminate):
+                    owned_tasks = []
+                    def scenario(send):
+                        send("sw 0")
+                        self.assertIn("Complete explore all", send("bfs"))
+                        self.assertIn("counter = 4", send("p counter"))
+                        self.assertIn("recoveries = 3", send("p recoveries"))
+                        self.assertIn("has exited with status 0", send("si"))
+                        listing = send("thread")
+                        leader = int(re.search(r"pid=(\d+)", listing).group(1))
+                        self.assertEqual(os.getpgid(leader), leader)
+                        owned_tasks.extend(int(t.name) for t in Path(f"/proc/{leader}/task").iterdir())
+                        self.assertGreaterEqual(len(owned_tasks), 2)
+                        if terminate:
+                            status = Path(f"/proc/{leader}/status").read_text()
+                            tracer = int(re.search(r"(?m)^PPid:\s+(\d+)", status).group(1))
+                            os.kill(tracer, signal.SIGTERM)
+                    name = "pthread_" + backend + ("_term" if terminate else "_normal")
+                    code, output = self.run_tracer(scenario, name=name,
+                        extra_env={"DETSIM_SNAPSHOT_BACKEND": backend})
+                    self.assertEqual(code, 128 + signal.SIGTERM if terminate else 0, output)
+                    self.assertTrue(owned_tasks)
+                    self.assertFalse(any(Path(f"/proc/{tid}").exists() for tid in owned_tasks), output)
+
     def test_bfs_finishes_for_finite_program(self):
         code, output = self.run_tracer("sw 0\nbfs\nq\n")
         self.assertIn("Complete explore all 5 sys_states", output)

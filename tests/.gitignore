@@ -98,3 +98,6 @@
 
 !thread_signal_mask.mk
 !thread_signal_mask_integration.cpp
+
+!thread_robust_integration.cpp
+!thread_robust.mk

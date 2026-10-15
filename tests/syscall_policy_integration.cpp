@@ -25,6 +25,7 @@ static_assert(NP == 2);
 extern "C" detsim::ui::NCursesUI* get_ncurses_ui() { return nullptr; }
 static int failures;
 alignas(32) static std::array<unsigned char,32> rseq_buffer{};
+static uint64_t robust_head_output=0x11223344,robust_length_output=0x55667788;
 static const char replacement_name[] = "escaped";
 static rlimit guest_limit{};
 static timespec guest_zero{}, guest_delay{1,0}, guest_invalid{-1,0};
@@ -109,6 +110,7 @@ int main() {
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) == MAP_FAILED) _exit(2);
             auto* code = reinterpret_cast<unsigned char*>(scratch_page + 0xff0);
             code[0] = 0x0f; code[1] = 0x05;
+            if (syscall(SYS_set_robust_list, nullptr, 24)) _exit(91);
             if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr)) _exit(2);
             asm volatile("int3");
             _exit(0);
@@ -119,6 +121,7 @@ int main() {
             throw std::runtime_error("ptrace options");
         ptmc_state.pids[0] = child;
         ptmc_state.cursor = 0;
+        adopt_thread_signal_mask(0,child);
         SyscallDispatcher dispatcher;
         check(SyscallRoute{}.action == SyscallAction::REJECT, "default route rejects unknown host effects");
         bool unknown_rejected = true;
@@ -137,6 +140,32 @@ int main() {
               observed_rseq==rseq_buffer,"unavailable rseq leaves user memory unchanged");
         check(ptrace(PTRACE_GET_RSEQ_CONFIGURATION,child,reinterpret_cast<void*>(sizeof(registration)),&registration)==sizeof(registration) &&
               !registration.rseq_abi_pointer,"unavailable rseq never registers with host kernel");
+        const auto robust_set=execute(dispatcher,child,SYS_set_robust_list,{0,24,0,0,0,0});
+        check(!robust_set.rejected && robust_set.value==0,"logical robust-list registration supported");
+        const uint64_t arbitrary_head=0x12345678;
+        auto robust=execute(dispatcher,child,SYS_set_robust_list,{arbitrary_head,24,0,0,0,0});
+        check(!robust.rejected && robust.value==0,"robust set does not dereference head");
+        robust=execute(dispatcher,child,SYS_set_robust_list,{0,23,0,0,0,0});
+        check(!robust.rejected && robust.value==-EINVAL,"robust length validation preserves registration");
+        robust=execute(dispatcher,child,SYS_get_robust_list,
+                       {0,reinterpret_cast<uint64_t>(&robust_head_output),reinterpret_cast<uint64_t>(&robust_length_output),0,0,0});
+        uint64_t head=0,length=0;
+        check(!robust.rejected && robust.value==0 &&
+              guest_read_exact(child,&robust_head_output,&head,sizeof(head)) && head==arbitrary_head &&
+              guest_read_exact(child,&robust_length_output,&length,sizeof(length)) && length==24,
+              "robust get returns logical pointer and ABI length");
+        robust=execute(dispatcher,child,SYS_get_robust_list,
+                       {uint64_t(logical_process_id(0)),reinterpret_cast<uint64_t>(&robust_head_output),reinterpret_cast<uint64_t>(&robust_head_output),0,0,0});
+        check(!robust.rejected && robust.value==0 && guest_read_exact(child,&robust_head_output,&head,sizeof(head)) &&
+              head==arbitrary_head,"robust aliased outputs write length before pointer");
+        length=99;guest_write_exact(child,&robust_length_output,&length,sizeof(length));
+        robust=execute(dispatcher,child,SYS_get_robust_list,
+                       {0,1,reinterpret_cast<uint64_t>(&robust_length_output),0,0,0});
+        check(!robust.rejected && robust.value==-EFAULT && guest_read_exact(child,&robust_length_output,&length,sizeof(length)) &&
+              length==24,"robust get head fault retains preceding length write");
+        robust=execute(dispatcher,child,SYS_get_robust_list,{uint64_t(-1),1,1,0,0,0});
+        check(!robust.rejected && robust.value==-ESRCH,"unknown logical robust owner returns ESRCH first");
+        execute(dispatcher,child,SYS_set_robust_list,{0,24,0,0,0,0});
         auto result = execute(dispatcher, child, SYS_prctl,
                               {PR_SET_NAME, reinterpret_cast<uint64_t>(replacement_name), 0, 0, 0, 0});
         check(result.rejected && child_name(child) == "policy-child", "PR_SET_NAME rejected before host mutation");
@@ -206,6 +235,30 @@ int main() {
             result=execute(dispatcher,child,SYS_munmap,{guard,4096,0,0,0,0});
             check(!result.rejected && result.value==0,"guard can be unmapped");
         }
+        const auto discard=execute(dispatcher,child,SYS_mmap,
+                       {0,8192,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,uint64_t(-1),0});
+        check(!discard.rejected && discard.value>0,"allocate discard fixture");
+        if (!discard.rejected && discard.value>0) {
+            const auto address=uint64_t(discard.value);const uint32_t marker=0x12345678;
+            guest_write_exact(child,reinterpret_cast<void*>(address),&marker,sizeof(marker));
+            guest_write_exact(child,reinterpret_cast<void*>(address+4096),&marker,sizeof(marker));
+            result=execute(dispatcher,child,SYS_madvise,{address,4096,MADV_DONTNEED,0,0,0});
+            uint32_t zero=1,retained=0;
+            check(!result.rejected && result.value==0 &&
+                  guest_read_exact(child,reinterpret_cast<void*>(address),&zero,sizeof(zero)) && zero==0 &&
+                  guest_read_exact(child,reinterpret_cast<void*>(address+4096),&retained,sizeof(retained)) && retained==marker,
+                  "MADV_DONTNEED zeros only requested anonymous pages");
+            result=execute(dispatcher,child,SYS_madvise,{address,4096,MADV_FREE,0,0,0});
+            check(result.rejected,"lazy nondeterministic MADV_FREE remains rejected");
+            result=execute(dispatcher,child,SYS_madvise,{address+1,4096,MADV_DONTNEED,0,0,0});
+            check(!result.rejected && result.value==-EINVAL,"unaligned madvise preserves native EINVAL");
+            execute(dispatcher,child,SYS_munmap,{address,8192,0,0,0,0});
+        }
+        result=execute(dispatcher,child,SYS_madvise,{scratch_page,4096,MADV_DONTNEED,0,0,0});
+        check(result.rejected,"madvise cannot discard control memory");
+        result=execute(dispatcher,child,SYS_madvise,
+                       {reinterpret_cast<uint64_t>(&replacement_name)&~uint64_t(4095),4096,MADV_DONTNEED,0,0,0});
+        check(result.rejected,"madvise cannot discard file-backed state");
         result=execute(dispatcher,child,SYS_mmap,
                        {0,4096,PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,uint64_t(-1),0});
         check(result.rejected,"write-only mappings remain unsupported");

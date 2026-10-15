@@ -4,6 +4,7 @@
 #include "state_store.h"
 #include "sysstate_store.h"
 #include "guest.h"
+#include "dispatcher.h"
 #include "proc_status.h"
 #include "page_snapshot.h"
 #include "engine/exec_engine.h"
@@ -45,6 +46,7 @@ int main(int argc, char**)
                          MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED) _exit(2);
                 auto *code = reinterpret_cast<unsigned char*>(scratch_page + 0xff0);
                 code[0] = 0x0f; code[1] = 0x05;
+                if (syscall(SYS_set_robust_list, nullptr, 24)) _exit(91);
                 if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr)) _exit(3);
                 asm volatile("int3");
                 _exit(0);
@@ -99,6 +101,9 @@ int main(int argc, char**)
         require(guest_write_exact(children[0], guest_address, tcp_payload, sizeof(tcp_payload)), "write TCP fixture");
         require(ptmc_state.sock_states[0].do_send(client_fd, guest_address, sizeof(tcp_payload), 0) == sizeof(tcp_payload),
                 "buffer preaccept TCP");
+        const uint64_t provenance_page=tracee_do_syscall(children[1],SYS_mmap,0,4096,
+            PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,uint64_t(-1),0);
+        require(provenance_page>0 && provenance_page<uint64_t(-4095),"provenance fixture mapping");
         std::array<ProcessKernelState,NP> initial_process_states;
         for (int i=0;i<NP;++i) {
             ptmc_state.process_states[i].random_state^=uint64_t(i+123);
@@ -179,6 +184,31 @@ int main(int argc, char**)
         sys_state process_replayed(info,&source);
         require(process_replayed.ss_hash==source.ss_hash,"RNG/signal branch restore identity drift");
         compare_full(process_replayed);
+        ptmc_state.fs_states[1].add_virtual_file_mapping(provenance_page,provenance_page+4096);
+        sys_state file_backed(info,&source);
+        require(file_backed.ts_hash[1]!=source.ts_hash[1] && file_backed.ss_hash!=source.ss_hash &&
+                source.child[1].fs_state.virtual_file_mappings.empty(),
+                "mapping provenance missing from identity or leaked across copies");
+        compare_full(file_backed);
+        ptmc_state.running_state=file_backed;
+        source.recover_running_state();
+        require(ptmc_state.fs_states[1].virtual_file_mappings.empty(),"provenance leaked into predecessor");
+        sys_state loaded_backing(file_backed.ss_hash);
+        loaded_backing.recover_running_state();
+        require(ptmc_state.fs_states[1].overlaps_virtual_file_mapping(provenance_page,provenance_page+4096),
+                "persisted restore lost mapping provenance");
+        ptmc_state.cursor=1;
+        syscall_info discard{};discard.nr=SYS_madvise;
+        discard.args[0]=provenance_page;discard.args[1]=4096;discard.args[2]=MADV_DONTNEED;
+        SyscallDispatcher dispatcher;
+        bool refused=false;
+        try {dispatcher.on_enter(children[1],SYS_madvise,discard);}
+        catch(const std::runtime_error&) {refused=true;}
+        require(refused,"restored file mapping became eligible for anonymous discard");
+        sys_state provenance_replayed(info,&loaded_backing);
+        require(provenance_replayed.ss_hash==file_backed.ss_hash,"provenance restore identity drift");
+        source.recover_running_state();
+        ptmc_state.cursor=0;
         // Cross-node modeled delivery must invalidate the idle node's hash.
         ptmc_state.time[1].tv_sec++;
         sys_state changed(info, &source);

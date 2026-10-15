@@ -76,6 +76,13 @@ class FileSystemState
   // to its description.
   std::map<int, OpenFileDescription> open_files;
 
+  // Virtual file mappings use anonymous host VMAs. Preserve their semantic
+  // provenance independently of /proc maps: canonical page-aligned [start,end).
+  std::map<uint64_t, uint64_t> virtual_file_mappings;
+  void add_virtual_file_mapping(uint64_t start, uint64_t end);
+  void remove_virtual_file_mapping(uint64_t start, uint64_t end);
+  bool overlaps_virtual_file_mapping(uint64_t start, uint64_t end) const;
+
   // Current working directory for the tracee (in VFS namespace)
   std::string cwd;
 

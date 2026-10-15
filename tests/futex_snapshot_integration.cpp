@@ -77,6 +77,7 @@ int main(int argc, char** argv)
                      MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED) _exit(2);
             auto* code = reinterpret_cast<unsigned char*>(scratch_page + 0xff0);
             code[0] = 0x0f; code[1] = 0x05;
+            if (syscall(SYS_set_robust_list, nullptr, 24)) _exit(91);
             if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr)) _exit(3);
             asm volatile("int3");
             _exit(0);

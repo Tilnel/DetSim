@@ -283,6 +283,7 @@ static void run_case(bool tiny)
             static_cast<char*>(__builtin_thread_pointer()) + __rseq_offset,
             32, RSEQ_FLAG_UNREGISTER, RSEQ_SIG)) _exit(2);
         syscall(SYS_set_tid_address, nullptr);
+        syscall(SYS_set_robust_list, nullptr, sizeof(robust_list_head));
         pending_robust.list.next = &pending_robust.list;
         pending_robust.list_op_pending = reinterpret_cast<robust_list*>(&clear_tid_word);
         if (mmap(reinterpret_cast<void*>(scratch_page), 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
@@ -471,7 +472,7 @@ static void run_case(bool tiny)
         bool robust_rejected = false;
         try { (void)state_transition(main_exit_branch, 0, 0); }
         catch (const std::runtime_error& error) {
-            robust_rejected = std::string(error.what()).find("nonempty or pending robust futex ownership") != std::string::npos;
+            robust_rejected = std::string(error.what()).find("unadopted native robust-list registration") != std::string::npos;
         }
         require(robust_rejected && ptmc_state.running_state.child[0].threads[0].alive,
                 "pending robust owner exit mutated logical liveness");

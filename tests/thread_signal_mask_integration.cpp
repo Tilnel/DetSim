@@ -145,6 +145,7 @@ static void run(bool tiny,bool shared_pending) {
         if(mmap(reinterpret_cast<void*>(scratch_page),4096,PROT_READ|PROT_WRITE|PROT_EXEC,
                 MAP_FIXED_NOREPLACE|MAP_PRIVATE|MAP_ANONYMOUS,-1,0)==MAP_FAILED)_exit(4);
         auto* code=reinterpret_cast<unsigned char*>(scratch_page+0xff0);code[0]=0x0f;code[1]=0x05;
+        if (syscall(SYS_set_robust_list, nullptr, 24)) _exit(91);
         if(ptrace(PTRACE_TRACEME,0,nullptr,nullptr))_exit(5);
         asm volatile("int3");mask_guest(&jobs[0]);_exit(6);
     }

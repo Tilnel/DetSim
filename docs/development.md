@@ -25,6 +25,7 @@ make check-storage       # storage faults/concurrency/reopen + read-only tools; 
 make check-integration   # production DWARF/ELF fixtures; default NP=1
 make check-scenarios     # build NP=1 tracer and run isolated native ptrace scenarios
 make check-thread-control check-thread-identity check-thread-carrier # NP=1 thread gates
+make check-thread-robust # NP=1 native owner-death oracle, group exit, persisted replay
 make check-thread-signal-mask # NP=1 per-task masks, inheritance, restore and pending rejection
 make check-thread-tid # NP=1 clone/clone3 TID, clear-tid/join and restore
 make check-thread-lifecycle # NP=1 raw clone/exit, TLS, full/pages + cache pressure
@@ -132,8 +133,8 @@ enter snapshot state. Loader CPU-feature normalization still logs an unresolved
 symbol (C17). Passing counter/replay tests does not close that gap,
 nor does it prove multithread, cross-process-run or eviction correctness.
 
-Default snapshot format is version 19; older formats are rejected without migration.
-This branch additionally reads opt-in version 20 page manifests, selected with
+Default snapshot format is version 21; older formats are rejected without migration.
+This branch additionally reads opt-in version 22 page manifests, selected with
 `DETSIM_SNAPSHOT_BACKEND=pages`; `verify-pages` adds a full memory oracle.
 See [page snapshots and whole-exploration measurements](page-snapshots.md).
 Private readable mappings and unnamed anonymous PROT_NONE guards are captured;
@@ -224,7 +225,7 @@ successor. Pure predecessor/target comparisons need no monitor state.
 
 Plugin binaries/schema/configuration, target executable contents and semantic
 execution configuration form the model compatibility fingerprint. Executables must remain immutable during a run. Changing cache
-sizes or loading a decoder does not change it. Flat19/page20 and the versioned
+sizes or loading a decoder does not change it. Flat21/page22 and the versioned
 system metadata reject older archives without deleting or migrating stores.
 Changes to kernel-model or inspection semantics require an explicit compatibility
 version bump; fingerprints do not prove equivalence between different implementations.
@@ -256,7 +257,7 @@ execution, faithful restore and exhaustive exploration are separate support leve
 | Lifecycle/restore (P0) | Full pthread/kernel thread-state reconstruction and process trees/fork/exec | Raw births/exits rebind retained carriers; untracked physical changes reject; parked terminal images restore across branches (C02/C08) |
 | Blocking/event loop (P1) | Wait registration, readiness wakeups, deadlines, timeout ordering and signal interruption | Returning EAGAIN/zero is not Linux blocking semantics; sleep and epoll timing are incomplete |
 | Files/IPC/network (P1) | Reusable rootfs and external inputs, shared filesystem/open-file descriptions, dup/vector/positioned I/O, directory mutations, Unix/IPv6 sockets, eventfd/timerfd/io_uring | Many common runtime interfaces explicitly reject; fsync does not model crash durability |
-| Mappings (P1) | Shared/unreadable mappings, guard/reserved pages and mutable file-backed coherence | Common allocators/JITs/shared-memory applications can hit explicit unsupported cases |
+| Mappings (P1) | Shared mappings, unreadable file-backed mappings and mutable file-backed coherence | Common allocators/JITs/shared-memory applications can hit explicit unsupported cases |
 | Startup/inspection (P1) | Portable initial boundary, per-node PIE/shared-image relocation and symbol contexts | PIE execution is possible; symbolic property inspection is more restricted than execution. Debug symbols are optional for raw/resource inspection |
 | Scale/search (P2) | Runtime process count, state equivalence/canonicalization, partial-order reduction and liveness/fairness algorithms | Fixed NP and bounded safety searches are not arbitrary process-graph or liveness support |
 
@@ -295,7 +296,7 @@ closure within an explicit environment, not compatibility with all Linux program
 
 ## Logical thread archives
 
-Flat19/page20 archive explicit thread liveness and logical parent IDs; physical
+Flat21/page22 archive explicit thread liveness and logical parent IDs; physical
 TIDs are transient bindings. Same-run captured hashes retain compact runtime
 provenance tied to an owned process pidfd, which is required on the host kernel.
 Disk reload may inspect any valid snapshot, but execution restore requires local
@@ -314,8 +315,8 @@ and successful validation after stopping it. Raw carrier reconciliation now cove
 `clone` and `clone3` require VM/FS/FILES/SIGHAND/THREAD sharing, with optional
 SYSVSEM, SETTLS, PARENT_SETTID, CHILD_SETTID and CHILD_CLEARTID. Other flags reject.
 Initial clear-tid registration transfers into the logical task; carrier kernel
-registrations stay zero. Active kernel rseq registration rejects capture, restore and birth. Nonempty/pending robust futex ownership rejects exit;
-raw thread exit performs modeled clear-tid notification. The rseq/robust limits
+registrations stay zero. Active kernel rseq registration rejects capture, restore and birth. Ordinary non-PI robust ownership is cleaned before clear-tid notification;
+PI and active native registrations reject. The remaining rseq/robust limits
 still apply; ordinary glibc/pthread startup is not certified.
 Host support for PR_GET_TID_ADDRESS and PTRACE_GET_RSEQ_CONFIGURATION is required.
 
@@ -531,3 +532,42 @@ support are not established by this change.
 References: [Linux syscall absence](https://raw.githubusercontent.com/torvalds/linux/v6.12/kernel/sys_ni.c),
 [Linux rseq ABI](https://raw.githubusercontent.com/torvalds/linux/v6.12/kernel/rseq.c),
 [glibc parent/child registration contract](https://raw.githubusercontent.com/bminor/glibc/glibc-2.41/nptl/pthread_create.c).
+
+## Pthread lifecycle and robust owner death (2026-10-16)
+
+`set_robust_list` and `get_robust_list` now share a logical per-thread ABI in the
+loader prelude and runtime. The pointer enters copy/archive/identity/StateView;
+list bytes remain ordinary snapshot memory. Newborn tasks start with no robust
+registration. Physical carriers stay unregistered, including parked spares;
+bootstrap may explicitly adopt an empty native list, but nonempty native ownership
+is rejected because its physical owner IDs cannot be substituted safely.
+
+On logical exit, non-PI robust cleanup precedes clear-tid. It preserves the Linux
+2048-entry bound, signed futex offsets, pending-operation handling, owner matching,
+OWNER_DIED/WAITERS bits and shared-key wake. A bounded byte overlay preserves
+malformed pointer aliases and group-exit TID writes while rejecting reachable PI
+before applying effects. Group exit uses the existing fixed slot order; this is
+not enumeration of all possible group teardown orders.
+
+Anonymous unnamed private MADV_DONTNEED is now permitted, with actual zeroing and
+permission-preserving restore tests. Virtual file mappings remain hosted as
+anonymous memory, so their canonical source intervals now enter filesystem state.
+Discard and guard conversion reject those intervals; successful mmap/MAP_FIXED,
+munmap and brk shrink update them. Failed operations preserve provenance.
+This prevents false anonymous admission; it does not implement coherent mutable
+file-backed pages or file mapping discard. Other madvise operations still reject.
+Flat21/page22 and kernel modelv9 reject incompatible prior state contexts.
+
+The native pthread scenario creates/joins three worker generations, checks TLS,
+recovers three robust mutex owner deaths via EOWNERDEAD/consistent/unlock, then
+uses an ordinary mutex and condition wait/signal. Both backends complete with
+counter4, recoveries3 and exit0. This tests the current actor policy, not exhaustive
+pthread interleavings. PI/timed futexes, cancellation, asynchronous signal delivery,
+process trees and complete Go runtime support remain outside the verified scope.
+
+Owned process cleanup now reaps all ptraced tasks in a dedicated host PGID rather
+than waiting on a leader blocked by unreaped workers. SIGTERM is blocked during
+fork/group registration; EXITKILL and parent-death handling cover interrupted
+startup. The prelude rejects group/session changes and process/thread births.
+Normal and SIGTERM cleanup of the pthread scenario leave no owned TIDs behind;
+unrelated-sibling regression checks remain in the native scenario suite.

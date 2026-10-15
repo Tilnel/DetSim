@@ -60,7 +60,15 @@ template <class Archive>
 void FileSystemState::serialize(Archive &ar)
 {
   /* Note: fd_manager_ is shared and not serialized per instance */
-  ar(filesystem, open_files, cwd, mappings, pipes_, pipe_fds_, creation_mask_);
+  ar(filesystem, open_files, cwd, mappings, pipes_, pipe_fds_, creation_mask_, virtual_file_mappings);
+  uint64_t previous_end = 0;
+  bool first = true;
+  for (const auto& [start, end] : virtual_file_mappings) {
+    if (start >= end || start % 4096 || end % 4096 || (!first && start <= previous_end))
+      throw std::runtime_error("Invalid virtual file mapping provenance");
+    first = false;
+    previous_end = end;
+  }
   if (creation_mask_ & ~0777)
     throw std::runtime_error("Invalid virtual filesystem creation mask");
 }
@@ -84,6 +92,47 @@ FileSystemState::FileSystemState() : cwd(""), fd_manager_()
 FileSystemState::FileSystemState(FdManagerPtr fd_mgr) : FileSystemState()
 {
   set_fd_manager(std::move(fd_mgr));
+}
+
+bool FileSystemState::overlaps_virtual_file_mapping(uint64_t start, uint64_t end) const
+{
+  if (start >= end) return false;
+  auto next = virtual_file_mappings.lower_bound(start);
+  if (next != virtual_file_mappings.end() && next->first < end) return true;
+  return next != virtual_file_mappings.begin() && std::prev(next)->second > start;
+}
+
+void FileSystemState::remove_virtual_file_mapping(uint64_t start, uint64_t end)
+{
+  if (start >= end) return;
+  if (start % 4096 || end % 4096)
+    throw std::runtime_error("Unaligned virtual file mapping removal");
+  auto next = virtual_file_mappings.lower_bound(start);
+  if (next != virtual_file_mappings.begin()) --next;
+  while (next != virtual_file_mappings.end() && next->first < end) {
+    const auto [left, right] = *next;
+    if (right <= start) { ++next; continue; }
+    next = virtual_file_mappings.erase(next);
+    if (left < start) virtual_file_mappings.emplace(left, start);
+    if (right > end) {
+      virtual_file_mappings.emplace(end, right);
+      break;
+    }
+  }
+}
+
+void FileSystemState::add_virtual_file_mapping(uint64_t start, uint64_t end)
+{
+  if (start >= end || start % 4096 || end % 4096)
+    throw std::runtime_error("Invalid virtual file mapping extent");
+  auto next = virtual_file_mappings.lower_bound(start);
+  if (next != virtual_file_mappings.begin() && std::prev(next)->second >= start) --next;
+  while (next != virtual_file_mappings.end() && next->first <= end) {
+    start = std::min(start, next->first);
+    end = std::max(end, next->second);
+    next = virtual_file_mappings.erase(next);
+  }
+  virtual_file_mappings.emplace(start, end);
 }
 
 int FileSystemState::allocate_fd(FdType type, int status_flags, int descriptor_flags)

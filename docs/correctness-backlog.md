@@ -9,14 +9,14 @@ relationship to the native-binary model-checking goal.
 | ID | Priority | Evidence / problem | Evidence required to close |
 | --- | --- | --- | --- |
 | C01 | Fixed (unchanged live thread set) | Futex queues are branch-owned, captured and archived; restore reconstructs blocked state, including same-hash restores. | `check-futex-snapshot` exercises capture/copy/assignment/archive, persisted reload and repeated ptrace restore/wake. Raw lifecycle/carrier restore has separate C02 tests; combined lifecycle and futex waiting still needs wider coverage. |
-| C02 | P0 / partial | Capture preserves virtual slots and creation records; raw clone/exit now restore logical contexts over retained carriers; unexpected physical death or untracked creation rejects. Physical TIDs now stay in transient bindings; explicit liveness and logical parent IDs enter archives. Guest-visible physical IDs in register/memory contents are not normalized. | Create A/B, exit A, create C, repeatedly restore with correct logical identity and TLS/stop phases. `check-thread-lifecycle` now covers that sequence, TLS, persisted replay, main-first exit and actual carrier reuse. TID writeback/clear-tid now have join and replay coverage; full pthread, robust owner-death and rseq remain unsupported. |
+| C02 | P0 / partial | Capture preserves virtual slots and creation records; raw clone/exit now restore logical contexts over retained carriers; unexpected physical death or untracked creation rejects. Physical TIDs now stay in transient bindings; explicit liveness and logical parent IDs enter archives. Guest-visible physical IDs in register/memory contents are not normalized. | Create A/B, exit A, create C, repeatedly restore with correct logical identity and TLS/stop phases. `check-thread-lifecycle` now covers that sequence, TLS, persisted replay, main-first exit and actual carrier reuse. TID writeback/clear-tid now have join and replay coverage; ordinary pthread TLS/join/condition and non-PI robust owner-death have scoped coverage; full pthread, PI and rseq critical sections remain unsupported. |
 | C03 | P0 | New BFS sets a selected thread before `state_transition`; recovery and `execute_step` synchronization can overwrite that selection. Two exploration implementations remain compiled; CLI uses the old one. | A two-thread finite program exposes both successor transitions from one snapshot. Trace all callers, compare BFS/DFS results, then consolidate to one path. |
 | C04 | Partial | Ordered system metadata identity includes status/budget; storage now compares duplicate bytes in cache, packed records and metadata instead of trusting hashes alone. | Identity and all storage gates cover ordering and duplicate conflicts. Logical thread identity and equivalence of differently encoded semantic states remain open. |
 | C05 | Fixed (scoped) | Removed filename heuristics; corrected libelf string-table index in Go-section detection. | Native `test_probe` starts at the same boundary as `probe`; ordinary/Go-section ELF fixtures and two existing gc Go binaries classified correctly. gccgo and actual Go runtime execution remain unverified. |
 | C06 | Fixed (framework boundary) | Removed Raft fields, implicit role pruning, message inference and example parser from the production link. Versioned plugins inspect explicit snapshots; branch-owned opaque monitors enter product identity before successor publication. | `check-state-view`, `check-plugins`, `check-identity` and native counter-plugin restore/violation scenarios cover readonly inspection, ABI failures, history isolation, terminal witnesses and decoder noninterference. Raft examples have separate projection/history contracts; this does not certify every Raft property. |
 | C07 | Fixed | Snapshot reads now require saved bytes and reject missing/corrupt data; no live-memory substitution. | `check-state-io` covers missing/invalid archives and reads spanning saved regions. |
 | C08 | Partial | Native same-edge replay preserves hash; storage tests now cover immutable reader lifetime, cache pressure/zero budgets, short I/O, prefetch and fresh-process reload. | `check-storage`, `check-state-io`, `check-capture` full-byte oracle, mapping and native replay gates pass. Full exploration equivalence across cache policies and general multi-node semantic canonicalization remain unproven. Virtual-exit/fatal-stop branch closure now has real ptrace regressions: persisted terminated images load and restore along with live peers; recapture preserves identity. Physical process death still rejects; lifecycle reconstruction remains C02. |
-| C09 | Fixed (scoped) | Replaced process-group termination with owned-child kill/reap; signal handler avoids store shutdown locks. | NP=1 scenarios verify unrelated sibling survives both normal exit and SIGTERM, and SIGTERM reaps tracees. Fork descendants, multithread races and initialization failures need additional coverage. |
+| C09 | Fixed (scoped) | Replaced process-group termination with owned-child kill/reap; signal handler avoids store shutdown locks. | NP=1 scenarios verify unrelated sibling survival and full/pages pthread normal/SIGTERM cleanup with all owned TIDs gone. Dedicated host groups let cleanup reap parked workers before leader. Unsupported prelude group changes reject. Fork descendants and broader initialization races need additional coverage. |
 | C10 | Fixed | Migrated removed libdwarf calls to supported APIs; validated with installed libdwarf 0.11.1 and GCC 14.2. | Real production parser tests pass DWARF 4/5, two CUs, sizes/member offsets, symbols, arrays and cleanup/reinit; tracer compiles and links. Split DWARF and PIE relocation remain outside coverage. |
 | C11 | Fixed (distinct addresses) | Direct `futex_requeue` now updates `waiter_map_` when moving a waiter. | Both entry points agree on queue/address; archive round trip followed by `wake_thread` succeeds. Same-address and syscall requeue ABI now have C16 regressions. |
 | C12 | Fixed | `handle_exit_group` wrote a raw wait status without the DetSim exited flag; successful exit became “running” and the next step crashed. | Finite program reaches counter 1/2/3, exits virtually, and further stepping reports exit status 0. |
@@ -243,3 +243,28 @@ This closes the old masking/preservation shortcut, not full rseq semantics.
 CPU/node/mm-cid, restartable critical-section abort and signal/preemption outcomes
 remain unimplemented. The actual pthread probe's next blocker is set_robust_list;
 robust-list ownership and owner-death need a separate generic Linux ABI slice.
+
+## Robust lifecycle, discard and cleanup follow-up (2026-10-16)
+
+C02 now includes logical robust-list registration and ordinary non-PI owner-death;
+physical registrations are null. Native oracles and four backend/cache variants
+cover pending, broken/cyclic/aliased links, private/shared wake separation, group
+exit and subsequent PI rejection without mutation, empty-only bootstrap adoption,
+carrier reuse and persisted replay. Single-field archive identity is checked.
+
+C21 adds unnamed private anonymous MADV_DONTNEED. A reproduced incorrect admission
+of VFS file mappings is fixed by archived canonical provenance intervals, trimmed
+on successful mmap/munmap/brk changes. Native dispatcher and complete capture/
+restore tests preserve rejection after branch reload. Mutable-file coherence,
+file-backed discard and other advice remain unsupported.
+
+C09 adds the reproduced ptraced-worker shutdown deadlock fix. Dedicated owned host
+groups are created under a SIGTERM startup barrier, and cleanup reaps all members
+without group-wide signals or waiting on unrelated children. Startup cannot change
+PGID/session or fork children. Fifteen native scenarios include a real pthread
+TLS/join/robust-mutex/condition program under both snapshot backends, with normal
+and SIGTERM cleanup proving all retained TIDs disappear.
+
+Flat21/page22 and kernel modelv9 encode the new semantic fields. These results do
+not close C03/C25: current scheduling still does not enumerate every enabled task,
+memory-access boundary, wake outcome or weak-memory behavior.

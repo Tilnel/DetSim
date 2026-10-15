@@ -372,6 +372,12 @@ int handle(pid_t pid, syscall_info &info) {
         case SYS_clone:      return handle_clone(pid, info);
         case SYS_clone3:     return handle_clone3(pid, info);
         case SYS_gettid:     return handle_gettid(pid, info);
+        case SYS_set_robust_list:
+            info.rval=emulate_set_robust_list(ptmc_state.cursor,pid,info.args[0],info.args[1]);
+            tracee_set_rax(pid,info.rval);return CKPT_YES;
+        case SYS_get_robust_list:
+            info.rval=emulate_get_robust_list(ptmc_state.cursor,pid,static_cast<int32_t>(info.args[0]),info.args[1],info.args[2]);
+            tracee_set_rax(pid,info.rval);return CKPT_YES;
         case SYS_rt_sigprocmask:
             info.rval=emulate_thread_sigprocmask(ptmc_state.cursor,pid,info.args[0],info.args[1],info.args[2],info.args[3]);
             tracee_set_rax(pid,info.rval);return CKPT_YES;

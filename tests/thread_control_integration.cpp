@@ -5,7 +5,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
-#include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdexcept>
 #include <sys/prctl.h>
@@ -45,7 +45,8 @@ template<class F> static void rejected(F action)
     require(failed, "invalid thread barrier unexpectedly passed");
 }
 
-static void *spin(void *)
+alignas(16) static char worker_stack[65536];
+static int spin(void *)
 {
     for (;;) asm volatile("" ::: "memory");
 }
@@ -59,10 +60,13 @@ static void run_case()
                 static_cast<char*>(__builtin_thread_pointer()) + __rseq_offset,
                 32, RSEQ_FLAG_UNREGISTER, RSEQ_SIG)) _exit(9);
         prctl(PR_SET_PDEATHSIG, SIGKILL);
+        if (syscall(SYS_set_robust_list, nullptr, 24)) _exit(91);
         if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr)) _exit(2);
         raise(SIGSTOP);
-        pthread_t worker;
-        if (pthread_create(&worker, nullptr, spin, nullptr)) _exit(3);
+        // Raw task: libc thread startup would install an unmodeled host list.
+        if (clone(spin, worker_stack + sizeof(worker_stack),
+                  CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM,
+                  nullptr) < 0) _exit(3);
         for (;;) asm volatile("" ::: "memory");
     }
     stopped(child);

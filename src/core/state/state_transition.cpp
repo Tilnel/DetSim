@@ -27,6 +27,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/ptrace.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/user.h>
 #include <sys/wait.h>
@@ -280,8 +281,20 @@ static void terminate_tracees()
     // An exited/reaped tracee PID may have been reused: only kill an owned child.
     if (result >= 0 && !(result == child && (WIFEXITED(status) || WIFSIGNALED(status))))
     {
+      const bool isolated = getpgid(child) == child;
       kill(child, SIGKILL);
-      while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {}
+      // A ptraced group leader cannot be reaped before its worker tasks.
+      // Wait only for this tracee's dedicated group, never unrelated children.
+      if (isolated) {
+        for (;;) {
+          const auto reaped = waitpid(-child, nullptr, __WALL);
+          if (reaped > 0 || (reaped < 0 && errno == EINTR)) continue;
+          break;
+        }
+      } else {
+        // Startup failed before group isolation; no guest threads could start.
+        while (waitpid(child, nullptr, __WALL) < 0 && errno == EINTR) {}
+      }
     }
     pids[i] = 0;
   }
@@ -364,12 +377,14 @@ syscall_info extract_one_syscall(pid_t pid)
 
   // Thread ownership begins at exec, even in the trusted loader prelude.
   // The prelude must end before births; children cannot run outside the model.
-  if (ret.nr == SYS_clone || ret.nr == SYS_clone3)
+  if (ret.nr == SYS_clone || ret.nr == SYS_clone3 || ret.nr == SYS_fork || ret.nr == SYS_vfork)
     throw std::runtime_error("RuntimeProfile startup boundary must precede thread creation");
+  if (ret.nr == SYS_setpgid || ret.nr == SYS_setsid)
+    throw std::runtime_error("Startup prelude cannot change the owned process group");
   if (ret.nr == SYS_set_tid_address) tracee_set_rdi(pid,0);
   // The execution environment exposes no rseq syscall, including the loader.
   // A successful initial registration followed by child ENOSYS breaks libc.
-  if (ret.nr == SYS_rseq) {
+  if (ret.nr == SYS_rseq || ret.nr == SYS_set_robust_list || ret.nr == SYS_get_robust_list) {
     tracee_set_orig_rax(pid,-1);tracee_set_rax(pid,-1);
   }
   if (ret.nr == SYS_rt_sigprocmask) {
@@ -386,7 +401,13 @@ syscall_info extract_one_syscall(pid_t pid)
     throw std::runtime_error("Unexpected syscall phase before configured RuntimeProfile startup boundary");
   ret.rval = info.exit.rval;
 
-  if (ret.nr == SYS_rseq) {
+  if (ret.nr == SYS_set_robust_list) {
+    ret.rval=emulate_set_robust_list(ptmc_state.cursor,pid,ret.args[0],ret.args[1]);
+    tracee_set_rax(pid,ret.rval);
+  } else if (ret.nr == SYS_get_robust_list) {
+    ret.rval=emulate_get_robust_list(ptmc_state.cursor,pid,static_cast<int32_t>(ret.args[0]),ret.args[1],ret.args[2]);
+    tracee_set_rax(pid,ret.rval);
+  } else if (ret.nr == SYS_rseq) {
     ret.rval = -ENOSYS;
     tracee_set_rax(pid,ret.rval);
   } else if (ret.nr == SYS_rt_sigprocmask) {
@@ -443,7 +464,7 @@ static void init_tracee_state(int index)
   /* tracee: stop at raise(SIGSTOP) */
 
   /* ptrace_right(PTRACE_SEIZE, pid, 0, 0); */
-  ptrace_right(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACESYSGOOD);
+  ptrace_right(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL);
 
   /* skip execve */
   while (extract_one_syscall(pid).nr != SYS_execve)
@@ -477,6 +498,7 @@ static void init_tracee_state(int index)
                    "\x0f\x05\x0f\x05\x0f\x05\x0f\x05", 8);
   capture_process_kernel_state(pid,index);
   adopt_clear_child_tid(index,pid);
+  adopt_thread_robust_list(index,pid);
 }
 
 /* prepare tracee for ptrace, and execve */
@@ -493,6 +515,7 @@ static void start_tracee(int id)
   execv(ptmc_state.tracee[id].executable, ptmc_state.tracee[id].argv);
 
   perror("exec");
+  _exit(127);
 }
 
 int state_initialization()
@@ -510,20 +533,34 @@ int state_initialization()
   signal(SIGTERM, exit_all);
   // signal(SIGINT, exit_all);
 
-  pids[0] = fork();
-  for (int i = 0; i < NP - 1; i++)
-  {
-    if (pids[i])
-      pids[i + 1] = fork();
-    else
-    {
-      // setpgid(0, pgid);
-      start_tracee(i);
+  // The cleanup wait set must include retained worker carriers, without
+  // touching the shell, driver or another tracee. Publish groups atomically
+  // with respect to our SIGTERM handler.
+  sigset_t blocked, previous_mask;
+  sigemptyset(&blocked);sigaddset(&blocked,SIGTERM);
+  if (sigprocmask(SIG_BLOCK,&blocked,&previous_mask))
+    throw std::runtime_error("Cannot protect tracee startup from SIGTERM");
+  try {
+    for (int i=0;i<NP;++i) {
+      const pid_t child=fork();
+      if (child<0) throw std::runtime_error("Cannot fork tracee");
+      if (!child) {
+        if (setpgid(0,0) || prctl(PR_SET_PDEATHSIG,SIGKILL) || getppid()!=tracer_owner)
+          _exit(126);
+        if (sigprocmask(SIG_SETMASK,&previous_mask,nullptr)) _exit(126);
+        start_tracee(i);
+        _exit(127);
+      }
+      pids[i]=child;
+      if (setpgid(child,child) && getpgid(child)!=child)
+        throw std::runtime_error("Cannot isolate tracee process group");
     }
+  } catch (...) {
+    sigprocmask(SIG_SETMASK,&previous_mask,nullptr);
+    throw;
   }
-
-  if (!pids[NP - 1])
-    start_tracee(NP - 1);
+  if (sigprocmask(SIG_SETMASK,&previous_mask,nullptr))
+    throw std::runtime_error("Cannot restore tracer signal mask after startup");
 
   detsim::ui::ui_printf("Instance #pid = %d\n", getpid());
 

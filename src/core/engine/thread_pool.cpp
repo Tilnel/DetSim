@@ -76,22 +76,6 @@ uint64_t query_clear_child_tid(pid_t tid)
   return address;
 }
 
-void require_empty_robust_list(pid_t tid)
-{
-  robust_list_head* remote = nullptr;
-  size_t length = 0;
-  if (syscall(SYS_get_robust_list, tid, &remote, &length) != 0)
-    throw std::runtime_error("Cannot inspect thread robust futex list before logical exit");
-  if (!remote) return;
-  if (length != sizeof(robust_list_head))
-    throw std::runtime_error("Unsupported thread robust futex list ABI");
-  robust_list_head head{};
-  if (!guest_read_exact(tid, remote, &head, sizeof(head)))
-    throw std::runtime_error("Cannot read thread robust futex list before logical exit");
-  if (head.list.next != reinterpret_cast<robust_list*>(remote) || head.list_op_pending)
-    throw std::runtime_error("Logical exit does not support nonempty or pending robust futex ownership");
-}
-
 void validate_tid_pointer(uint64_t address)
 {
   if (address < scratch_page + 4096 && address > scratch_page - sizeof(int32_t))
@@ -100,12 +84,12 @@ void validate_tid_pointer(uint64_t address)
 
 // Kernel put_user(u32) does not leave a prefix written on an x86 page fault.
 // process_vm_writev can, so verify the whole range while every carrier is stopped.
-bool write_tid_word(pid_t pid, uint64_t address, int32_t value, bool clearing = false)
+bool writable_guest_range(pid_t pid, uint64_t address, size_t size, bool clearing = false)
 {
-  if (!address || address > UINT64_MAX - sizeof(value)) return false;
+  if (!address || address > UINT64_MAX - size) return false;
   std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
   if (!maps) throw std::runtime_error("Cannot inspect TID write mappings");
-  const uint64_t end = address + sizeof(value);
+  const uint64_t end = address + size;
   uint64_t cursor = address;
   std::string line;
   while (std::getline(maps, line)) {
@@ -125,14 +109,131 @@ bool write_tid_word(pid_t pid, uint64_t address, int32_t value, bool clearing = 
       return false;
     }
     cursor = std::min<uint64_t>(stop, end);
-    if (cursor == end) {
-      if (!guest_write_exact(pid, reinterpret_cast<void*>(address), &value, sizeof(value)))
-        throw std::runtime_error("TID write failed after writable-range validation");
-      return true;
-    }
+    if (cursor == end) return true;
   }
   if (maps.bad()) throw std::runtime_error("Cannot read TID write mappings");
   return false;
+}
+
+template <class T>
+bool write_guest_scalar(pid_t pid, uint64_t address, T value, bool clearing = false)
+{
+  if (!writable_guest_range(pid, address, sizeof(value), clearing)) return false;
+  if (!guest_write_exact(pid, reinterpret_cast<void*>(address), &value, sizeof(value)))
+    throw std::runtime_error("Scalar write failed after writable-range validation");
+  return true;
+}
+
+bool write_tid_word(pid_t pid, uint64_t address, int32_t value, bool clearing = false)
+{
+  return write_guest_scalar(pid, address, value, clearing);
+}
+
+void validate_robust_range(uint64_t address, size_t size)
+{
+  if (address < scratch_page + 4096 &&
+      (address >= scratch_page || size > scratch_page - address))
+    throw std::runtime_error("Robust-list access overlaps reserved control memory");
+}
+
+struct RobustEffect {
+  uint64_t address;
+  uint32_t value;
+  bool write;
+  bool wake;
+};
+
+// All carriers are stopped. Simulate stores before applying any effects, so
+// malformed aliases and cycles see the same ordered values as Linux, while a
+// reachable unsupported PI entry rejects before mutating the branch.
+class RobustExitPlan {
+  pid_t pid;
+  std::map<uint64_t, uint8_t> bytes;
+
+  template <class T> bool read(uint64_t address, T& value)
+  {
+    validate_robust_range(address, sizeof(value));
+    if (!address || address > UINT64_MAX - sizeof(value) ||
+        !guest_read_exact(pid, reinterpret_cast<void*>(address), &value, sizeof(value)))
+      return false;
+    auto* result = reinterpret_cast<uint8_t*>(&value);
+    for (size_t i = 0; i < sizeof(value); ++i) {
+      const auto found = bytes.find(address + i);
+      if (found != bytes.end()) result[i] = found->second;
+    }
+    return true;
+  }
+
+  bool death(uint64_t address, bool pi, bool pending, pid_t owner,
+             std::vector<RobustEffect>& effects)
+  {
+    if (pi) throw std::runtime_error("Unsupported PI robust futex ownership");
+    validate_robust_range(address, sizeof(uint32_t));
+    if (address % sizeof(uint32_t)) return false;
+    uint32_t value = 0;
+    if (!read(address, value)) return false;
+    if (pending && !(value & FUTEX_TID_MASK)) {
+      // Shared futex keys for read-only anonymous pages cannot be acquired.
+      // Read-only file-backed keys need a backing-object model and reject.
+      if (writable_guest_range(pid, address, sizeof(value), true))
+        effects.push_back({address, value, false, true});
+      return true;
+    }
+    if ((value & FUTEX_TID_MASK) != static_cast<uint32_t>(owner)) return true;
+    const uint32_t replacement = (value & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+    if (!store(address, replacement)) return false;
+    effects.push_back({address, replacement, true, bool(value & FUTEX_WAITERS)});
+    return true;
+  }
+
+public:
+  explicit RobustExitPlan(pid_t physical_tid) : pid(physical_tid) {}
+
+  bool store(uint64_t address, uint32_t value, bool clearing = false)
+  {
+    validate_robust_range(address, sizeof(value));
+    if (!writable_guest_range(pid, address, sizeof(value), clearing)) return false;
+    const auto* source = reinterpret_cast<const uint8_t*>(&value);
+    for (size_t i = 0; i < sizeof(value); ++i) bytes[address + i] = source[i];
+    return true;
+  }
+
+  std::vector<RobustEffect> collect(const thread_state& thread, pid_t owner)
+  {
+    std::vector<RobustEffect> effects;
+    const uint64_t head = thread.robust_list_head;
+    if (!head) return effects;
+    robust_list_head registration{};
+    if (!read(head, registration)) return effects;
+    uint64_t tagged = reinterpret_cast<uint64_t>(registration.list.next);
+    const uint64_t pending_tagged = reinterpret_cast<uint64_t>(registration.list_op_pending);
+    const uint64_t pending = pending_tagged & ~uint64_t(1);
+    const uint64_t offset = static_cast<uint64_t>(registration.futex_offset);
+    for (unsigned remaining = ROBUST_LIST_LIMIT; (tagged & ~uint64_t(1)) != head; ) {
+      const uint64_t entry = tagged & ~uint64_t(1);
+      uint64_t next = 0;
+      const bool next_read = read(entry, next);
+      if (entry != pending && !death(entry + offset, tagged & 1, false, owner, effects))
+        return effects;
+      // Linux handles the current owner even when fetching next faulted.
+      if (!next_read) return effects;
+      tagged = next;
+      if (!--remaining) break;
+    }
+    if (pending) death(pending + offset, pending_tagged & 1, true, owner, effects);
+    return effects;
+  }
+};
+
+void apply_robust_cleanup(tracee_state& state, const thread_state& thread,
+                          const std::vector<RobustEffect>& effects)
+{
+  for (const auto& effect : effects) {
+    if (effect.write && !write_guest_scalar(thread.physical_tid, effect.address, effect.value))
+      throw std::runtime_error("Robust futex became unwritable after exit preflight");
+    if (effect.wake && state.futex_state)
+      state.futex_state->futex_wake(effect.address, 1, ~0u, false);
+  }
 }
 
 void clear_logical_tid(int node, tracee_state& state, thread_state& thread)
@@ -146,6 +247,7 @@ void clear_logical_tid(int node, tracee_state& state, thread_state& thread)
   }
   write_thread_signal_mask(thread.physical_tid, 0);
   thread.signal_mask = 0;
+  thread.robust_list_head = 0;
   thread.clear_child_tid = 0;
   thread.child_settid_pending = false;
   thread.pending_child_settid = 0;
@@ -168,6 +270,8 @@ void validate_bound_slots(const CarrierPool& pool, const tracee_state& state)
     constexpr uint64_t unblockable = (uint64_t(1) << (SIGKILL - 1)) | (uint64_t(1) << (SIGSTOP - 1));
     if ((thread.signal_mask & unblockable) || (!thread.alive && thread.signal_mask))
       throw std::runtime_error("Invalid logical thread signal mask");
+    if (!thread.alive && thread.robust_list_head)
+      throw std::runtime_error("Exited logical thread retains robust-list registration");
     if (!thread.alive) continue;
     if (!std::binary_search(pool.carriers.begin(), pool.carriers.end(), thread.physical_tid) ||
         !occupied.insert(thread.physical_tid).second ||
@@ -226,6 +330,62 @@ void adopt_clear_child_tid(int node, pid_t physical_tid)
       SYS_set_tid_address, 0, 0, 0, 0, 0, 0));
   if (result != physical_tid)
     throw std::runtime_error("Cannot disable carrier clear_child_tid registration");
+}
+
+void adopt_thread_robust_list(int node, pid_t physical_tid)
+{
+  if (node < 0 || node >= NP || pools.count(node))
+    throw std::runtime_error("Robust-list adoption requires initial owned thread bootstrap");
+  auto& state = ptmc_state.running_state.child[node];
+  if (state.threads.empty()) record_logical_clear_tid(node, physical_tid, 0);
+  const auto found = std::find_if(state.threads.begin(), state.threads.end(),
+      [physical_tid](const thread_state& thread) { return thread.alive && thread.physical_tid == physical_tid; });
+  if (found == state.threads.end()) throw std::runtime_error("Cannot adopt unowned robust-list registration");
+  const uint64_t head = read_thread_robust_list(physical_tid);
+  if (!head) return; // Preserve a registration already virtualized by startup.
+  validate_robust_range(head, sizeof(robust_list_head));
+  robust_list_head registration{};
+  if (!guest_read_exact(physical_tid, reinterpret_cast<void*>(head), &registration, sizeof(registration)) ||
+      reinterpret_cast<uint64_t>(registration.list.next) != head || registration.list_op_pending)
+    throw std::runtime_error("Cannot adopt nonempty or unreadable native robust list with physical owner IDs");
+  const auto result = static_cast<int64_t>(tracee_do_syscall(physical_tid,
+      SYS_set_robust_list, 0, sizeof(robust_list_head), 0, 0, 0, 0));
+  if (result != 0) throw std::runtime_error("Cannot disable carrier robust-list registration");
+  found->robust_list_head = head;
+}
+
+long emulate_set_robust_list(int node, pid_t physical_tid, uint64_t head, uint64_t length)
+{
+  if (length != sizeof(robust_list_head)) return -EINVAL;
+  if (node < 0 || node >= NP) throw std::runtime_error("Thread pool node out of range");
+  auto& state = ptmc_state.running_state.child[node];
+  const auto found = std::find_if(state.threads.begin(), state.threads.end(),
+      [physical_tid](const thread_state& thread) { return thread.alive && thread.physical_tid == physical_tid; });
+  if (found == state.threads.end()) throw std::runtime_error("set_robust_list has no live owned thread");
+  validate_robust_range(head, sizeof(robust_list_head));
+  require_no_native_robust_list(physical_tid);
+  found->robust_list_head = head;
+  return 0;
+}
+
+long emulate_get_robust_list(int node, pid_t caller, int32_t target,
+                            uint64_t head_out, uint64_t length_out)
+{
+  if (node < 0 || node >= NP) throw std::runtime_error("Thread pool node out of range");
+  const thread_state* found = nullptr;
+  for (int index = 0; index < NP && !found; ++index)
+    for (const auto& thread : ptmc_state.running_state.child[index].threads)
+      if (thread.alive && ((target == 0 && index == node && thread.physical_tid == caller) ||
+          (target > 0 && logical_thread_id(index, thread.tid) == target))) {
+        found = &thread;
+        break;
+      }
+  if (!found) return -ESRCH;
+  validate_robust_range(length_out, sizeof(uint64_t));
+  validate_robust_range(head_out, sizeof(uint64_t));
+  if (!write_guest_scalar(caller, length_out, uint64_t(sizeof(robust_list_head)))) return -EFAULT;
+  if (!write_guest_scalar(caller, head_out, found->robust_list_head)) return -EFAULT;
+  return 0;
 }
 
 void adopt_thread_signal_mask(int node, pid_t physical_tid)
@@ -500,13 +660,18 @@ bool exit_logical_thread(int node, pid_t physical_tid, int exit_code)
   if (found == state.threads.end()) throw std::runtime_error("Logical exit has no live owned thread");
   if (query_clear_child_tid(physical_tid))
     throw std::runtime_error("Thread carrier has unadopted inherited clear_child_tid registration");
-  require_empty_robust_list(physical_tid);
+  RobustExitPlan robust_plan(physical_tid);
+  const auto robust_effects = robust_plan.collect(*found, logical_thread_id(node, found->tid));
+  if (found->clear_child_tid && std::any_of(state.threads.begin(), state.threads.end(),
+      [&found](const thread_state& thread) { return &thread != &*found && thread.alive; }))
+    robust_plan.store(found->clear_child_tid, 0, true);
   if (ptrace(PTRACE_GETREGS, physical_tid, nullptr, &found->regs) == -1)
     throw std::runtime_error("Cannot capture exiting thread registers");
   found->regs.rax = 0;
   found->xstate = capture_xstate(physical_tid);
   found->exit_code = exit_code & 255;
   const auto slot = static_cast<size_t>(found - state.threads.begin());
+  apply_robust_cleanup(state, *found, robust_effects);
   clear_logical_tid(node, state, *found);
   found->alive = false;
   found->physical_tid = 0;
@@ -526,12 +691,22 @@ void exit_logical_process(int node, pid_t caller, int exit_code)
   if (std::none_of(state.threads.begin(), state.threads.end(),
       [caller](const thread_state& thread) { return thread.alive && thread.physical_tid == caller; }))
     throw std::runtime_error("Logical process exit has no live owned caller");
-  // Check every owner before changing any peer's lifecycle or futex queues.
-  for (const auto& thread : state.threads) {
+  // Preflight the entire group with an overlay of the stores that earlier
+  // exits perform, including aliased child-settid and clear-tid addresses.
+  RobustExitPlan robust_plan(caller);
+  std::vector<std::vector<RobustEffect>> robust_effects(state.threads.size());
+  size_t live = std::count_if(state.threads.begin(), state.threads.end(),
+      [](const thread_state& thread) { return thread.alive; });
+  for (size_t i = 0; i < state.threads.size(); ++i) {
+    const auto& thread = state.threads[i];
     if (!thread.alive) continue;
-    require_empty_robust_list(thread.physical_tid);
     if (query_clear_child_tid(thread.physical_tid))
       throw std::runtime_error("Thread carrier has unadopted inherited clear_child_tid registration");
+    if (thread.child_settid_pending)
+      robust_plan.store(thread.pending_child_settid, logical_thread_id(node, thread.tid));
+    robust_effects[i] = robust_plan.collect(thread, logical_thread_id(node, thread.tid));
+    if (thread.clear_child_tid && live > 1) robust_plan.store(thread.clear_child_tid, 0, true);
+    --live;
   }
   for (size_t i = 0; i < state.threads.size(); ++i) {
     auto& thread = state.threads[i];
@@ -544,6 +719,7 @@ void exit_logical_process(int node, pid_t caller, int exit_code)
     thread.xstate = capture_xstate(thread.physical_tid);
     if (thread.physical_tid == caller) thread.regs.rax = 0;
     thread.exit_code = exit_code & 255;
+    apply_robust_cleanup(state, thread, robust_effects[i]);
     clear_logical_tid(node, state, thread);
     thread.alive = false;
     thread.physical_tid = 0;

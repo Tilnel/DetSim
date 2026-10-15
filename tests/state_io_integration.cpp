@@ -163,6 +163,7 @@ int main()
             if (__rseq_size && syscall(SYS_rseq,
                     static_cast<char*>(__builtin_thread_pointer()) + __rseq_offset,
                     32, RSEQ_FLAG_UNREGISTER, RSEQ_SIG)) _exit(9);
+            if (syscall(SYS_set_robust_list, nullptr, 24)) _exit(91);
             if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr)) _exit(2);
             asm volatile("int3");
             _exit(0);

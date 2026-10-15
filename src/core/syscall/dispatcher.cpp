@@ -35,20 +35,22 @@ void validate_guest_mapping_range(uint64_t address,uint64_t length) {
         throw std::runtime_error("Guest mapping operation overlaps reserved syscall scratch page");
 }
 
-void validate_guard_mapping(pid_t pid, uint64_t address, uint64_t length) {
+void validate_anonymous_mapping_range(pid_t pid, uint64_t address, uint64_t length) {
     // Invalid alignment/empty extents retain the kernel's normal errno behavior.
     if (!length || address % 4096) return;
     const uint64_t end = address + ((length + 4095) & ~uint64_t(4095));
+    if (ptmc_state.fs_states[ptmc_state.cursor].overlaps_virtual_file_mapping(address, end))
+        throw std::runtime_error("Operation requires anonymous memory, not virtual file mappings");
     auto file = fileutils::open_cfile("/proc/" + std::to_string(pid) + "/maps", "r");
-    if (!file) throw std::runtime_error("Cannot inspect guard mapping backing");
+    if (!file) throw std::runtime_error("Cannot inspect private anonymous mapping backing");
     std::vector<maps_item> maps;
     get_maps_item(maps, file.get());
     if (ferror(file.get()) || maps.empty())
-        throw std::runtime_error("Cannot read complete guard mapping backing");
+        throw std::runtime_error("Cannot read complete private anonymous mapping backing");
     for (const auto& map : maps) {
         if (map.end <= address || map.start >= end) continue;
         if (map.flags[3] != 'p' || map.inode || map.name[0])
-            throw std::runtime_error("Guard protections require unnamed private anonymous mappings");
+            throw std::runtime_error("Operation requires unnamed private anonymous mappings");
     }
 }
 
@@ -189,6 +191,7 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
             return SyscallRoute(SyscallCategory::EMULATED, SyscallAction::EMULATE,
                                 "rseq syscall unavailable in this execution environment");
 
+        case SYS_set_robust_list: case SYS_get_robust_list:
         case SYS_clone: case SYS_clone3: case SYS_set_tid_address: case SYS_rt_sigprocmask:
         case SYS_exit: case SYS_getpid: case SYS_gettid:
             return SyscallRoute(SyscallCategory::EMULATED, SyscallAction::EMULATE,
@@ -210,7 +213,7 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         // Native queries are stable within the owned tracee. Private-memory
         // effects are included in capture; argument restrictions run on entry.
         case SYS_getuid: case SYS_geteuid: case SYS_getgid: case SYS_getegid:
-        case SYS_brk: case SYS_mprotect: case SYS_munmap:
+        case SYS_brk: case SYS_mprotect: case SYS_munmap: case SYS_madvise:
         case SYS_prlimit64:
             return SyscallRoute(SyscallCategory::PASSTHROUGH,
                                SyscallAction::EXECUTE,
@@ -293,7 +296,7 @@ bool SyscallDispatcher::on_enter(pid_t pid, int syscall_nr, syscall_info& info)
             return true;
 
         case SyscallAction::EXECUTE:
-            if (syscall_nr == SYS_mprotect || syscall_nr == SYS_munmap)
+            if (syscall_nr == SYS_mprotect || syscall_nr == SYS_munmap || syscall_nr == SYS_madvise)
                 validate_guest_mapping_range(info.args[0],info.args[1]);
             if (syscall_nr == SYS_prlimit64 &&
                 (info.args[2] || (info.args[0] && info.args[0] != uint64_t(logical_process_id(ptmc_state.cursor)))))
@@ -304,7 +307,12 @@ bool SyscallDispatcher::on_enter(pid_t pid, int syscall_nr, syscall_info& info)
                  (info.args[2] & ~uint64_t(PROT_READ|PROT_WRITE|PROT_EXEC))))
                 throw std::runtime_error("Only readable or guard protections are supported");
             if (syscall_nr == SYS_mprotect && info.args[2] == PROT_NONE)
-                validate_guard_mapping(pid, info.args[0], info.args[1]);
+                validate_anonymous_mapping_range(pid, info.args[0], info.args[1]);
+            if (syscall_nr == SYS_madvise) {
+                if (static_cast<int32_t>(info.args[2]) != MADV_DONTNEED)
+                    throw std::runtime_error("Only private anonymous MADV_DONTNEED is supported");
+                validate_anonymous_mapping_range(pid, info.args[0], info.args[1]);
+            }
             return true;
         default:
             throw std::runtime_error("Invalid syscall action");
@@ -383,6 +391,8 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
         case SYS_clone3:
         case SYS_gettid:
         case SYS_set_tid_address:
+        case SYS_set_robust_list:
+        case SYS_get_robust_list:
         case SYS_rt_sigprocmask:
         case SYS_exit:
         case SYS_exit_group:
@@ -404,6 +414,19 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
             const long result=emu_process_syscall(info);
             tracee_set_rax(pid,result);info.rval=result;
             return CKPT_YES;
+        }
+
+        case SYS_brk: {
+            auto& state = ptmc_state.running_state.child[ptmc_state.cursor];
+            // Linux returns the unchanged break on failure and the current
+            // break for a query. Only a successful shrink removes mappings.
+            if (info.args[0] && info.rval == info.args[0] && info.rval < state.brk) {
+                const uint64_t start = (info.rval + 4095) & ~uint64_t(4095);
+                const uint64_t end = (state.brk + 4095) & ~uint64_t(4095);
+                ptmc_state.fs_states[ptmc_state.cursor].remove_virtual_file_mapping(start, end);
+            }
+            state.brk = info.rval;
+            return CKPT_NO;
         }
 
         // Default - no checkpoint needed
@@ -507,6 +530,18 @@ int SyscallDispatcher::handle_fs_exit(pid_t pid, syscall_info& info)
     // Delegate to FS handlers
     int result = handlers::fs::handle(pid, info);
 
+    auto& fs = ptmc_state.fs_states[ptmc_state.cursor];
+    if (info.nr == SYS_munmap && static_cast<int64_t>(info.rval) == 0) {
+        validate_guest_mapping_range(info.args[0], info.args[1]);
+        fs.remove_virtual_file_mapping(info.args[0], info.args[0] + ((info.args[1] + 4095) & ~uint64_t(4095)));
+    }
+    // Account for anonymous MAP_FIXED replacements as well as file mappings.
+    // The returned extent is authoritative; failed syscalls never trim state.
+    if (info.nr == SYS_mmap && static_cast<int64_t>(info.rval) >= 0 &&
+        (!vfs_mmap_state_.active || !vfs_mmap_state_.error)) {
+        validate_guest_mapping_range(info.rval, info.args[1]);
+        fs.remove_virtual_file_mapping(info.rval, info.rval + ((info.args[1] + 4095) & ~uint64_t(4095)));
+    }
     if (info.nr == SYS_mmap && vfs_mmap_state_.active) {
         const auto operation=vfs_mmap_state_;
         vfs_mmap_state_={};
@@ -519,7 +554,6 @@ int SyscallDispatcher::handle_fs_exit(pid_t pid, syscall_info& info)
             registers.r8=operation.fd;registers.r9=operation.offset;
             ptrace_right(PTRACE_SETREGS,pid,nullptr,&registers);
             if (static_cast<int64_t>(info.rval)>=0) {
-                const auto& fs=ptmc_state.fs_states[ptmc_state.cursor];
                 const auto& description=fs.open_files.at(operation.fd);
                 const auto& content=fs.filesystem.at(description.path).content;
                 const size_t offset=operation.offset;
@@ -529,6 +563,7 @@ int SyscallDispatcher::handle_fs_exit(pid_t pid, syscall_info& info)
                 if (!(operation.protection&PROT_WRITE) &&
                     tracee_do_syscall(pid,SYS_mprotect,info.rval,operation.length,operation.protection,0,0,0)!=0)
                     throw std::runtime_error("Virtual mapping protection restore failed");
+                fs.add_virtual_file_mapping(info.rval, info.rval + ((operation.length + 4095) & ~uint64_t(4095)));
             }
         }
     }
