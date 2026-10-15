@@ -336,3 +336,84 @@ therefore cannot mistake a failed step for an unchanged source. Syscall-entry
 rollback first cancels the pending call without executing guest code; capture
 rejects entry stops. Internal carrier/injection failures abort exploration.
 Process exit still lacks complete descriptor/clear-tid teardown and crash semantics.
+
+## Runtime-independent task contract audit (2026-10-15)
+
+The implementation target is Linux x86-64 task semantics, not pthread functions.
+glibc/musl pthreads, native Go runtime threads and other runtimes should consume
+the same platform model. Their user-space thread descriptors, goroutine queues,
+TLS data and suspended stacks remain ordinary guest memory. Do not add runtime
+structure offsets or special checkpoint extractors to the core.
+
+A local native audit used glibc2.41 and the installed Go command, which reports
+`go1.18 gccgo ...14.2.0`, not the standard gc compiler. A pthread TLS/condition/
+join/robust-owner-death probe completed normally and traced clone3 with
+PARENT_SETTID+CHILD_CLEARTID, set_tid_address, set_robust_list, rseq, signal masks,
+futex and PROT_NONE stack reservation. Its join used shared WAIT_BITSET with
+CLOCK_REALTIME and a null timeout; the present futex model already accepts that
+combination, so clear-tid notification is the missing part, not this null timeout.
+The gccgo goroutine/channel/sleep probe also completed normally and traced the
+pthread creation path, altstack and epoll. These are native dependency inventories,
+not DetSim pass results. Sources, native traces and summary are retained locally
+under ignored `build/runtime-thread-audit/`; syscall counts depend on this workload
+and runtime version. No dependency was installed.
+
+Upstream gc Go separately implements OS-thread creation through clone and TLS,
+masking signals around birth; its goroutine scheduler maps Gs to Ms and Ps. It
+also uses signal-based asynchronous preemption. Therefore gccgo observations must
+not stand in for gc Go or cgo coverage.
+
+Sources: [glibc2.41 create](https://raw.githubusercontent.com/bminor/glibc/release/2.41/master/nptl/pthread_create.c),
+[glibc2.41 join](https://raw.githubusercontent.com/bminor/glibc/release/2.41/master/nptl/pthread_join_common.c),
+[Go scheduler](https://go.dev/src/runtime/HACKING),
+[Go Linux threads](https://go.dev/src/runtime/os_linux.go),
+[Go amd64 clone/TLS](https://go.dev/src/runtime/sys_linux_amd64.s),
+[Go signal preemption](https://go.dev/src/runtime/signal_unix.go),
+[Linux robust ABI](https://www.kernel.org/doc/html/latest/locking/robust-futex-ABI.html).
+
+The next platform slices should be tested across runtimes:
+
+1. Normalize clone/clone3 into one birth request. Model parent TID copyout,
+   child-start TID copyout at its correct phase, set_tid_address and logical exit
+   clear32+wake-at-address. A join waiter must be woken by address; removing the
+   exiting thread's own futex wait record is a different operation. Native error
+   and ordering oracles are required; merely enabling clone flags is insufficient.
+2. Archive per-task ABI state: clear-tid registration, robust head/length, signal
+   mask, alternate stack, pending/start/restart phases. Keep process dispositions
+   and process-directed pending signals separate. Reset old carrier registrations
+   and install the new logical task's state before running it. These fields must
+   survive copy/archive/restore/identity, including the trusted startup boundary.
+3. Support guard/reserved mappings, common TLS installation and virtual timed
+   waits/readiness. Share one wait/deadline mechanism among futex, sleep and epoll;
+   enumerate eligible wake outcomes and runnable task actors.
+4. Add robust owner-death from the Linux linked-list ABI, including pending entry
+   and owner bits; do not inspect pthread private fields. PI futex remains a
+   separate feature. A coherent rseq-absent virtual kernel from exec entry can
+   support runtime fallback; full rseq requires a separate CPU/critical-section
+   model. Do not grant successful registration and then erase the whole region.
+5. Signal mask/altstack restoration is not signal delivery. Delivery needs
+   modeled pending events, target selection, frames, rt_sigreturn and blocked-call
+   interruption/restart. pthread cancellation and Go asynchronous preemption
+   exercise that shared machinery; suppressing their signals changes behavior.
+
+Two existing prelude shortcuts need independent repair: set_tid_address returns
+114514 after executing the real registration, and capture masks the whole recorded
+rseq region while restore preserves its live bytes. These are not a foundation for
+full runtime support. ABI handlers should apply consistently from the exec stop,
+even where the loader prelude otherwise remains a declared trusted environment.
+
+OS-thread fidelity and schedule coverage remain separate acceptance levels.
+Capturing all guest memory plus logical task contexts can preserve goroutine
+scheduler state without extracting G/P objects. But syscall-only stepping cannot
+bound pure computation or expose every memory/atomic/preemption interleaving.
+A generic instruction/shared-memory boundary backend, explicit memory model and
+reduction strategy are a separate project. Optional runtime observers may name
+user tasks; core actors should not silently become goroutines. Disabling GC,
+async preemption or lowering GOMAXPROCS defines a restricted workload profile,
+not proof for the original configuration.
+
+Use capability-scoped tests, not a blanket pthread-supported flag: first native
+raw ABI + glibc/musl create/join/TLS and restore; then mutex/condition/timeouts;
+then robust, signals/cancellation, gc Go scheduling/netpoll/GC, and mixed cgo.
+A runtime starting or one pthread example passing does not establish exhaustive
+model checking for that runtime.

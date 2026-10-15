@@ -175,3 +175,14 @@ full rollback after failed guest execution or partial restore. Entry cancellatio
 skips a pending syscall before restore injection; capture refuses such a phase.
 C02 remains partial for full Linux lifecycle; C03/C25 actor and instruction-level
 coverage remain open despite the explicit transition actor API.
+
+## Cross-runtime follow-up
+
+The [Linux task contract audit](development.md#runtime-independent-task-contract-audit-2026-10-15)
+separates kernel ABI coverage from user-level scheduler coverage. Next bounded
+slice: clone/clone3 TID copyout + modeled clear-tid/join, with initial-thread
+registration handled from exec rather than the prelude's114514 return shortcut.
+Guard mappings, per-task masks/altstack, timed waits, robust and signal delivery
+remain generic capabilities. The rseq whole-region masking/live-byte preservation
+shortcut remains unverified semantic debt, including on the single-thread path;
+raw clone currently rejects rseq rather than certifying that shortcut.
