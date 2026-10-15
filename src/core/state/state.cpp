@@ -1159,6 +1159,7 @@ void tracee_state::prepare_capture(pid_t pid)
     for (pid_t tid : get_thread_list(pid)) {
       add_thread(tid, 0, 0, 0, tid == pid);
       threads.back().signal_mask = read_thread_signal_mask(tid);
+      threads.back().comm = capture_native_thread_comm(tid);
     }
   }
   if (threads.size() > MAX_THREADS_PER_PROCESS)
@@ -1230,6 +1231,7 @@ void tracee_state::add_thread(pid_t physical_tid, uint64_t clone_flags, uint64_t
   if (ptid && parent == threads.end())
     throw std::runtime_error("Thread creation parent has no owned logical binding");
   const pid_t logical_parent = !ptid || parent == threads.end() ? 0 : parent->tid;
+  if(ptid && parent!=threads.end()) ts.comm=parent->comm;
   ts.ptid = logical_parent;
   ts.is_main = is_main;
 

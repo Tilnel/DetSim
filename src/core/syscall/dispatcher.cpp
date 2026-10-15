@@ -127,7 +127,7 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         case SYS_setitimer:
         case SYS_getitimer:
         case SYS_umask:
-        case SYS_getrlimit: case SYS_prlimit64:
+        case SYS_getrlimit: case SYS_prlimit64: case SYS_prctl:
             return SyscallRoute(SyscallCategory::EMULATED,
                                SyscallAction::EMULATE,
                                "Time syscall - emulated");
@@ -428,7 +428,7 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
         case SYS_clock_gettime: case SYS_clock_getres: case SYS_time:
         case SYS_getrandom: case SYS_sysinfo: case SYS_sched_getaffinity: case SYS_rt_sigaction:
         case SYS_setitimer: case SYS_getitimer: case SYS_umask:
-        case SYS_getrlimit: case SYS_prlimit64: {
+        case SYS_getrlimit: case SYS_prlimit64: case SYS_prctl: {
             const long result=emu_process_syscall(info);
             tracee_set_rax(pid,result);info.rval=result;
             return CKPT_YES;

@@ -29,6 +29,7 @@ alignas(32) static std::array<unsigned char,32> rseq_buffer{};
 static uint64_t robust_head_output=0x11223344,robust_length_output=0x55667788;
 static const char replacement_name[] = "escaped";
 static rlimit guest_limit{};
+static char guest_name[16]{};
 static timespec guest_zero{}, guest_delay{1,0}, guest_invalid{-1,0};
 
 static void check(bool condition, const char* label) {
@@ -189,7 +190,7 @@ int main() {
         SyscallDispatcher dispatcher;
         check(SyscallRoute{}.action == SyscallAction::REJECT, "default route rejects unknown host effects");
         bool unknown_rejected = true;
-        for (const auto number : {-1, 1000000, SYS_prctl, SYS_kill, SYS_ptrace, SYS_reboot})
+        for (const auto number : {-1, 1000000, SYS_kill, SYS_ptrace, SYS_reboot})
             unknown_rejected &= dispatcher.get_route(number).action == SyscallAction::REJECT;
         check(unknown_rejected, "unmodeled and out-of-range syscalls reject");
         for (const auto args : {std::array<uint64_t,6>{reinterpret_cast<uint64_t>(rseq_buffer.data()),32,0,RSEQ_SIG,0,0},
@@ -232,7 +233,44 @@ int main() {
         execute(dispatcher,child,SYS_set_robust_list,{0,24,0,0,0,0});
         auto result = execute(dispatcher, child, SYS_prctl,
                               {PR_SET_NAME, reinterpret_cast<uint64_t>(replacement_name), 0, 0, 0, 0});
-        check(result.rejected && child_name(child) == "policy-child", "PR_SET_NAME rejected before host mutation");
+        check(!result.rejected && result.value==0 && child_name(child)=="policy-child",
+              "PR_SET_NAME updates logical name without host mutation");
+        result=execute(dispatcher,child,SYS_prctl,
+                       {PR_GET_NAME,reinterpret_cast<uint64_t>(guest_name),0,0,0,0});
+        char observed_name[16]{};
+        check(!result.rejected && result.value==0 &&
+              guest_read_exact(child,guest_name,observed_name,sizeof(observed_name)) &&
+              !strcmp(observed_name,replacement_name),"PR_GET_NAME reads saved logical name");
+        auto& prctl_state=ptmc_state.process_states[0];
+        for(unsigned capability=0;capability<=64;++capability) {
+            const long native=tracee_do_syscall(child,SYS_prctl,PR_CAPBSET_READ,capability,0,0,0,0);
+            if(native==-EINVAL) {prctl_state.capability_count=capability;break;}
+            if(capability==64 || native<0) throw std::runtime_error("policy capability oracle");
+            prctl_state.capability_mask|=uint64_t(native)<<capability;
+        }
+        for(uint64_t capability:{uint64_t(0),uint64_t(prctl_state.capability_count),uint64_t(1)<<32}) {
+            const auto query=execute(dispatcher,child,SYS_prctl,
+                {0xffffffff00000000ULL|PR_CAPBSET_READ,capability,~0ULL,~0ULL,~0ULL,0});
+            const long expected=capability>=prctl_state.capability_count ? -EINVAL : (prctl_state.capability_mask>>capability)&1;
+            check(!query.rejected && query.value==expected,"actual capability query preserves cap64 option32 and ignored tails");
+        }
+        const auto prctl_comm=ptmc_state.running_state.child[0].threads[0].comm;
+        std::array<unsigned char,4096> prctl_page{},prctl_after{};
+        if(!guest_read_exact(child,reinterpret_cast<void*>(scratch_page),prctl_page.data(),prctl_page.size()))
+            throw std::runtime_error("prctl scratch fixture");
+        for(uint64_t option:{uint64_t(PR_GET_DUMPABLE),uint64_t(PR_SET_DUMPABLE),uint64_t(PR_CAPBSET_DROP),uint64_t(PR_SET_NO_NEW_PRIVS),uint64_t(-1)})
+            check(execute(dispatcher,child,SYS_prctl,{option,scratch_page+0xff0,~0ULL,~0ULL,~0ULL,0}).rejected,
+                  "unknown prctl options reject before pointer or host state effects");
+        for(uint64_t option:{uint64_t(PR_SET_NAME),uint64_t(PR_GET_NAME)})
+            for(uint64_t address:{scratch_page+0x100,scratch_page+0xff0,scratch_page-8}) {
+                user_regs_struct before{},after{};ptrace(PTRACE_GETREGS,child,nullptr,&before);
+                const auto rejected=execute(dispatcher,child,SYS_prctl,{option,address,~0ULL,~0ULL,~0ULL,0});
+                check(rejected.rejected && guest_read_exact(child,reinterpret_cast<void*>(scratch_page),prctl_after.data(),prctl_after.size()) &&
+                      prctl_page==prctl_after && ptmc_state.running_state.child[0].threads[0].comm==prctl_comm &&
+                      ptrace(PTRACE_GETREGS,child,nullptr,&after)==0 && !memcmp(&before,&after,sizeof(before)),
+                      "prctl name control-page overlap rejects without name page or register mutation");
+            }
+
         for (const auto number : {SYS_getrandom, SYS_clock_gettime, SYS_time, SYS_gettimeofday}) {
             const auto action = dispatcher.get_route(number).action;
             check(action == SyscallAction::EMULATE || action == SyscallAction::REJECT,

@@ -773,6 +773,7 @@ change modeled answers; archive/copy/identity and malformed-table rejection pass
 Standalone EOF-backing native oracle (not a DetSim mapping acceptance gate):
 
 ```sh
+mkdir -p build/file-eof-native-oracle
 /usr/bin/g++ -std=c++20 -O2 -g -Wall -Wextra -Werror tests/file_eof_native_oracle.cpp -o build/file-eof-native-oracle/oracle
 build/file-eof-native-oracle/oracle
 ```
@@ -784,3 +785,24 @@ per run with memfd_noexec=0 and zero execution-policy skips; strict and UBSan
 runs pass. Clang analysis is clean. GCC14 fanalyzer reports a policy-fd leak despite
 an unconditional close and stable runtime descriptor counts; its failing log is
 retained rather than suppressed. Framework EOF capture/restore remains unimplemented.
+
+
+prctl exposes only PR_CAPBSET_READ and per-thread PR_SET_NAME/PR_GET_NAME.
+Capability support count/bounding bits are captured once;0/0 marks an uninitialized
+profile and queries reject explicitly until capture. Unsupported capabilities
+return EINVAL using the full64-bit argument; option uses low32 bits. Other prctl
+operations, capability mutation, namespaces and dynamic procfs comm remain rejected.
+
+Each logical task saves a canonical16-byte name, inherits from its logical parent,
+retains its frozen exit name and never adopts a reused carrier's physical name.
+SET reads at most15bytes and commits after successful copy; GET preserves native
+partial copyout. Control-page aliases reject. Initial low-level adoption reads
+/proc without resuming anything before stop barriers; final bootstrap imports a
+late native prelude name transactionally. Ordinary capture/restore never refreshes
+names from host state. Layout33/34 and kernelv20 identify both new state fields.
+
+Native ABI, process/policy/IO gates, thread control/carrier and four full/pages
+normal/tiny lifecycle runs pass. A real startup157 scenario executes native
+SET_NAME in the prelude, then checks controlled GET_NAME, search, output/exit and
+three identical replays in both backends.25 native scenarios,12 paired case rows,
+page-snapshot/state-I/O, make check and NP1/NP3 production builds also pass.

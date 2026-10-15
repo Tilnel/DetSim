@@ -316,6 +316,7 @@ pid_t record_logical_clear_tid(int node, pid_t physical_tid, uint64_t address)
       throw std::runtime_error("Initial logical thread must be the owned leader");
     const uint64_t mask = read_thread_signal_mask(physical_tid);
     state.add_thread(physical_tid, 0, 0, 0, true);
+    state.threads.back().comm=capture_native_thread_comm(physical_tid);
     state.threads.back().signal_mask = mask;
   }
   const auto found = std::find_if(state.threads.begin(), state.threads.end(),
@@ -664,6 +665,7 @@ pid_t create_logical_thread(int node, pid_t parent, const CloneRequest& request)
   const auto xstate = capture_xstate(parent);
   const auto parent_slot = static_cast<size_t>(source - state.threads.begin());
   const uint64_t inherited_mask = source->signal_mask;
+  const auto inherited_comm = source->comm;
   std::set<pid_t> occupied;
   for (const auto& thread : state.threads)
     if (thread.alive) occupied.insert(thread.physical_tid);
@@ -689,6 +691,7 @@ pid_t create_logical_thread(int node, pid_t parent, const CloneRequest& request)
   child.regs = regs;
   child.xstate = xstate;
   child.signal_mask = inherited_mask;
+  child.comm = inherited_comm;
   child.clear_child_tid = (flags & CLONE_CHILD_CLEARTID) ? child_tid : 0;
   child.child_settid_pending = flags & CLONE_CHILD_SETTID;
   child.pending_child_settid = child.child_settid_pending ? child_tid : 0;

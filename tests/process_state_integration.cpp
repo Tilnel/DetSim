@@ -5,6 +5,7 @@
 #include "engine/thread_pool.h"
 #include "signal_handler.h"
 #include "cereal/archives/binary.hpp"
+#include "cereal/types/vector.hpp"
 #include <array>
 #include <cerrno>
 #include <cstring>
@@ -13,6 +14,7 @@
 #include <sstream>
 #include <sys/random.h>
 #include <sys/resource.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
 #include <sys/time.h>
@@ -24,6 +26,8 @@
 extern "C" detsim::ui::NCursesUI* get_ncurses_ui() { return nullptr; }
 static int failures;
 static KernelResourceLimit guest_resource_output;
+static const char late_boundary_name[]="late\nboundary";
+static const char rejected_boundary_name[]="reject-publish";
 static void check(bool value, const char* name) {
     printf("%s %s\n", value ? "PASS" : "FAIL", name);
     failures += !value;
@@ -110,7 +114,7 @@ static void check_resource_queries() {
     check(restored==state && archive(restored)==encoded,"all resource limits survive archive round trip");
     std::string malformed=encoded;
     const KernelResourceLimit invalid{1,0};
-    memcpy(malformed.data()+malformed.size()-16*16,&invalid,sizeof(invalid));
+    memcpy(malformed.data()+malformed.size()-16*16-12,&invalid,sizeof(invalid));
     const auto unchanged=restored;
     bool rejected=false;
     try {std::istringstream input(malformed);cereal::BinaryInputArchive a(input);a(restored);}
@@ -119,11 +123,109 @@ static void check_resource_queries() {
     state=before;
 }
 
+static void check_prctl_model() {
+    auto& state=ptmc_state.process_states[0];
+    const auto saved_state=state;
+    auto& threads=ptmc_state.running_state.child[0].threads;
+    const auto saved_threads=threads;
+    thread_state task;task.tid=1;task.alive=true;task.is_main=true;task.physical_tid=getpid();
+    threads={task};ptmc_state.current_thread_idx[0]=0;
+    bool unavailable=false;
+    try {call(SYS_prctl,PR_CAPBSET_READ,0);}catch(const std::runtime_error&) {unavailable=true;}
+    check(unavailable,"uncaptured capability boundary is explicitly unavailable");
+    state.capability_mask=0;
+    for(unsigned capability=0;capability<=64;++capability) {
+        errno=0;
+        const long result=syscall(SYS_prctl,PR_CAPBSET_READ,capability,~0UL,~0UL,~0UL);
+        if(result<0) {check(errno==EINVAL && capability>0,"native capability count ends at EINVAL");state.capability_count=capability;break;}
+        if(capability==64) throw std::runtime_error("native capability range exceeds model");
+        state.capability_mask|=uint64_t(result)<<capability;
+    }
+    for(unsigned capability=0;capability<state.capability_count;++capability)
+        check(call(SYS_prctl,0x100000000ULL|PR_CAPBSET_READ,capability,~0ULL,~0ULL)==
+              syscall(SYS_prctl,PR_CAPBSET_READ,capability,~0UL,~0UL,~0UL),"captured capability bitmap matches native queries");
+    for(uint64_t capability:{uint64_t(state.capability_count),uint64_t(1)<<32,UINT64_MAX}) {
+        errno=0;
+        check(syscall(SYS_prctl,PR_CAPBSET_READ,capability,0,0,0)==-1 && errno==EINVAL &&
+              call(SYS_prctl,PR_CAPBSET_READ,capability)==-EINVAL,"capability argument retains all64 bits");
+    }
+    char native_before[16]{},native_after[16]{};
+    check(syscall(SYS_prctl,PR_GET_NAME,native_before,0,0,0)==0,"native initial comm");
+    const char name[]="logical\nname";
+    check(syscall(SYS_prctl,0x100000000ULL|PR_SET_NAME,name,~0UL,~0UL,~0UL)==0 &&
+          syscall(SYS_prctl,PR_GET_NAME,native_after,~0UL,~0UL,~0UL)==0 && !strcmp(native_after,name),
+          "native prctl option32 and ignored trailing args");
+    const auto adopted=capture_native_thread_comm(getpid());
+    check(!strcmp(adopted.data(),name),"proc adoption retains embedded newline without injection page");
+    syscall(SYS_prctl,PR_SET_NAME,native_before,0,0,0);
+    check(call(SYS_prctl,0x100000000ULL|PR_SET_NAME,reinterpret_cast<uint64_t>(name),~0ULL,~0ULL)==0 &&
+          !strcmp(threads[0].comm.data(),name) && syscall(SYS_prctl,PR_GET_NAME,native_after,0,0,0)==0 &&
+          !memcmp(native_after,native_before,16),"logical SET_NAME preserves physical thread name");
+    auto* pages=static_cast<char*>(mmap(nullptr,8192,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));
+    if(pages==MAP_FAILED) throw std::runtime_error("prctl name boundary fixture");
+    memset(pages,'x',8192);mprotect(pages+4096,4096,PROT_NONE);
+    check(syscall(SYS_prctl,PR_SET_NAME,pages+4096-15,0,0,0)==0 &&
+          call(SYS_prctl,PR_SET_NAME,reinterpret_cast<uint64_t>(pages+4096-15))==0 &&
+          !memcmp(threads[0].comm.data(),"xxxxxxxxxxxxxxx",16),"SET_NAME needs only fifteen readable nonNUL bytes");
+    const auto previous=threads[0].comm;
+    errno=0;
+    check(syscall(SYS_prctl,PR_SET_NAME,pages+4096-14,0,0,0)==-1 && errno==EFAULT &&
+          call(SYS_prctl,PR_SET_NAME,reinterpret_cast<uint64_t>(pages+4096-14))==-EFAULT &&
+          threads[0].comm==previous,"SET_NAME fault after fourteen bytes preserves old logical name");
+    pages[4095]=0;
+    check(call(SYS_prctl,PR_SET_NAME,reinterpret_cast<uint64_t>(pages+4095))==0 &&
+          threads[0].comm==std::array<char,16>{},"SET_NAME stops at NUL and zero fills entire comm");
+    threads[0].comm=previous;
+    mprotect(pages+4096,4096,PROT_READ);
+    for(size_t prefix:{size_t(1),size_t(7),size_t(8),size_t(15)}) {
+        auto* output=pages+4096-prefix;memset(output,0x5a,prefix);
+        errno=0;
+        const long result=syscall(SYS_prctl,PR_GET_NAME,output,~0UL,~0UL,~0UL);
+        std::array<char,16> oracle{};memcpy(oracle.data(),output,16);
+        const bool fault=result==-1 && errno==EFAULT;
+        memset(output,0x5a,prefix);
+        check(fault && call(SYS_prctl,PR_GET_NAME,reinterpret_cast<uint64_t>(output),~0ULL,~0ULL)==-EFAULT &&
+              !memcmp(output,oracle.data(),16),"GET_NAME matches native partial prefix EFAULT");
+    }
+    munmap(pages,8192);syscall(SYS_prctl,PR_SET_NAME,native_before,0,0,0);
+    const auto encoded=archive(state);
+    ProcessKernelState restored;
+    {std::istringstream input(encoded);cereal::BinaryInputArchive ar(input);ar(restored);}
+    check(restored==state,"capability count and mask survive canonical archive");
+    auto cap_changed=state;cap_changed.capability_mask^=1;
+    tracee_state cap_original;cap_original.process_state=state;
+    tracee_state cap_copy=cap_original;cap_copy.process_state=cap_changed;
+    check(archive(cap_changed)!=encoded && !cap_original.metadata_equal(cap_copy),
+          "capability-only mutation enters copy archive and machine metadata identity");
+    for(const auto invalid:std::array<std::pair<uint32_t,uint64_t>,3>{{{0,1},{65,0},{1,2}}}) {
+        auto bytes=encoded;memcpy(bytes.data()+bytes.size()-12,&invalid.first,4);memcpy(bytes.data()+bytes.size()-8,&invalid.second,8);
+        bool rejected=false;
+        try {std::istringstream input(bytes);cereal::BinaryInputArchive ar(input);ar(restored);}catch(const std::runtime_error&) {rejected=true;}
+        check(rejected && restored==state,"malformed capability archive rejects atomically");
+    }
+    auto thread_bytes=[](thread_state& value) {std::ostringstream out;{cereal::BinaryOutputArchive ar(out);ar(value);}return out.str();};
+    auto copy=threads[0];copy.comm[0]='z';
+    check(copy.comm!=threads[0].comm && thread_bytes(copy)!=thread_bytes(threads[0]),"thread comm is copied and enters serialized identity");
+    for(bool terminate:{false,true}) {
+        auto malformed=threads[0];malformed.comm.fill('q');if(terminate) malformed.comm[0]=0;
+        bool rejected=false;try {(void)thread_bytes(malformed);}catch(const std::runtime_error&) {rejected=true;}
+        check(rejected,"noncanonical or unterminated thread name rejects archive");
+        auto bytes=thread_bytes(threads[0]);
+        std::fill(bytes.end()-17,bytes.end()-1,'q');if(terminate) bytes[bytes.size()-17]=0;
+        rejected=false;
+        try {std::istringstream input(bytes);cereal::BinaryInputArchive ar(input);thread_state decoded;ar(decoded);}
+        catch(const std::runtime_error&) {rejected=true;}
+        check(rejected,"noncanonical or unterminated persisted comm rejects load");
+    }
+    threads=saved_threads;state=saved_state;
+}
+
 int main() {
     ptmc_state.cursor=0;ptmc_state.pids[0]=getpid();
     ptmc_state.process_states[0]=ProcessKernelState{};
     ptmc_state.time[0]={123,456789};
     check_resource_queries();
+    check_prctl_model();
     auto original=ptmc_state.process_states[0];
     std::array<unsigned char,40> bytes{},again{};
     check(call(SYS_getrandom,reinterpret_cast<uint64_t>(bytes.data()),bytes.size(),0)==40,"random returns bytes");
@@ -269,10 +371,23 @@ int main() {
                 std::array<unsigned char,128> scratch_before{},scratch_after{};
                 scratch_before.fill(0x6b);
                 guest_write_exact(child,reinterpret_cast<void*>(scratch_page+0x800),scratch_before.data(),scratch_before.size());
+                adopt_thread_signal_mask(0,child); // Early adoption precedes the chosen startup boundary.
+                guest_write_exact(child,reinterpret_cast<void*>(scratch_page+0x900),late_boundary_name,sizeof(late_boundary_name));
+                check(tracee_do_syscall(child,SYS_prctl,PR_SET_NAME,scratch_page+0x900,0,0,0,0)==0,
+                      "native prelude changes name after early adoption");
                 capture_process_kernel_state(child,0);
+                std::array<char,16> late_name{};
+                check(call(SYS_prctl,PR_GET_NAME,reinterpret_cast<uint64_t>(&guest_resource_output))==0 &&
+                      guest_read_exact(child,&guest_resource_output,late_name.data(),late_name.size()) &&
+                      !strcmp(late_name.data(),late_boundary_name),"final bootstrap imports late prelude name for logical GET_NAME");
                 check(guest_read_exact(child,reinterpret_cast<void*>(scratch_page+0x800),scratch_after.data(),scratch_after.size()) &&
                       scratch_after==scratch_before,"resource capture preserves injected scratch bytes");
                 const auto captured=ptmc_state.process_states[0];
+                check(captured.capability_count>0 && captured.capability_count<=64,
+                      "bootstrap captures supported capability range");
+                for(unsigned capability=0;capability<captured.capability_count;++capability)
+                    check(tracee_do_syscall(child,SYS_prctl,PR_CAPBSET_READ,capability,0,0,0,0)==
+                          ((captured.capability_mask>>capability)&1),"bootstrap captures native capability bitmap");
                 for(unsigned resource=0;resource<16;++resource) {
                     KernelResourceLimit native{};
                     check(tracee_do_syscall(child,SYS_prlimit64,0,resource,0,scratch_page+0x900,0,0)==0 &&
@@ -319,10 +434,15 @@ int main() {
                 stack_t enabled{};enabled.ss_sp=reinterpret_cast<void*>(0x100000);enabled.ss_size=8192;
                 guest_write_exact(child,reinterpret_cast<void*>(scratch_page+0x900),&enabled,sizeof(enabled));
                 if(static_cast<int64_t>(tracee_do_syscall(child,SYS_sigaltstack,scratch_page+0x900,0,0,0,0,0))==0) {
+                    const auto previous_comm=ptmc_state.running_state.child[0].threads.front().comm;
+                    check(tracee_do_syscall(child,SYS_prctl,PR_SET_NAME,reinterpret_cast<uint64_t>(rejected_boundary_name),0,0,0,0)==0,
+                          "native name changes before rejected bootstrap");
                     try {capture_process_kernel_state(child,0);}
                     catch(const std::runtime_error& e) {
                         enabled_altstack_rejected=std::string(e.what()).find("Inherited alternate signal stacks")!=std::string::npos;
                     }
+                    check(enabled_altstack_rejected && ptmc_state.running_state.child[0].threads.front().comm==previous_comm,
+                          "failed final bootstrap does not publish freshly queried comm");
                 }
                 stack_t disabled{};disabled.ss_flags=static_cast<int>(0x80000002u);
                 guest_write_exact(child,reinterpret_cast<void*>(scratch_page+0x900),&disabled,sizeof(disabled));

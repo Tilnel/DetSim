@@ -14,6 +14,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <sys/random.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
 #include <sys/time.h>
@@ -66,12 +67,33 @@ template<class Archive> void ProcessKernelState::serialize(Archive& ar) {
         ar(limit.current,limit.maximum);
         if(limit.current>limit.maximum) throw std::runtime_error("Invalid captured resource limit");
     }
+    uint32_t count_caps=capability_count;
+    uint64_t mask_caps=capability_mask;
+    ar(count_caps,mask_caps);
+    if(count_caps>64 || (count_caps<64 && (mask_caps>>count_caps)))
+        throw std::runtime_error("Invalid captured capability boundary");
     if constexpr(Archive::is_loading::value) {
         random_state=seed;signal_actions=std::move(actions);resource_limits=limits;
+        capability_count=count_caps;capability_mask=mask_caps;
     }
 }
 template void ProcessKernelState::serialize(cereal::BinaryInputArchive&);
 template void ProcessKernelState::serialize(cereal::BinaryOutputArchive&);
+
+std::array<char,16> capture_native_thread_comm(int pid) {
+    // Initial low-level adoption precedes the stop barrier: never inject here.
+    std::ifstream input("/proc/"+std::to_string(pid)+"/comm",std::ios::binary);
+    if(!input) throw std::runtime_error("Cannot read initial native thread name");
+    std::string bytes((std::istreambuf_iterator<char>(input)),{});
+    if(input.bad() || bytes.empty() || bytes.back()!='\n')
+        throw std::runtime_error("Invalid initial native thread name");
+    bytes.pop_back(); // Preserve any newlines inside the actual name.
+    if(bytes.size()>15 || bytes.find('\0')!=std::string::npos)
+        throw std::runtime_error("Invalid initial native thread name bytes");
+    std::array<char,16> name{};
+    std::copy(bytes.begin(),bytes.end(),name.begin());
+    return name;
+}
 
 void capture_process_kernel_state(int pid,int node) {
     if(node<0 || node>=NP) throw std::runtime_error("Invalid kernel process capture node");
@@ -83,6 +105,7 @@ void capture_process_kernel_state(int pid,int node) {
     if(threads!=1) throw std::runtime_error("Cannot inspect startup process thread set");
     adopt_thread_signal_mask(node,pid);
     ProcessKernelState captured;
+    std::array<char,16> captured_comm{};
     uint32_t inherited_altstack_flags=SS_DISABLE;
     const uintptr_t address=scratch_page+0x800;
     std::array<unsigned char,128> original{};
@@ -97,11 +120,25 @@ void capture_process_kernel_state(int pid,int node) {
             throw std::runtime_error("Cannot read inherited process kernel state");
     };
     try {
+        // Trusted prelude syscalls may have renamed the physical task since
+        // early adoption. Publish its final boundary name only on full success.
+        query(SYS_prctl,PR_GET_NAME,address,0,0);read(captured_comm);
+        const auto end=std::find(captured_comm.begin(),captured_comm.end(),'\0');
+        if(end==captured_comm.end()) throw std::runtime_error("Unterminated bootstrap thread name");
+        std::fill(end,captured_comm.end(),'\0');
         for(unsigned resource=0;resource<captured.resource_limits.size();++resource) {
             query(SYS_prlimit64,0,resource,0,address);
             auto& limit=captured.resource_limits[resource];read(limit);
             if(limit.current>limit.maximum) throw std::runtime_error("Invalid inherited resource limit");
         }
+        for(unsigned capability=0;capability<=64;++capability) {
+            const long result=tracee_do_syscall(pid,SYS_prctl,PR_CAPBSET_READ,capability,0,0,0,0);
+            if(result==-EINVAL) {captured.capability_count=capability;break;}
+            if(result<0 || result>1 || capability==64)
+                throw std::runtime_error("Unsupported inherited capability boundary");
+            captured.capability_mask|=uint64_t(result)<<capability;
+        }
+        if(!captured.capability_count) throw std::runtime_error("Cannot capture supported capability range");
         for(int signal=1;signal<=64;++signal) {
             query(SYS_rt_sigaction,signal,0,address,8);
             KernelSigaction action{};read(action);
@@ -147,6 +184,7 @@ void capture_process_kernel_state(int pid,int node) {
     auto& task=ptmc_state.running_state.child[node].threads.front();
     task.altstack_sp=task.altstack_size=0;
     task.altstack_flags=inherited_altstack_flags;
+    task.comm=captured_comm;
     ptmc_state.process_states[node]=std::move(captured);
     ptmc_state.fs_states[node].set_creation_mask(creation_mask);
 }
@@ -163,6 +201,33 @@ long emu_process_syscall(const syscall_info& info) {
         return guest_read_exact(pid,reinterpret_cast<const void*>(address),&value,sizeof(value));
     };
     switch(info.nr) {
+    case SYS_prctl: {
+        const uint32_t option=info.args[0];
+        if(option!=PR_CAPBSET_READ && option!=PR_SET_NAME && option!=PR_GET_NAME)
+            throw std::runtime_error("Unsupported modeled prctl option");
+        if(option==PR_CAPBSET_READ) {
+            if(!state.capability_count) throw std::runtime_error("Capability boundary has not been captured");
+            const uint64_t capability=info.args[1];
+            return capability>=state.capability_count ? -EINVAL : (state.capability_mask>>capability)&1;
+        }
+        auto& threads=ptmc_state.running_state.child[node].threads;
+        const auto found=std::find_if(threads.begin(),threads.end(),[pid](const thread_state& thread) {
+            return thread.alive && thread.physical_tid==pid;
+        });
+        if(found==threads.end()) throw std::runtime_error("Thread name has no live logical owner");
+        const uint64_t address=info.args[1];
+        const size_t size=option==PR_GET_NAME?16:15;
+        if(address<scratch_page+4096 && address>scratch_page-size)
+            throw std::runtime_error("Thread name buffer overlaps reserved syscall scratch page");
+        if(option==PR_GET_NAME) return write(address,found->comm)?0:-EFAULT;
+        std::array<char,16> name{};
+        for(unsigned offset=0;offset<15;++offset) {
+            if(address>UINT64_MAX-offset || !read(address+offset,name[offset])) return -EFAULT;
+            if(!name[offset]) break;
+        }
+        found->comm=name;
+        return 0;
+    }
     case SYS_getrlimit:case SYS_prlimit64: {
         const bool extended=info.nr==SYS_prlimit64;
         if(extended && (info.args[2] || (static_cast<int32_t>(info.args[0])!=0 &&

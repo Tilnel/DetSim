@@ -679,3 +679,33 @@ explicit FileEofFault regions, no fabricated zero payload, both readers unavaila
 on faults, target-snapshot restore of genuine fault backing, serialized provenance
 and fixed-image mutation guards. Python Queue/Java/module claims remain non-green
 until actual program execution, property and replay gates pass.
+
+
+### Captured capability bounds and logical task names
+
+Closed prctl subset: CAPBSET_READ imports native support count+bounding mask once,
+with explicit uncaptured0/0 marker; SET_NAME/GET_NAME use canonical per-task16bytes.
+Names enter copy/archive/identity/restore, inherit from logical parent before
+vector growth, freeze on exit and survive carrier reuse without physical rename.
+Native oracles cover option32/caparg64 and SET15/GET16 fault/partial-copy semantics.
+
+Independent review caught two closure bugs before commit: late prelude native
+rename was not imported, and first-capture helper could inject before stop barriers.
+Final bootstrap now commits its local name only after the entire transaction;
+low-level adoption only reads /proc, never resumes a task. New RED/GREEN wrapper
+regression verifies first capture with running worker rejects with zero resume
+attempts and unchanged registers/control page. The real startup157 scenario checks
+both backends through search, controlled GET/output/exit and3x same hashes.
+
+Independent final review approves; NP2process245/policy134/IO244, thread control/
+carrier, four lifecycle combinations,25 native scenarios,12case rows, snapshot/
+state-I/O, make check and NP1/NP3 builds pass. Layout33/34, kernelv20. This does
+not implement arbitrary prctl, capability mutation or dynamic procfs names.
+
+Real module attempt now searches rather than rejecting its capability query:
+three actual Redis+module processes, pages DFSdepth500, about5755unique states
+at the180s timeout. No business client or property checkpoint yet, cleanup-9;
+recorded owner group has no surviving tasks. Evidence:
+build/workloads/module-control-1b3dchvf/result.json. This is execution/search
+progress only. Next prioritize a controlled startup prefix and real client, not
+unbounded startup interleavings; ftruncate is statically identified at log init.

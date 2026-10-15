@@ -31,10 +31,14 @@ public:
     uint64_t random_state = 0x4d595df4d0f33173ULL;
     std::map<int, KernelSigaction> signal_actions;
     std::array<KernelResourceLimit,16> resource_limits{};
+    // Zero/zero means not captured (unstarted nodes and standalone fixtures).
+    uint32_t capability_count = 0;
+    uint64_t capability_mask = 0;
     bool operator==(const ProcessKernelState&) const = default;
     template<class Archive> void serialize(Archive& ar);
 };
 
+std::array<char,16> capture_native_thread_comm(int pid);
 long emu_process_syscall(const syscall_info& info);
 // Called once after the startup prelude and scratch page initialization.
 // Imports supported inherited state and rejects kernel state not yet modeled.

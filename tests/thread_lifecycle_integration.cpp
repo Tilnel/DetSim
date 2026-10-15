@@ -11,6 +11,7 @@
 #include "engine/exec_engine.h"
 #include "engine/thread_carrier.h"
 #include "engine/thread_manager.h"
+#include "engine/thread_pool.h"
 #include "syscall/dispatcher.h"
 
 #include <array>
@@ -79,6 +80,17 @@ lifecycle_spawn:
  ud2
 .size lifecycle_spawn,.-lifecycle_spawn
 )");
+
+static const char logical_main_name[]="logical-main";
+static const char late_bootstrap_name[]="late-bootstrap";
+static std::array<char,16> bootstrap_name_output{};
+static const char logical_worker_name[]="worker-parent";
+alignas(16) static unsigned char nested_stack[65536];
+static void rename_logical(int actor,const char* name) {
+    ptmc_state.cursor=0;ptmc_state.current_thread_idx[0]=actor;
+    syscall_info info{};info.nr=SYS_prctl;info.args[0]=PR_SET_NAME;info.args[1]=reinterpret_cast<uint64_t>(name);
+    if(emu_process_syscall(info)!=0) throw std::runtime_error("logical thread rename");
+}
 
 static void require(bool condition, const char *message)
 {
@@ -165,6 +177,10 @@ static void restore_roundtrip(const sys_state& expected)
     sys_state recaptured(info, &loaded);
     require(recaptured.ss_hash == expected.ss_hash && recaptured.ts_hash[0] == expected.ts_hash[0],
             "persisted lifecycle restore/recapture identity drift");
+    require(recaptured.child[0].threads.size()==expected.child[0].threads.size(),"restored comm slot count");
+    for(size_t i=0;i<expected.child[0].threads.size();++i)
+        require(recaptured.child[0].threads[i].comm==expected.child[0].threads[i].comm,
+                "persisted restore lost live or exited logical comm");
 }
 
 static void assert_worker(pid_t pid, int index, unsigned long logical_tid)
@@ -304,6 +320,13 @@ static void run_case(bool tiny)
         ptmc_state.fd_managers[0] = std::make_shared<FdManager>();
         ptmc_state.fs_states[0].set_fd_manager(ptmc_state.fd_managers[0]);
         ptmc_state.sock_states[0].set_fd_manager(ptmc_state.fd_managers[0]);
+        adopt_thread_signal_mask(0,child);
+        const auto adopted_name=capture_native_thread_comm(child);
+        require(ptmc_state.running_state.child[0].threads[0].comm==adopted_name,
+                "early bootstrap adoption did not read native comm");
+        require(tracee_do_syscall(child,SYS_prctl,PR_SET_NAME,reinterpret_cast<uint64_t>(late_bootstrap_name),0,0,0,0)==0,
+                "native late-boundary prelude rename");
+        capture_process_kernel_state(child,0);
         StateStore::Config config;
         if (tiny) config.hot_cache_size = config.warm_cache_size = 1;
         StateStore::instance().init(config);
@@ -313,6 +336,25 @@ static void run_case(bool tiny)
         ptmc_state.running_state = initial;
         thread::init_all(ptmc_state);
         exec::init_all();
+        syscall_info name_query{};name_query.nr=SYS_prctl;name_query.args[0]=PR_GET_NAME;
+        name_query.args[1]=reinterpret_cast<uint64_t>(&bootstrap_name_output);
+        ptmc_state.cursor=0;ptmc_state.current_thread_idx[0]=0;
+        require(emu_process_syscall(name_query)==0 &&
+                !strcmp(read_guest(child,&bootstrap_name_output).data(),late_bootstrap_name),
+                "late bootstrap name was not imported for logical GET_NAME");
+        // Direct model calls bypass exec_engine's image-dirty bookkeeping.
+        ptmc_state.tracee_image_dirty[0]=true;
+        restore_roundtrip(initial);
+        require(emu_process_syscall(name_query)==0 &&
+                !strcmp(read_guest(child,&bootstrap_name_output).data(),late_bootstrap_name),
+                "persisted restore lost late bootstrap name");
+        ptmc_state.tracee_image_dirty[0]=true;
+        restore_roundtrip(initial);
+        const auto physical_name=capture_native_thread_comm(child);
+        rename_logical(0,logical_main_name);
+        initial=capture_current(ptmc_state.running_state);
+        ptmc_state.running_state=initial;
+        require(capture_native_thread_comm(child)==physical_name,"logical main rename changed physical name");
         roundtrip_unregistered_rseq_bytes(child, initial);
 
         // A host-only clear_child_tid registration must block logical clone
@@ -414,6 +456,8 @@ static void run_case(bool tiny)
         reject_active_rseq(child, after_a, initial);
         const pid_t a_carrier = ptmc_state.running_state.child[0].threads[1].physical_tid;
         reject_active_rseq(a_carrier, after_a, initial);
+        require(after_a.child[0].threads[1].comm==after_a.child[0].threads[0].comm &&
+                capture_native_thread_comm(a_carrier)==physical_name,"clone comm inheritance changed physical carrier");
         auto after_b = step(after_a, 0, SYS_clone);
         require(after_b.child[0].threads.size() == 3 && read_guest(child, &jobs[1]).tid == 0,
                 "clone B publication or newborn stop failed");
@@ -426,6 +470,8 @@ static void run_case(bool tiny)
         auto after_a_exit = step(a_pid, 1, SYS_exit);
         require(!after_a_exit.child[0].threads[1].alive && after_a_exit.child[0].threads[0].alive &&
                 after_a_exit.child[0].threads[2].alive, "thread exit terminated peers or lost its slot");
+        require(after_a_exit.child[0].threads[1].comm==after_b.child[0].threads[1].comm,
+                "logical exit discarded frozen comm");
         assert_worker(child, 0, 2);
         reject_active_rseq(a_carrier, after_a_exit, initial);
         dead_actor_rejected(after_a_exit, 1);
@@ -521,6 +567,40 @@ static void run_case(bool tiny)
         require(replay_exit.ss_hash == after_a_exit.ss_hash, "carrier rebinding changed TLS/exit replay");
         assert_worker(child, 0, 2);
 
+        // A renamed non-main parent must win over the anchor/carrier name.
+        restore_roundtrip(after_b);
+        rename_logical(1,logical_worker_name);
+        auto renamed=capture_current(ptmc_state.running_state);
+        require(renamed.ss_hash!=after_b.ss_hash,"comm-only branch rename missing from identity");
+        restore_roundtrip(renamed);
+        auto& live=ptmc_state.running_state.child[0];
+        std::vector<thread_state>(live.threads).swap(live.threads);
+        require(live.threads.capacity()==live.threads.size(),"force logical slot vector growth");
+        const auto old_data=live.threads.data();
+        const pid_t parent=live.threads[1].physical_tid;
+        const auto flags=live.threads[1].clone_flags;
+        const pid_t nested_tid=create_logical_thread(0,parent,flags,
+            reinterpret_cast<uint64_t>(nested_stack+sizeof(nested_stack)),reinterpret_cast<uint64_t>(&tls[0]));
+        require(live.threads.data()!=old_data && nested_tid==4 && live.threads.back().ptid==2 &&
+                !strcmp(live.threads.back().comm.data(),logical_worker_name) &&
+                !strcmp(live.threads[0].comm.data(),logical_main_name),
+                "non-main logical comm inheritance failed across vector growth");
+        const pid_t nested_carrier=live.threads.back().physical_tid;
+        require(capture_native_thread_comm(parent)==physical_name &&
+                capture_native_thread_comm(nested_carrier)==physical_name,"logical clone rewrote physical comm");
+        auto nested=capture_current(ptmc_state.running_state);
+        restore_roundtrip(nested);
+        rename_logical(1,logical_main_name);
+        auto renamed_again=capture_current(ptmc_state.running_state);
+        require(renamed_again.ss_hash!=nested.ss_hash,"restored rename missing from identity");
+        restore_roundtrip(nested);
+        require(!exit_logical_thread(0,ptmc_state.running_state.child[0].threads[3].physical_tid,0),
+                "nested logical exit");
+        auto nested_exit=capture_current(ptmc_state.running_state);
+        require(!nested_exit.child[0].threads[3].alive &&
+                !strcmp(nested_exit.child[0].threads[3].comm.data(),logical_worker_name),"nested exit lost frozen comm");
+        for(const auto* saved:{&renamed,&nested,&nested_exit,&after_c,&initial}) restore_roundtrip(*saved);
+        puts("PASS comm: renamed non-main clone, vector growth, frozen exit and carrier restore");
         kill(child, SIGKILL);
         while (waitpid(-1, nullptr, __WALL) > 0 || errno == EINTR) {}
         StateStore::instance().shutdown();

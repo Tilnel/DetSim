@@ -1,4 +1,6 @@
 #include "engine/thread_control.h"
+#include "state/state.h"
+#include "guest.h"
 #include "ncurses_ui.h"
 
 #include <array>
@@ -9,6 +11,8 @@
 #include <signal.h>
 #include <stdexcept>
 #include <sys/prctl.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/ptrace.h>
 #include <sys/rseq.h>
 #include <sys/syscall.h>
@@ -17,6 +21,19 @@
 #include <unistd.h>
 
 extern "C" detsim::ui::NCursesUI *get_ncurses_ui() { return nullptr; }
+
+static bool track_capture_resumes=false;
+static unsigned capture_resumes=0;
+extern "C" long __real_ptrace(enum __ptrace_request, ...);
+extern "C" long __wrap_ptrace(enum __ptrace_request request,pid_t pid,void* address,void* data) noexcept {
+    if(track_capture_resumes && (request==PTRACE_CONT || request==PTRACE_SYSCALL || request==PTRACE_SINGLESTEP)) {
+        ++capture_resumes;
+        // A negative oracle must never let the pre-barrier injection run.
+        // Ptrace_right reports this outside glibc's noexcept call boundary.
+        errno=EIO;return -1;
+    }
+    return __real_ptrace(request,pid,address,data);
+}
 
 static void require(bool condition, const char *message)
 {
@@ -61,6 +78,10 @@ static void run_case()
                 32, RSEQ_FLAG_UNREGISTER, RSEQ_SIG)) _exit(9);
         prctl(PR_SET_PDEATHSIG, SIGKILL);
         if (syscall(SYS_set_robust_list, nullptr, 24)) _exit(91);
+        auto* control=static_cast<unsigned char*>(mmap(reinterpret_cast<void*>(scratch_page),4096,
+            PROT_READ|PROT_WRITE|PROT_EXEC,MAP_FIXED_NOREPLACE|MAP_PRIVATE|MAP_ANONYMOUS,-1,0));
+        if(control==MAP_FAILED) _exit(5);
+        memset(control,0xa5,4096);control[0xff0]=0x0f;control[0xff1]=0x05;
         if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr)) _exit(2);
         raise(SIGSTOP);
         // Raw task: libc thread startup would install an unmodeled host list.
@@ -102,6 +123,24 @@ static void run_case()
     require(ptrace(PTRACE_GETREGS, child, nullptr, &after) == 0, "leader remains stopped");
     require(std::memcmp(&before, &after, sizeof before) == 0,
             "failed barrier modified leader registers");
+    std::array<unsigned char,4096> control_before{},control_after{};
+    require(guest_read_exact(child,reinterpret_cast<void*>(scratch_page),control_before.data(),control_before.size()),
+            "read control page before refused first capture");
+    capture_resumes=0;track_capture_resumes=true;
+    bool stopped_rejection=false;
+    try {tracee_state first;(void)first.save_full_state_to_state_store(child);}
+    catch(const std::runtime_error& error) {
+        const std::string message=error.what();
+        stopped_rejection=message=="Cannot read stopped thread signal mask" ||
+            message.starts_with("Thread stop barrier cannot inspect stopped thread");
+    }
+    track_capture_resumes=false;
+    require(stopped_rejection,"first capture did not reject the running worker at stop validation");
+    require(capture_resumes==0,"first capture injected a syscall before the stop barrier");
+    require(guest_read_exact(child,reinterpret_cast<void*>(scratch_page),control_after.data(),control_after.size()) &&
+            control_before==control_after,"refused first capture changed control page");
+    require(ptrace(PTRACE_GETREGS,child,nullptr,&after)==0 && !memcmp(&before,&after,sizeof(before)),
+            "refused first capture changed stopped main registers");
     require(syscall(SYS_tgkill, child, worker, SIGSTOP) == 0, "stop running worker");
     stopped(worker);
     verify_stopped_thread_set(child, tids);
@@ -115,6 +154,7 @@ int main()
     const pid_t test = fork();
     if (!test) {
         setpgid(0, 0);
+        const rlimit no_core{0,0};setrlimit(RLIMIT_CORE,&no_core);
         try { run_case(); _exit(0); }
         catch (const std::exception &error) {
             std::fprintf(stderr, "thread control: %s\n", error.what());

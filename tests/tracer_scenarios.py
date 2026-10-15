@@ -197,6 +197,84 @@ finally:
                 self.assertIn("exit_group(0)", output)
                 self.assertIn("Complete explore all", output)
 
+    def test_late_bootstrap_name_search_and_replay(self):
+        source = self.root / "late_comm.c"
+        source.write_text(r"""
+#include <sys/prctl.h>
+#include <string.h>
+#include <unistd.h>
+volatile int name_ok;
+volatile int observed;
+static char comm[16];
+int main(void) {
+    if (prctl(PR_SET_NAME, "prelude", 0, 0, 0)) return 71;
+    observed = 1;
+    if (prctl(PR_GET_NAME, comm, 0, 0, 0)) return 72;
+    name_ok = !memcmp(comm, "prelude", 8);
+    for (int i = 8; i < 16; ++i) if (comm[i]) name_ok = 0;
+    if (!name_ok) return 73;
+    observed = 2;
+    if (write(1, "COMM_PRELUDE_OK\n", 16) != 16) return 74;
+    observed = 3;
+    return 0;
+}
+""")
+        subprocess.run(shlex.split(os.environ.get("CC", "/usr/bin/gcc")) +
+            ["-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie", str(source),
+             "-o", str(self.root / "probe")], check=True)
+        native = subprocess.run([str(self.root / "probe")], check=True,
+                                stdout=subprocess.PIPE, timeout=5)
+        self.assertEqual(native.stdout, b"COMM_PRELUDE_OK\n")
+
+        def scenario(send):
+            def edge():
+                matches = re.findall(r"([0-9a-f]{16}) => ([0-9a-f]{16})", send("info current"))
+                self.assertEqual(len(matches), 1)
+                return matches[0]
+
+            def marker():
+                reply = send("si")
+                self.assertIn("COMM_PRELUDE_OK", reply)
+                self.assertRegex(reply, r", 16\) = 16")
+                self.assertIn("name_ok = 1", send("p name_ok"))
+                self.assertIn("observed = 2", send("p observed"))
+                return edge()[1]
+
+            send("sw 0")
+            # startup_syscall157 executes the first SET_NAME in the native prelude.
+            # The first controlled call must therefore be GET_NAME.
+            self.assertRegex(send("si"), r"prctl\(.*= 0")
+            self.assertIn("observed = 1", send("p observed"))
+            predecessor, query_hash = edge()
+            marker_hash = marker()
+            self.assertIn("Loaded state", send("load " + predecessor))
+            searched = send("bfs")
+            count = re.search(r"Complete explore all (\d+) sys_states", searched)
+            self.assertIsNotNone(count, searched)
+            self.assertGreater(int(count[1]), 1, searched)
+            self.assertNotIn("illegal state", searched)
+            self.assertIn("has exited with status 0", send("si"))
+            exit_hash = None
+            for _ in range(3):
+                self.assertIn("Loaded state", send("load " + predecessor))
+                self.assertIn("name_ok = 0", send("p name_ok"))
+                self.assertRegex(send("si"), r"prctl\(.*= 0")
+                self.assertEqual(edge()[1], query_hash, "GET_NAME replay changed identity")
+                self.assertEqual(marker(), marker_hash, "name/output replay changed identity")
+                self.assertIn("exit_group(0)", send("si"))
+                self.assertIn("has exited with status 0", send("si"))
+                current = edge()[1]
+                if exit_hash is None:
+                    exit_hash = current
+                self.assertEqual(current, exit_hash, "completion replay changed identity")
+
+        for backend in ("full", "pages"):
+            with self.subTest(backend=backend):
+                code, output = self.run_tracer(scenario, name="late_comm_" + backend,
+                    tracee_args=(), runtime_profile={"startup_syscall": 157},
+                    extra_env={"DETSIM_SNAPSHOT_BACKEND": backend})
+                self.assertEqual(code, 0, output)
+
     def test_runtime_queries_restore_and_replay(self):
         source = self.root / "runtime_queries.c"
         source.write_text(r"""

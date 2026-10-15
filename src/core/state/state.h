@@ -25,14 +25,14 @@ void clear_snapshot_thread_bindings();
  * State Data Format (shared with StateStore)
  * ====================================================================== */
 
-inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 31;
-inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 32;
+inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 33;
+inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 34;
 
 /* Packed to avoid alignment padding */
 struct __attribute__((packed)) StateDataHeader
 {
   uint32_t magic;         // 'DSTM' = 0x4453544D
-  uint32_t version;       // 31: flat; 32: pages (captured resource-limit query state)
+  uint32_t version;       // 33: flat; 34: pages (capability bounds and logical thread names)
   uint32_t num_regions;   // number of memory regions
   uint64_t tstate_offset; // offset to serialized tracee_state
   uint64_t tstate_size;   // size of serialized tracee_state
@@ -88,6 +88,7 @@ struct thread_state
   pid_t tid;                      // Virtual TID (stable thread index + 1)
   pid_t physical_tid;             // Runtime only; omitted from archives
   bool alive;                    // Logical lifecycle, independent of binding
+  std::array<char,16> comm{};      // Canonical logical task name, frozen on exit
   int exit_code = 0;             // Frozen virtual exit status
   struct user_regs_struct regs{}; // General-purpose register context
   std::vector<uint8_t> xstate;     // Complete Linux NT_X86_XSTATE register set
@@ -119,6 +120,13 @@ struct thread_state
        regs.fs, regs.gs, clone_flags, stack_addr, ptid, is_main, xstate,
        clear_child_tid, pending_child_settid, child_settid_pending, signal_mask, robust_list_head,
        altstack_sp, altstack_size, altstack_flags);
+    bool terminated=false;
+    for(char& byte:comm) {
+      ar(byte);
+      if(terminated && byte) throw std::runtime_error("Noncanonical logical thread name");
+      if(!byte) terminated=true;
+    }
+    if(!terminated) throw std::runtime_error("Unterminated logical thread name");
     bool pending = pending_syscall.has_value();
     ar(pending);
     if constexpr (Archive::is_loading::value) {
