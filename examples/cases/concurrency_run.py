@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real Rust std / CPython producer-consumer pairs under bounded DetSim search."""
+"""Real Rust std / CPython / Go producer-consumer pairs under bounded DetSim search."""
 import argparse
 import json
 import os
@@ -23,6 +23,7 @@ EXPECTED = {
 
 def prepare(language, output, cc, python_target):
     output.mkdir(parents=True)
+    runtime_profile = {"startup_syscall": 9 if language == "go-gc" else 11}
     if language == "rust":
         source = SOURCES / "producer_consumer.rs"
         tool = [shutil.which("rustc") or "rustc"]
@@ -35,6 +36,18 @@ def prepare(language, output, cc, python_target):
         argv = [str(binary)]
         runtime = "rust-std-thread-and-mpsc"
         input_language = "rs"
+    elif language in ("go-gccgo", "go-gc"):
+        source = SOURCES / "producer_consumer.go"
+        tool = ["/usr/bin/go"] if language == "go-gccgo" else [str(ROOT / "build/toolchains/go1.23.12/go/bin/go")]
+        binary = output / "producer-consumer"
+        compiler = "gccgo" if language == "go-gccgo" else "gc"
+        build = tool + ["build", "-compiler=" + compiler, "-o", str(binary), str(source)]
+        result = common.command(build, ROOT, 120)
+        (output / "build.log").write_text(result.stdout)
+        common.require(result.returncode == 0, result.stdout)
+        argv = [str(binary)]
+        runtime = compiler
+        input_language = "go"
     elif language == "python":
         source = SOURCES / ("producer_consumer_condition.py" if python_target == "condition" else "producer_consumer.py")
         tool = [os.environ.get("CASE_PYTHON", "/usr/bin/python3")]
@@ -44,14 +57,21 @@ def prepare(language, output, cc, python_target):
         input_language = "py"
     else:
         raise common.CaseFailure("unknown language: " + language)
-    version = common.command(tool + ["--version"], output)
+    version = common.command(tool + (["version"] if language.startswith("go-") else ["--version"]), output)
     common.require(version.returncode == 0, version.stdout)
+    if language.startswith("go-"):
+        common.require(("gccgo" in version.stdout) == (language == "go-gccgo"),
+                       "Go compiler identity does not match requested runtime: " + version.stdout)
     mappings, manifest = common.runtime_files(input_language, tool, source, output)
     details = {
         "language": language, "runtime_implementation": runtime,
         "toolchain": version.stdout.strip(), "compile": build, "command": argv,
         "source": str(source), "source_sha256": common.digest(source), "binary_sha256": common.digest(argv[0]),
-        "primitives": "std::thread, std::sync::mpsc, JoinHandle::join" if language == "rust" else
+        "runtime_profile": runtime_profile,
+        "runtime_environment": {key: os.environ.get(key) for key in
+            ("GODEBUG", "GOMAXPROCS", "GOGC", "GOMEMLIMIT", "GOEXPERIMENT", "GOFLAGS", "GOTOOLCHAIN")} if language.startswith("go-") else {},
+        "primitives": "goroutine, unbuffered task channel, channel close, result-channel join" if language.startswith("go-") else
+                      "std::thread, std::sync::mpsc, JoinHandle::join" if language == "rust" else
                       "threading.Thread, threading.Condition, list, Thread.join" if python_target == "condition" else
                       "threading.Thread, queue.Queue (_queue extension), Thread.join",
         "rootfs_manifest": str(manifest), "rootfs_sha256": common.digest(manifest),
@@ -105,7 +125,7 @@ def main():
     common.require(args.tracer.is_file(), "build NP=1 tracer first")
     languages = args.languages.split(",")
     variants = args.variants.split(",")
-    common.require(all(language in ("rust", "python") for language in languages), "unknown language")
+    common.require(all(language in ("rust", "python", "go-gccgo", "go-gc") for language in languages), "unknown language")
     common.require(all(variant in EXPECTED for variant in variants), "unknown variant")
     common.require(len(languages) == len(set(languages)) and len(variants) == len(set(variants)),
                    "requested languages and variants must be unique")
@@ -163,7 +183,8 @@ def main():
                             row["model"] = common.search(args.tracer, command, plugin,
                                 directory, backend, args.timeout, bug=variant != "healthy",
                                 depth=args.depth, fsmap=mappings,
-                                expected_diagnostic="exact-once producer/consumer mismatch")
+                                expected_diagnostic="exact-once producer/consumer mismatch",
+                                runtime_profile=details.get("runtime_profile", {"startup_syscall": 11}))
                             row["passed"] = (row["model"]["status"] ==
                                 ("pass" if variant == "healthy" else "violation") and
                                 row["model"].get("tracer_exit") == 0)

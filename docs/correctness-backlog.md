@@ -641,3 +641,23 @@ production build pass. Layout31/32, kernelv19 reject incompatible roots. Actual 
 Go admission/concurrency now rerun against the new immutable binary. This is
 query closure only: no claim of restoring/enforcing physical resource limits,
 CPU budgets, complete virtual FD capacities or limit mutations.
+
+
+### Go admission and goroutine protocol matrices
+
+Standard gc1.23.12 now passes admission in full/pages (201visited each), checked
+output/exit0 plus control and terminal3x replay. Explicit mmap startup9 ends the
+trusted prelude before thread creation.4GiB profile,900s full admission budget;
+actual full driver429s. Evidence: build/cases/run-ixays29s/results.json (pages),
+build/cases/run-0xfy5b8i/results.json (full). No GC/preemption flags disabled.
+
+Both gc and gccgo goroutine/channel fixtures now have complete healthy/omit/
+duplicate full/pages matrices,12actual rows with native/protocol/exit and3x replay.
+gc201/199/199; gccgo full234/236/238 and pages236/236/234. Reports respectively
+concurrency-dijy2cw7,concurrency-oschmx18,concurrency-nk79ibko,
+concurrency-54sbjxge under build/cases. Independent review approved after closing
+compiler identity: explicit -compiler overrides oppositeGOFLAGS;13runner tests,
+6opposite-flag native builds and stored-binary compiler/hash audit pass. Evidence:
+build/case-jobs/go-compiler-audit-7sy2joyc/report.json. This is language/runtime
+protocol capability under current actor policy; Go runtime OS-thread count does
+not establish goroutine-to-OS-thread assignment or exhaustive scheduling.

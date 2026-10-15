@@ -58,15 +58,18 @@
       "id": "runtime-exact-once",
       "languages": [
         "Rust std",
-        "CPython Condition"
+        "CPython Condition",
+        "Go gc1.23.12",
+        "Go gccgo14.2"
       ],
       "processes": 1,
       "threads": 2,
-      "command": "python3 examples/cases/concurrency_run.py --tracer ./tracer --backend both --languages rust,python --variants healthy,omit,duplicate --timeout 180 --depth 1500 --memory-mb 4096",
+      "command": "python3 examples/cases/concurrency_run.py --tracer ./tracer --backend both --languages rust,python,go-gc,go-gccgo --variants healthy,omit,duplicate --timeout 600 --depth 1500 --memory-mb 4096",
       "property": "worker consumes task IDs0 and1 exactly once; observed worker, exact output and zero exit",
       "mutation": "omit or duplicate task1",
       "scope": "native plus full/pages search and3x endpoint/counterexample replay under existing actor policy",
-      "unsupported_variant": "CPython Queue/_queue remains non-green due SIGBUS-backed file mapping"
+      "unsupported_variant": "CPython Queue/_queue remains non-green due SIGBUS-backed file mapping",
+      "compiler_identity": "Explicit -compiler=gc/gccgo; opposite-GOFLAGS negative regression and artifact audit"
     },
     {
       "id": "redisraft-library",
@@ -87,13 +90,9 @@
     {
       "id": "runtime-concurrency",
       "languages": [
-        "Rust std",
-        "Go gc",
-        "Go gccgo",
-        "CPython",
-        "OpenJDK"
+        "OpenJDK (conditional deferred)"
       ],
-      "status": "advance one actual runtime blocker at a time; any altered GC/JIT/preemption configuration belongs in evidence"
+      "status": "Rust/CPythonCondition/Go gc/gccgo paired full/pages cases implemented; OpenJDK remains conditional non-green. General actor/atomic coverage remains C03/C25."
     }
   ],
   "conditional_targets": [

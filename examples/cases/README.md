@@ -52,7 +52,8 @@ runner 只依赖 Python 标准库及已有编译器。不会下载依赖、修�
 | C | GCC14.2 | 通过 | 标记及退出0，搜索完成 |
 | C++ std | GCC14.2 | 通过 | 标记及退出0，搜索完成 |
 | Rust std | rustc1.51.0 | 通过 | full/pages 已完成输出检查及退出0 |
-| Go | gccgo14.2（非标准 gc） | 通过 | full/pages 均完成输出/退出及3x重放；full 显式4GiB限额 |
+| Go gccgo | gccgo14.2（非标准 gc） | 通过 | full/pages 均完成输出/退出及3x重放；full 显式4GiB限额 |
+| Go gc | 官方隔离Go1.23.12 | 通过（显式startup9） | full/pages均201状态，输出/退出0及3x重放通过，4GiB |
 | Python | CPython3.13.5，`-I -S` | 通过 | full/pages 各273状态，输出/退出0及3x重放通过 |
 | Java | OpenJDK21.0.12.1 | 通过 | 文件身份和系统动态库输入已补；SIGBUS-backed 映射尚不支持；条件目标 |
 
@@ -189,3 +190,17 @@ python3 tests/redisraft_case_runner_test.py
 两后端从预算1出发各搜索70次/45unique；mutant分别4/5次访问发现目标反例。
 这些是受控选举前缀及深度4/错误预算限制下的案例，不是完整RedisRaft或一般共识
 安全证明。搜索顺序保留现有时间种子，报告实际种子候选范围及全部命令/哈希。
+
+
+### 两套真实 Go 工具链的 goroutine/channel 案例
+
+`concurrency_run.py --languages go-gc,go-gccgo --backend both --timeout 600
+--depth 1500 --memory-mb 4096` 分开报告标准gc与gccgo。构建显式指定compiler，
+相反GOFLAGS不能偷偷换实现；13项驱动回归覆盖身份和原有失败闭包。工具链需预先
+存在：gccgo的/usr/bin/go，以及已校验的build/toolchains/go1.23.12/go/bin/go。
+
+两种实现×三变体×full/pages共12项均完成原生、搜索、性质检查和3x恢复。
+gc两后端健康201/遗漏199/重复199状态；gccgo full234/236/238、pages236/236/234。
+新进程运行时启动可能产生不同状态数，未把跨backend原始状态数称为等价证明。
+病例保留正常goroutine调度、GC和抢占；显式startup9/11记录在config。观察到运行时
+多个逻辑OS线程不等于证明两个goroutine分属不同OS线程，更不等于穷举Go交织。

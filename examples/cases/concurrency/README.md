@@ -35,3 +35,21 @@ current actor policy; they do not establish exhaustive runtime interleavings.
 The Queue target has exposed explicit unsupported SIGBUS-backed file mapping
 during `_queue` loading. Its failed model report must remain non-green; choosing
 the Condition target does not resolve that generic file EOF-tail mapping gap.
+
+Go targets are explicit opt-ins, leaving the default Rust/CPython matrix intact:
+
+```sh
+python3 examples/cases/concurrency_run.py --languages go-gccgo --backend pages --timeout 180
+python3 examples/cases/concurrency_run.py --languages go-gccgo --backend full --timeout 600
+python3 examples/cases/concurrency_run.py --languages go-gc --backend pages --timeout 180
+```
+
+Both Go targets use the same real goroutine, unbuffered task channel, channel
+close and result-channel join. `go-gccgo` builds with `/usr/bin/go` and requires
+its version to identify gccgo. `go-gc` builds with the isolated official compiler
+at `build/toolchains/go1.23.12/go/bin/go` and rejects gccgo identity. Build commands explicitly select `-compiler=gccgo` or `-compiler=gc`, overriding
+a conflicting `GOFLAGS` compiler selection. Neither changes GC, preemption or
+scheduler settings. Compiler versions, exact builds,
+primitives and runtime profiles are recorded per row. gccgo retains startup
+syscall 11; the static standard gc executable uses startup syscall 9. These
+compiler/runtime targets have separate matrix keys and admission results.
