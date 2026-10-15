@@ -42,6 +42,12 @@ static void run_case(int mode) {
                 syscall(SYS_nanosleep, &zero, nullptr);
             else if (mode == 3)
                 syscall(SYS_clock_nanosleep, CLOCK_MONOTONIC, 0, &zero, nullptr);
+            else if (mode == 6)
+                asm volatile("int $0x80" : : "a"(20) : "memory"); // i386 getpid
+            else if (mode == 7)
+                syscall(0x100000000ULL+SYS_getpid);
+            else if (mode == 8)
+                syscall(0x40000000ULL+SYS_getpid); // x32 ABI
             else
                 syscall(SYS_getpid);
         }
@@ -73,6 +79,13 @@ static void run_case(int mode) {
                 && info.args[3] == 0 && info.args[4] == 0 && info.args[5] == 0,
                 "entry arguments were not captured faithfully");
         require(info.rval == 0, "wake without waiters");
+    } else if (mode>=6) {
+        bool rejected=false;
+        try { engine.execute_syscall(child,info); }
+        catch (const std::runtime_error& error) {
+            rejected=std::string(error.what()).find("Unsupported syscall ABI")!=std::string::npos;
+        }
+        require(rejected,"unsupported syscall ABI must reject before execution or narrowing");
     } else {
         for (int i = 0; i < 3; ++i) {
             auto result = engine.execute_step(ptmc_state.running_state, info);
@@ -93,9 +106,10 @@ static void run_case(int mode) {
 
 int main() {
     const char *names[] = {"current syscall entry args", "receive retry yields",
-                           "nanosleep yields", "clock_nanosleep yields", "getpid busy loop yields", "automatic actor selection"};
+                           "nanosleep yields", "clock_nanosleep yields", "getpid busy loop yields", "automatic actor selection",
+                           "i386 syscall ABI rejected", "wide syscall number rejected", "x32 syscall ABI rejected"};
     int failures = 0;
-    for (int mode = 0; mode < 6; ++mode) {
+    for (int mode = 0; mode < 9; ++mode) {
         fflush(nullptr);
         pid_t test = fork();
         if (test == 0) {

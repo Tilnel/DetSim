@@ -11,6 +11,9 @@
 #include "monitor.h"
 #include "state/state.h"
 #include "proc_status.h"
+#include <linux/audit.h>
+#include <climits>
+#include <stdexcept>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
 
@@ -74,7 +77,15 @@ int ExecutionEngine::do_single_syscall(pid_t pid, syscall_info& info)
         return CKPT_STOP;
     }
 
-    info.nr = psi.entry.nr;
+    user_regs_struct entry_regs{};
+    ptrace_right(PTRACE_GETREGS, pid, nullptr, &entry_regs);
+    // The kernel may truncate the reported syscall number to 32 bits; reject
+    // noncanonical register values before applying the model route.
+    if (entry_regs.orig_rax != psi.entry.nr ||
+        psi.arch != AUDIT_ARCH_X86_64 || psi.entry.nr > INT_MAX ||
+        (psi.entry.nr & 0x40000000ULL))
+        throw std::runtime_error("Unsupported syscall ABI or syscall number");
+    info.nr = static_cast<int>(psi.entry.nr);
     for (int i = 0; i < 6; i++) {
         info.args[i] = psi.entry.args[i];
     }

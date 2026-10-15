@@ -440,14 +440,10 @@ int handle_clone3(pid_t pid, syscall_info &info) {
 }
 
 int handle_gettid(pid_t pid, syscall_info &info) {
-    // Return virtual TID (thread index within the tracee)
-    int tracee_idx = ptmc_state.cursor;
-    int thread_idx = ptmc_state.current_thread_idx[tracee_idx];
-    int virtual_tid = thread_idx + 1;  // +1 to avoid 0
-    tracee_set_rax(pid, virtual_tid);
-    info.rval = virtual_tid;
-    LOG_DEBUG("gettid: returning virtual tid %d for thread %d in process %d",
-              virtual_tid, thread_idx, tracee_idx);
+    // Kernel-owned identity must agree with TLS/futex and getpid. Snapshot
+    // identity normalization is separate from syscall-visible identity.
+    (void)pid;
+    (void)info;
     return CKPT_NO;
 }
 
@@ -545,17 +541,21 @@ int handle_gettimeofday(pid_t pid, syscall_info &info) {
 }
 
 int handle_nanosleep(pid_t pid, syscall_info &info) {
-    // Return immediately for deterministic execution
-    tracee_set_rax(pid, 0);
-    info.rval = 0;
+    timespec request{};
+    long result=0;
+    if (!guest_read_exact(pid,reinterpret_cast<const void*>(info.args[0]),&request,sizeof(request))) result=-EFAULT;
+    else if (request.tv_sec<0 || request.tv_nsec<0 || request.tv_nsec>=1000000000) result=-EINVAL;
+    else if (request.tv_sec || request.tv_nsec) throw std::runtime_error("Blocking nanosleep is unsupported");
+    tracee_set_rax(pid,result);info.rval=result;
     return CKPT_NO;
 }
 
 int handle_clock_nanosleep(pid_t pid, syscall_info &info) {
-    // Return immediately for deterministic execution
-    tracee_set_rax(pid, 0);
-    info.rval = 0;
-    return CKPT_NO;
+    if ((info.args[0]!=CLOCK_REALTIME && info.args[0]!=CLOCK_MONOTONIC) || info.args[1])
+        throw std::runtime_error("Unsupported clock_nanosleep clock or flags");
+    syscall_info request=info;request.args[0]=info.args[2];
+    const int checkpoint=handle_nanosleep(pid,request);info.rval=request.rval;
+    return checkpoint;
 }
 
 } // namespace time

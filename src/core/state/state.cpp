@@ -647,6 +647,7 @@ void tracee_state::restore_runtime_state(int index) const
   /* Restore subsystems */
   ptmc_state.sock_states[index] = sock_state;
   ptmc_state.fs_states[index] = fs_state;
+  ptmc_state.process_states[index] = process_state;
 
   /* Restore FdManager state */
   *ptmc_state.fd_managers[index] = fd_manager_state;
@@ -957,6 +958,7 @@ tracee_state::tracee_state(int which, const struct syscall_info info[])
   /* Save subsystems */
   sock_state = ptmc_state.sock_states[which];
   fs_state = ptmc_state.fs_states[which];
+  process_state = ptmc_state.process_states[which];
 
   /* Save FdManager state */
   if (ptmc_state.fd_managers[which])
@@ -1209,6 +1211,7 @@ void cleanup_all()
   {
     ptmc_state.sock_states[i] = SockState();
     ptmc_state.fs_states[i] = FileSystemState();
+    ptmc_state.process_states[i] = ProcessKernelState();
     ptmc_state.fd_managers[i].reset();
   }
 

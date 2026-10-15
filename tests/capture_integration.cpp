@@ -6,6 +6,7 @@
 #include "guest.h"
 #include "proc_status.h"
 #include "page_snapshot.h"
+#include <array>
 #include <cstdio>
 #include <arpa/inet.h>
 #include <cstring>
@@ -94,6 +95,12 @@ int main(int argc, char**)
         require(guest_write_exact(children[0], guest_address, tcp_payload, sizeof(tcp_payload)), "write TCP fixture");
         require(ptmc_state.sock_states[0].do_send(client_fd, guest_address, sizeof(tcp_payload), 0) == sizeof(tcp_payload),
                 "buffer preaccept TCP");
+        std::array<ProcessKernelState,NP> initial_process_states;
+        for (int i=0;i<NP;++i) {
+            ptmc_state.process_states[i].random_state^=uint64_t(i+123);
+            ptmc_state.process_states[i].signal_actions[SIGUSR1]={uint64_t(SIG_IGN),0,0,0};
+            initial_process_states[i]=ptmc_state.process_states[i];
+        }
         ptmc_state.cursor = -1;
         sys_state source(info);
         ptmc_state.running_state = source;
@@ -143,6 +150,31 @@ int main(int argc, char**)
             }
         };
         compare_full(reused);
+        for (int i=0;i<NP;++i)
+            require(source.child[i].process_state==initial_process_states[i],"process model state absent from capture");
+        ptmc_state.process_states[1].random_state^=0x1234;
+        sys_state random_changed(info,&source);
+        require(random_changed.ts_hash[1]!=source.ts_hash[1] && random_changed.ss_hash!=source.ss_hash,
+                "RNG stream position absent from snapshot identity");
+        require(source.child[1].process_state==initial_process_states[1],"RNG branch mutated source snapshot");
+        compare_full(random_changed);
+        ptmc_state.running_state=random_changed;
+        source.recover_running_state();
+        for (int i=0;i<NP;++i)
+            require(ptmc_state.process_states[i]==initial_process_states[i],"restored RNG/signal state differs");
+        ptmc_state.process_states[0].signal_actions[SIGUSR1].handler=0x12345678;
+        sys_state action_changed(info,&source);
+        require(action_changed.ts_hash[0]!=source.ts_hash[0] && action_changed.ss_hash!=source.ss_hash,
+                "signal disposition absent from snapshot identity");
+        require(source.child[0].process_state==initial_process_states[0],"signal branch mutated source snapshot");
+        compare_full(action_changed);
+        ptmc_state.running_state=action_changed;
+        source.recover_running_state();
+        for (int i=0;i<NP;++i)
+            require(ptmc_state.process_states[i]==initial_process_states[i],"signal branch restore differs");
+        sys_state process_replayed(info,&source);
+        require(process_replayed.ss_hash==source.ss_hash,"RNG/signal branch restore identity drift");
+        compare_full(process_replayed);
         // Cross-node modeled delivery must invalidate the idle node's hash.
         ptmc_state.time[1].tv_sec++;
         sys_state changed(info, &source);

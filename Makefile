@@ -9,7 +9,7 @@ ifneq ($(filter benchmark-redisraft,$(MAKECMDGOALS)),)
 NP ?= 3
 endif
 
-ifneq ($(filter check-accept check-redis check-port check-identity check-capture check-io-boundary check-state-view check-plugins check-runtime-profile,$(MAKECMDGOALS)),)
+ifneq ($(filter check-accept check-redis check-port check-identity check-capture check-io-boundary check-state-view check-plugins check-runtime-profile check-syscall-policy check-process-state,$(MAKECMDGOALS)),)
 NP ?= 2
 endif
 
@@ -49,7 +49,7 @@ SRCS = src/main.cpp\
        src/core/syscall/dispatcher.cpp src/core/syscall/handlers.cpp \
        src/subsys/net/sockstate.cpp src/subsys/net/emu.cpp \
        src/subsys/fs/fsstate.cpp src/subsys/fs/fd_manager.cpp src/subsys/io.cpp \
-       src/subsys/sync/futexstate.cpp \
+       src/subsys/sync/futexstate.cpp src/subsys/process/process_state.cpp \
        src/utils/utils.cpp src/utils/expr.cpp src/utils/expr_ast.cpp \
        src/utils/expr_lexer.cpp src/utils/expr_parser.cpp \
        src/utils/file_lock.cpp \
@@ -116,7 +116,7 @@ check-build-contracts:
 check: test check-build-contracts
 
 # Optional fragments are absent in the disposable build-contract fixtures.
--include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk tests/futex_snapshot.mk tests/futex.mk tests/storage.mk tests/store_cache.mk tests/store_packed.mk tests/redisraft.mk tests/capture.mk tests/soft_dirty.mk tests/page_snapshot.mk tests/io_boundary.mk tests/framework.mk tests/runtime_profile.mk
+-include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk tests/futex_snapshot.mk tests/futex.mk tests/storage.mk tests/store_cache.mk tests/store_packed.mk tests/redisraft.mk tests/capture.mk tests/soft_dirty.mk tests/page_snapshot.mk tests/io_boundary.mk tests/framework.mk tests/runtime_profile.mk tests/syscall_policy.mk tests/process_state.mk
 check-integration: check-dwarf check-elf
 
 # This gate executes native programs via ptrace; keep it separate from make check.

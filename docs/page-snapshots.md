@@ -1,20 +1,20 @@
 # 页快照分支：实现与全链路测量
 
 分支 `experiment/page-snapshots`。页捕获实现基于 `08ed190`；后续虚拟 I/O 修复
-扩充了元数据，格式先升级到7/8；通用框架改造后升级到9/10，拒绝旧5/6/7/8，不迁移或删除旧存储。默认仍生成v9完整快照，
-`DETSIM_SNAPSHOT_BACKEND=pages` 启用新的v10页对象格式。
+扩充了元数据，格式先升级到7/8；通用框架改造后升级到9/10，进程内核状态闭合后升级到11/12，拒绝旧5/6/7/8/9/10，不迁移或删除旧存储。默认仍生成v11完整快照，
+`DETSIM_SNAPSHOT_BACKEND=pages` 启用新的v12页对象格式。
 **主要收益来自表示和去重粒度变化；启用页格式不要求依赖脏页标记。**
 
 ## 行为与持久化
 
-- v10根对象是小manifest：canonical映射、Cereal tracee元数据、GP/XSTATE及
+- v12根对象是小manifest：canonical映射、Cereal tracee元数据、GP/XSTATE及
   按区域/地址排列的页引用。每份页内容用原有StateStore独立保存，不引入父快照链。
 - 页后端默认完整读取支持的私有可读区域，用每个live PID的工作buffer避免
   每次分配/清零整份内存。先做现有rseq归一化，再逐页与上一次不可变页比较；
   **字节相等**才复用已接受的页key。布局/内容变化不会因提示而省略读取。
-- 新增SnapshotView共同读取v9/v10；表达式仅加载涉及的页，直接读到栈上的long。
+- 新增SnapshotView共同读取v11/v12；表达式仅加载涉及的页，直接读到栈上的long。
   maps/元数据检查、范围读取、恢复不再各自解释格式。去掉旧代码中的重复解析分支。
-- v9和v10都保持完整live区域读取，逐页与保存内容比较，只将不同页加入writev。
+- v11和v12都保持完整live区域读取，逐页与保存内容比较，只将不同页加入writev。
   批次持有页owner，淘汰不能使指针悬空；权限、rseq和寄存器恢复保留原契约。
 - 缺页、长度错误、错误内容key及错误manifest范围显式失败。内容key的验证复用
   StateStore已有的保存/加载校验，不对可信不可变buffer重复hash。
@@ -23,7 +23,7 @@
 - 页对象先接受、manifest后接受；冷进程完整读取以completion barrier为界。
   worker实际完成顺序可能不同，没有新增跨sstate与snapshot store的事务保证。
 
-v10在格式内身份确定，**v9/v10 hash不相等**。对照比较解码后的元数据、maps、
+v12在格式内身份确定，**v11/v12 hash不相等**。对照比较解码后的元数据、maps、
 GP/XSTATE、区域属性和全部地址字节，不能用跨格式hash相等作为验收。
 物理TID、跨运行canonicalization和其他原有正确性缺口没有在本次关闭。
 

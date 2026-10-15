@@ -23,6 +23,14 @@
 #include <sys/types.h>
 #include <time.h>
 
+#ifdef FSSTATE_DETAILED_METADATA
+static time_t modeled_fs_time()
+{
+  const int node=ptmc_state.cursor;
+  return node>=0 && node<NP ? ptmc_state.time[node].tv_sec : 0;
+}
+#endif
+
 /* --- Serialization Implementations --- */
 
 template <class Archive>
@@ -52,7 +60,9 @@ template <class Archive>
 void FileSystemState::serialize(Archive &ar)
 {
   /* Note: fd_manager_ is shared and not serialized per instance */
-  ar(filesystem, open_files, cwd, mappings, pipes_, pipe_fds_);
+  ar(filesystem, open_files, cwd, mappings, pipes_, pipe_fds_, creation_mask_);
+  if (creation_mask_ & ~0777)
+    throw std::runtime_error("Invalid virtual filesystem creation mask");
 }
 
 /* --- FileSystemState Method Implementations --- */
@@ -325,12 +335,12 @@ int FileSystemState::do_open(const std::string &path, int flags, mode_t mode)
 #ifdef FSSTATE_DETAILED_METADATA
       memset(&newNode.metadata, 0, sizeof(struct stat));
       newNode.metadata.st_nlink = 1;
-      newNode.metadata.st_uid = getuid();
-      newNode.metadata.st_gid = getgid();
+      newNode.metadata.st_uid = 0;
+      newNode.metadata.st_gid = 0;
       newNode.metadata.st_atime = newNode.metadata.st_mtime =
-          newNode.metadata.st_ctime = time(NULL);
+          newNode.metadata.st_ctime = modeled_fs_time();
 #endif
-      newNode.metadata.st_mode = S_IFREG | (mode & 07777);
+      newNode.metadata.st_mode = S_IFREG | ((mode & 07777) & ~creation_mask_);
       newNode.metadata.st_size = 0;
       filesystem[path] = newNode;
     }
@@ -437,7 +447,7 @@ ssize_t FileSystemState::do_write(int fd, const void *buf, size_t count)
   ofd.offset = write_offset + count;
   node.metadata.st_size = node.content.size();
 #ifdef FSSTATE_DETAILED_METADATA
-  node.metadata.st_mtime = time(NULL);
+  node.metadata.st_mtime = modeled_fs_time();
 #endif
 
   return count;

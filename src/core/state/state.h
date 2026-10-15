@@ -14,20 +14,21 @@
 #include <unordered_set>
 #include <optional>
 #include "futexstate.h"
+#include "process/process_state.h"
 
 
 /* ======================================================================
  * State Data Format (shared with StateStore)
  * ====================================================================== */
 
-inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 9;
-inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 10;
+inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 11;
+inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 12;
 
 /* Packed to avoid alignment padding */
 struct __attribute__((packed)) StateDataHeader
 {
   uint32_t magic;         // 'DSTM' = 0x4453544D
-  uint32_t version;       // 9: flat; 10: pages (application-independent machine state)
+  uint32_t version;       // 11: flat; 12: pages (includes modeled kernel process state)
   uint32_t num_regions;   // number of memory regions
   uint64_t tstate_offset; // offset to serialized tracee_state
   uint64_t tstate_size;   // size of serialized tracee_state
@@ -147,6 +148,7 @@ typedef struct tracee_state
   struct timeval tv;
   FileSystemState fs_state;
   SockState sock_state;
+  ProcessKernelState process_state;
 
   /* FdManager state - saved to preserve fd allocation state */
   FdManager fd_manager_state;

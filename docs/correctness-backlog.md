@@ -28,7 +28,7 @@ relationship to the native-binary model-checking goal.
 | C20 | Fixed (host user XSTATE) | Capture/archive/restore NT_X86_XSTATE for each thread; snapshot version 5 rejects old formats. | `check-xstate` covers XMM/AVX/x87/MXCSR; native SIMD scenario repeatedly restores observed=0 and replays observed=11. Cross-host layouts and supervisor state are outside coverage. |
 | C21 | Fixed (scoped) | Save private readable mappings including RO pages; restore protections/backing and canonicalize equivalent VMA partitions. Reject shared/unreadable maps and missing file/named backing. | `check-mappings` covers RO contents, permissions, split/merge, anonymous recreation, explicit unsupported cases and wide map fields. Native replay preserves successor identity. |
 | C22 | Fixed (snapshot I/O) | Exact read/write counts and archive bounds required; failures propagate, without zero-fill or live fallback. | `check-state-io` fault-injects short/failed process_vm I/O and corrupt/missing/old archives. Failed restore is fatal; no successor may execute afterward. |
-| C23 | P0 / partial | TCP source ports now derive from saved socket state, independent of search RNG; clocks/getrandom and kernel signals remain uncontrolled. | `check-port` covers replay, RNG independence, source addresses, uniqueness and exhaustion. Still virtualize or reject clocks/random/signals. |
+| C23 | P0 / partial | TCP source ports now derive from saved socket state, independent of search RNG; clocks/getrandom now use saved virtual state; custom signal delivery, masks and asynchronous kernel inputs remain unsupported. | `check-port` covers replay, RNG independence, source addresses, uniqueness and exhaustion. Closed syscall policy and process-model regressions cover rejection, deterministic replay and archives; this does not close general asynchronous inputs. |
 | C24 | Fixed | Populate current syscall number/arguments before the entry handler. | `check-exec` exercises real ptrace FUTEX_WAKE suppression using current arguments. |
 | C25 | P0 / partial | Auto execution now returns after each completed syscall, including CKPT_NO. Runnable threads/outcomes are still not exhaustively enumerated; pure user loops and blocking kernel calls are not bounded. | `check-exec` verifies empty receive, sleep and getpid loops return control. Futex waiting successors are now preserved; enabled actor enumeration and shared-memory atom boundaries remain open. |
 | C26 | Fixed | Pending accounting covers queued and executing work; completion waits and synchronizes packed data/index. Async and sync errors poison subsequent operations. | `check-store-cache` holds a worker at compression, proves barrier stays blocked, then opens a fresh read-only process while writer remains alive. Sync failure and shutdown/reinit also covered. |
@@ -38,8 +38,8 @@ relationship to the native-binary model-checking goal.
 
 ## Next development slice
 
-Page snapshot branch (2026-10-15): opt-in page manifests (now v10) and page objects use the
-existing barrier; flat snapshots (now v9) stay default. Exact decoded flat/page ptrace oracles, cold/tiny
+Page snapshot branch (2026-10-15): opt-in page manifests (now v12) and page objects use the
+existing barrier; flat snapshots (now v11) stay default. Exact decoded flat/page ptrace oracles, cold/tiny
 reads, fresh-process inspection, missing/corrupt pages and warmed-cache poisoning
 have regressions. Both formats compare live bytes and restore only differing pages.
 This strengthens C08 evidence without closing general canonicalization, complete
@@ -63,7 +63,7 @@ Redis findings and resolution:
 - **C19 / fixed for the supported path:** Checked guest sockaddr/length copies,
   length writeback, truncation, fd/peer matching and stale queue handling pass 12
   cross-process cases; original Redis SET/GET now completes. Pending connections now use captured endpoint keys; same numeric client FDs
-  across nodes no longer alias. Snapshot formats are now9/10 (I/O repair first introduced7/8).
+  across nodes no longer alias. Snapshot formats are now11/12 (I/O repair first introduced7/8).
   EFAULT retains the virtual pending connection; partial copyout is not rolled back.
   These error-path modeling limits and accept4 flag fidelity need further coverage.
 
@@ -113,3 +113,27 @@ a run, explicit Linux syscall bootstrap outside exploration, and time-choice-onl
 external environment callbacks. Generic network/futex outcomes remain in platform
 models. Signal delivery and universal CPU nondeterminism are not solved by removing
 workload patches. C02/C03/C08/C23/C25 remain open at their stated scope.
+
+## Closed exploration syscall profile (2026-10-15)
+
+Unknown calls now reject before kernel execution; the default route no longer
+passes through. The explicit native allowlist retains owned-process identity and
+credential queries, query-only own resource limits and supported private memory
+operations. Mapping operations reject scratch-page overlap and range overflow.
+Clone/clone3 and thread exit reject until lifecycle restoration is implemented.
+The execution entry rejects i386/x32 ABIs and noncanonical wide syscall numbers.
+
+Flat11/page12 include deterministic RNG state and signal dispositions; filesystem
+umask is saved with VFS state. Clocks and sysinfo read a fixed virtual environment.
+Startup imports actual dispositions/umask and rejects preexisting multiple threads,
+blocked/pending signals, active interval timers and alternate stacks. Nonzero
+sleep, armed timers and custom signal delivery fail explicitly. Trusted startup
+and internal restore injections remain separate from modeled exploration.
+
+`check-syscall-policy` uses native ptrace to prove PR_SET_NAME cannot escape to
+host state, validates allowed queries/errors and guards reserved memory.
+`check-process-state` covers copy/archive, RNG replay and EFAULT rollback, signal
+policy and actual startup inheritance. `check-capture` perturbs RNG/actions to
+prove identity changes and repeated restore for flat/page snapshots. These tests
+close the default unknown-call escape; C02/C03/C08/C23/C25 remain scoped/open.
+General signal delivery and exhaustive random outcomes are not implemented.

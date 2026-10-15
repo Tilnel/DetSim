@@ -28,7 +28,7 @@ void tracee_state::serialize(Archive &ar)
   if (threads.size() > 10000)
     throw std::runtime_error("Thread archive exceeds supported limit");
 
-  ar(si, brk, tv.tv_sec, tv.tv_usec, fs_state, sock_state, fd_manager_state,
+  ar(si, brk, tv.tv_sec, tv.tv_usec, fs_state, sock_state, process_state, fd_manager_state,
      threads, thread_create_records, main_tid, current_thread_idx);
 }
 

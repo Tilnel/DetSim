@@ -30,6 +30,7 @@ make check-identity check-port # NP=2 identity and deterministic network state
 make check-capture       # NP=2 full/hinted snapshot byte-equivalence oracle
 make check-soft-dirty    # opt-in experiment: real kernel dirty tracking + byte oracle
 make check-page-snapshot # flat/page readers, missing/corrupt pages, reopen and poison gates
+make check-syscall-policy check-process-state # NP=2 closed syscall/model gates
 make check-state-view check-plugins check-runtime-profile # NP=2 generic framework gates
 make check-io-boundary   # NP=2 mixed descriptors, guest-copy faults and native dispatch
 make check-accept        # NP=2 cross-process accept address/length regressions
@@ -127,8 +128,8 @@ enter snapshot state. Loader CPU-feature normalization still logs an unresolved
 symbol (C17). Passing counter/replay tests does not close that gap,
 nor does it prove multithread, cross-process-run or eviction correctness.
 
-Default snapshot format is version 9; older formats are rejected without migration.
-This branch additionally reads opt-in version 10 page manifests, selected with
+Default snapshot format is version 11; older formats are rejected without migration.
+This branch additionally reads opt-in version 12 page manifests, selected with
 `DETSIM_SNAPSHOT_BACKEND=pages`; `verify-pages` adds a full memory oracle.
 See [page snapshots and whole-exploration measurements](page-snapshots.md).
 Private readable mappings are captured; shared/unreadable mappings, overlaps with
@@ -218,7 +219,7 @@ successor. Pure predecessor/target comparisons need no monitor state.
 
 Plugin binaries/schema/configuration, target executable contents and semantic
 execution configuration form the model compatibility fingerprint. Executables must remain immutable during a run. Changing cache
-sizes or loading a decoder does not change it. Flat9/page10 and the versioned
+sizes or loading a decoder does not change it. Flat11/page12 and the versioned
 system metadata reject older archives without deleting or migrating stores.
 Changes to kernel-model or inspection semantics require an explicit compatibility
 version bump; fingerprints do not prove equivalence between different implementations.
@@ -272,3 +273,17 @@ names alone cannot supply them. Detailed evidence and acceptance tests remain in
 
 Future work should update these files instead of adding another overlapping
 architecture summary or an unverified “completed” report.
+
+## Closed syscall profile
+
+Exploration rejects unregistered system calls before kernel execution. The native
+allowlist is limited to owned-process identity/credential queries, query-only
+resource limits and supported private memory operations. Thread creation and
+thread exit remain unsupported; `exit_group` retains the virtual termination path.
+The trusted ELF prelude and internal restore injections are separate boundaries.
+
+Clocks use the saved virtual clock. `getrandom` uses a saved deterministic stream;
+this does not enumerate random outcomes. System memory reports a fixed model
+profile. Signal dispositions and filesystem umask are branch state; custom signal
+delivery and armed interval timers are unsupported. These choices improve state
+closure within an explicit environment, not compatibility with all Linux programs.

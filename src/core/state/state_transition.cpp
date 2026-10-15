@@ -531,6 +531,7 @@ static void init_tracee_state(int index)
   tracee_reserve_temp_page(pid);
   tracee_write_mem(pid, (void *)(scratch_page + 0xff0),
                    "\x0f\x05\x0f\x05\x0f\x05\x0f\x05", 8);
+  capture_process_kernel_state(pid,index);
 }
 
 /* prepare tracee for ptrace, and execve */

@@ -314,16 +314,8 @@ uint64_t tracee_do_syscall_in_place(int pid, int SYS_which, uint64_t rdi, uint64
   int wstatus = 0;
   ptrace_right(PTRACE_SYSCALL, pid, NULL, NULL);
   waitpid(pid, &wstatus, 0);
-  if (WIFSTOPPED(wstatus) && (WSTOPSIG(wstatus) != PTRACE_TRAP_SIG))
-  {
-    LOG_INFO(
-        "ptrace_syscall has wrong stop status. WIFSTOPPED=%s and WSTOPSIG=%s.",
-        WIFSTOPPED(wstatus) ? "true" : "false", strsignal(WSTOPSIG(wstatus)));
-
-    ptrace_right(PTRACE_SYSCALL, pid, NULL, NULL);
-    waitpid(pid, &wstatus, 0);
-    assert(WIFSTOPPED(wstatus) && (WSTOPSIG(wstatus) == PTRACE_TRAP_SIG));
-  }
+  if (!WIFSTOPPED(wstatus) || WSTOPSIG(wstatus) != PTRACE_TRAP_SIG)
+    throw std::runtime_error("Unexpected signal or exit during bootstrap syscall injection");
 
   /* before syscall enter */
   /* syscall modified already */
@@ -333,7 +325,8 @@ uint64_t tracee_do_syscall_in_place(int pid, int SYS_which, uint64_t rdi, uint64
   /* push syscall to exit */
   ptrace_right(PTRACE_SYSCALL, pid, NULL, NULL);
   waitpid(pid, &wstatus, 0);
-  assert(WIFSTOPPED(wstatus) && WSTOPSIG(wstatus) == PTRACE_TRAP_SIG);
+  if (!WIFSTOPPED(wstatus) || WSTOPSIG(wstatus) != PTRACE_TRAP_SIG)
+    throw std::runtime_error("Unexpected signal or exit during syscall injection");
 
   ptrace_right(PTRACE_GETREGS, pid, NULL, &syscall_regs);
   LOG_TRACE("Syscall returns %p", (void *)syscall_regs.rax);
@@ -374,16 +367,8 @@ uint64_t tracee_do_syscall(int pid, int SYS_which, uint64_t rdi, uint64_t rsi,
   int wstatus = 0;
   ptrace_right(PTRACE_SYSCALL, pid, NULL, NULL);
   waitpid(pid, &wstatus, 0);
-  if (WIFSTOPPED(wstatus) && (WSTOPSIG(wstatus) != PTRACE_TRAP_SIG))
-  {
-    LOG_INFO(
-        "ptrace_syscall has wrong stop status. WIFSTOPPED=%s and WSTOPSIG=%s.",
-        WIFSTOPPED(wstatus) ? "true" : "false", strsignal(WSTOPSIG(wstatus)));
-
-    ptrace_right(PTRACE_SYSCALL, pid, NULL, NULL);
-    waitpid(pid, &wstatus, 0);
-    assert(WIFSTOPPED(wstatus) && (WSTOPSIG(wstatus) == PTRACE_TRAP_SIG));
-  }
+  if (!WIFSTOPPED(wstatus) || WSTOPSIG(wstatus) != PTRACE_TRAP_SIG)
+    throw std::runtime_error("Unexpected signal or exit during injected syscall entry");
 
   /* before syscall enter */
   /* syscall modified already */
@@ -393,7 +378,8 @@ uint64_t tracee_do_syscall(int pid, int SYS_which, uint64_t rdi, uint64_t rsi,
   /* push syscall to exit */
   ptrace_right(PTRACE_SYSCALL, pid, NULL, NULL);
   waitpid(pid, &wstatus, 0);
-  assert(WIFSTOPPED(wstatus) && WSTOPSIG(wstatus) == PTRACE_TRAP_SIG);
+  if (!WIFSTOPPED(wstatus) || WSTOPSIG(wstatus) != PTRACE_TRAP_SIG)
+    throw std::runtime_error("Unexpected signal or exit during injected syscall exit");
 
   ptrace_right(PTRACE_GETREGS, pid, NULL, &syscall_regs);
   LOG_TRACE("Syscall returns %p", (void *)syscall_regs.rax);

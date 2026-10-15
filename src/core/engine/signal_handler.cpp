@@ -4,6 +4,7 @@
 
 #include "signal_handler.h"
 #include "guest.h"
+#include "monitor.h"
 #include "runtime_profile.h"
 #include <stdexcept>
 #include "log_wrapper.h"
@@ -28,6 +29,24 @@ SignalHandler::SignalHandler()
 SignalResult SignalHandler::handle(const SignalContext& ctx)
 {
     SignalResult result;
+
+    if (ctx.is_stopped && ctx.category != SignalCategory::SYSCALL_TRAP) {
+        for (int node=0; node<NP; ++node) {
+            if (ptmc_state.pids[node] != ctx.pid && ptmc_state.get_current_tid(node) != ctx.pid)
+                continue;
+            const auto& actions=ptmc_state.process_states[node].signal_actions;
+            const auto action=actions.find(ctx.signal);
+            if (action==actions.end() || action->second.handler==0) break;
+            if (action->second.handler!=1)
+                throw std::runtime_error("Signal delivery to a guest handler is unsupported: " + std::to_string(ctx.signal));
+            if (ctx.category==SignalCategory::FATAL)
+                throw std::runtime_error("Ignored synchronous-fault signal delivery is unsupported");
+            result.action=SignalAction::SPECIAL;
+            result.should_retry=true;
+            result.message="Signal ignored by captured guest disposition";
+            return result;
+        }
+    }
 
     switch (ctx.category) {
         case SignalCategory::SYSCALL_TRAP:

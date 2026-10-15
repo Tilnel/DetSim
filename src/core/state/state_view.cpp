@@ -75,6 +75,7 @@ const tracee_state& StateView::metadata(size_t node) const {
       state->tv=clocks_[node];
       state->fs_state=ptmc_state.fs_states[node];
       state->sock_state=ptmc_state.sock_states[node];
+      state->process_state=ptmc_state.process_states[node];
       if (!ptmc_state.fd_managers[node]) throw std::runtime_error("Missing live descriptor namespace");
       state->fd_manager_state=*ptmc_state.fd_managers[node];
       metadata_[node]=std::move(state);
@@ -130,6 +131,11 @@ std::string StateView::inspect_json(size_t node) const {
       DISSIGNALED(status) ? "signaled" : (status & DIFSTOPPED) ? "stopped" : "running";
   result["exit_code"] = DISEXITED(status) ? Json(DEXITSTATUS(status)) : Json(nullptr);
   result["signal"] = (status & (DIFCRASHED | DIFSIGNALED | DIFSTOPPED)) ? Json(DSTOPSIG(status)) : Json(nullptr);
+  result["creation_mask"] = fs.creation_mask();
+  result["kernel_process"] = {{"random_state",state.process_state.random_state},{"signal_actions",Json::array()}};
+  for(const auto& [signal,action]:state.process_state.signal_actions)
+    result["kernel_process"]["signal_actions"].push_back({{"signal",signal},{"handler",action.handler},
+      {"flags",action.flags},{"restorer",action.restorer},{"mask",action.mask}});
   auto descriptors=Json::array(); auto fds=manager.get_allocated_fds();
   std::vector<int> sorted(fds.begin(),fds.end()); std::sort(sorted.begin(),sorted.end());
   for (int fd:sorted) descriptors.push_back({{"fd",fd},{"kind",fd_kind(manager.get_fd_type(fd))},

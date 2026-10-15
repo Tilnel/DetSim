@@ -46,6 +46,7 @@ struct PTMC_STATE
   SockState sock_states[NP];
   std::shared_ptr<FdManager> fd_managers[NP]; /* Per-process fd allocation */
   FileSystemState fs_states[NP];
+  ProcessKernelState process_states[NP];
 
   int pids[NP] = {};
 

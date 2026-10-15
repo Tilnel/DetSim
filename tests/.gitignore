@@ -75,3 +75,8 @@
 !state_view_layout.c
 
 !fixture_profile.py
+!process_state_integration.cpp
+!process_state.mk
+
+!syscall_policy.mk
+!syscall_policy_integration.cpp

@@ -1,5 +1,32 @@
 # Maintenance baseline
 
+## Closed syscall dispatch slice (2026-10-15)
+
+Invariant: once exploration starts, an unclassified syscall cannot execute a
+host-side effect. Explicit passthrough is limited to captured address-space
+operations and stable queries of the unchanged owned live process; argument
+validation rejects foreign-resource access. Trusted bootstrap/restore injection
+remains a separate explicit boundary. Default routing and default route objects
+reject; diagnostics name the unsupported operation before executing the kernel.
+
+Lock this with native ptrace tests: an unknown prctl(PR_SET_NAME) cannot change
+the child comm; negative/high syscall IDs reject; allowed memory/query calls keep
+normal kernel error behavior. Audit existing Redis/Raft traces before changing
+routing, then preserve compatible paths through truthful generic emulation:
+virtual clocks, a captured seeded random stream, process signal dispositions
+(delivery unsupported), disabled-only interval timers, captured umask, deterministic
+sysinfo and query-only owned-process limits. No workload-specific exceptions.
+
+All new semantic fields require copy/archive/restore/identity tests and an
+incompatible machine snapshot version bump. Fix gettid's fabricated value to the
+actual stable owned TID while this backend still requires the same live thread
+set. Do not claim logical PID virtualization or complete signals/timers/threads.
+
+Run native policy/side-effect regressions, process-model branch/replay/error tests,
+make check, NP1/NP2 default and page gates, Redis exact SET/GET and bounded Raft.
+Separate implementation and read-only review. Keep current master workflow and
+preserve existing runtime/submodule artifacts.
+
 ## Generic framework implementation plan (2026-10-15)
 
 Invariant: core captures machine/environment state without application-specific
@@ -582,3 +609,27 @@ Verification (explicit GCC14 compiler paths):
 
 Future large gains still require proven dirty tracking or an enforced closed
 execution profile. Stopping one thread does not prove its memory cannot change.
+
+## Closed syscall slice verification
+
+Completed on master with `/usr/bin/gcc` and `/usr/bin/g++`:
+
+- `make check`: component and build-contract gates.
+- NP=1: `check-exec check-state-io check-mappings check-xstate
+  check-futex-snapshot check-futex check-page-snapshot check-scenarios`;
+  nine exec/ABI cases and fourteen native scenarios. Existing madvise/shared-map
+  expectations now assert earlier rejection and preserved state.
+- NP=2: `check-syscall-policy check-process-state check-state-view
+  check-runtime-profile check-identity check-capture check-io-boundary
+  check-accept check-plugins check-redis`. Capture covers both snapshot backends;
+  Redis fixed-schedule SET/GET completes. Initial policy RED had nine failures.
+- NP=3 production build and depth8 Raft-library benchmark, one round each:
+  flat and pages both 2,582 visits / 1,347 new states, respectively about
+  396 and 587 states/s. Artifacts: `build/closed-syscalls-raft` and
+  `build/closed-syscalls-raft-pages`. Single runs are smoke measurements,
+  not evidence of performance improvement or equivalence to the old host inputs.
+
+Separate read-only review found no remaining blocker in this slice. Injection
+failure on an unexpected signal is explicit but lacks a dedicated signal-injection
+regression. Thread lifecycle, general signal delivery and complete enabled actor
+enumeration remain separate work.

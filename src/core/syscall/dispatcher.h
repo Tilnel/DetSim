@@ -25,7 +25,7 @@ struct PTMC_STATE;
 enum class SyscallCategory {
     EMULATED,       // Fully emulated (network, time, fs)
     MODIFIED,       // Modified before execution (clone flags)
-    PASSTHROUGH,    // Execute normally (most syscalls)
+    PASSTHROUGH,    // Explicitly allowed, captured private-memory/query operations
     BLOCKED,        // Not allowed (exit_group)
     SPECIAL,        // Special handling required
     UNSUPPORTED,    // Outside the modeled I/O/resource profile
@@ -53,9 +53,9 @@ struct SyscallRoute {
     SyscallAction action;
     const char* description;
 
-    SyscallRoute(SyscallCategory cat = SyscallCategory::PASSTHROUGH,
-                 SyscallAction act = SyscallAction::EXECUTE,
-                 const char* desc = "")
+    SyscallRoute(SyscallCategory cat = SyscallCategory::UNSUPPORTED,
+                 SyscallAction act = SyscallAction::REJECT,
+                 const char* desc = "Unmodeled syscall")
         : category(cat), action(act), description(desc) {}
 };
 

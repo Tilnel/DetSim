@@ -83,17 +83,16 @@ static void run_case(int mode) {
     bool rejected = false;
     try {
         const int checkpoint = engine.execute_syscall(child, info);
-        require(checkpoint == (mode == 10 ? 0 : 1), "waiting successor must be checkpointed");
-        // The dispatcher currently passes madvise through. Also exercise the
-        // dormant FS handler so restoring that route cannot corrupt tracer VMAs.
-        if (mode == 10) handlers::fs::handle_madvise(child, info);
+        require(checkpoint == 1, "waiting successor must be checkpointed");
     } catch (const std::runtime_error &) { rejected = true; }
-    if (mode == 6 || mode == 8) require(rejected, "unsupported futex must fail checker");
+    if (mode == 10) {
+        require(rejected && futex.get_waiters(address).size() == 3 &&
+            ptmc_state.thread_blocked[0][1] && *mapping == 73,
+            "unsupported madvise must preserve waiters and tracer memory");
+    } else if (mode == 6 || mode == 8) require(rejected, "unsupported futex must fail checker");
     else {
         require(!rejected, "supported operation rejected");
         long result = static_cast<long>(info.rval);
-        if (mode == 10) require(result == 0 && futex.get_waiters(address).size() == 3
-            && ptmc_state.thread_blocked[0][1] && *mapping == 73, "madvise must preserve waiters and tracer memory");
         if (mode == 1) require(result == 0 && futex.is_thread_waiting(1) && ptmc_state.thread_blocked[0][0], "32-bit signed wait must block with success on eventual wake");
         if (mode == 0 || mode == 4 || mode == 11 || mode == 12) require(result == (mode == 4 ? 3 : 1) && !futex.is_thread_waiting(2)
             && !ptmc_state.thread_blocked[0][1] && ptmc_state.thread_blocked[0][2] && ptmc_state.thread_blocked[0][3], "wake must unblock only removed waiter");

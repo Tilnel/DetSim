@@ -86,6 +86,7 @@ class FileSystemState
   private:
   // FdManager for unified fd allocation (shared with SockState)
   FdManagerPtr fd_manager_;
+  mode_t creation_mask_ = 0022;
 
   public:
   // Default constructor - ensures all members are properly initialized
@@ -103,6 +104,8 @@ class FileSystemState
 
   // Attach the captured descriptor namespace without creating any descriptors.
   void set_fd_manager(FdManagerPtr fd_mgr) { fd_manager_ = fd_mgr; }
+  mode_t creation_mask() const { return creation_mask_; }
+  void set_creation_mask(mode_t mask) { creation_mask_ = mask & 0777; }
 
   template <class Archive>
   void serialize(Archive &ar);

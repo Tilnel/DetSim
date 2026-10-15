@@ -9,6 +9,7 @@
 #include "monitor.h"
 #include "thread_manager.h"
 #include "sync/futexstate.h"
+#include "process/process_state.h"
 #include <cassert>
 #include <cstring>
 #include <sys/ptrace.h>
@@ -18,6 +19,20 @@
 #include <stdexcept>
 #include <fcntl.h>
 #include <algorithm>
+#include <limits>
+
+namespace {
+void validate_guest_mapping_range(uint64_t address,uint64_t length) {
+    constexpr uint64_t page_size=4096;
+    if (!length) return;
+    constexpr uint64_t maximum=std::numeric_limits<uint64_t>::max();
+    if (length>maximum-(page_size-1)) throw std::runtime_error("Mapping length overflow");
+    const uint64_t rounded=(length+page_size-1)&~(page_size-1);
+    if (address>maximum-rounded) throw std::runtime_error("Mapping address overflow");
+    if (address<scratch_page+page_size && address+rounded>scratch_page)
+        throw std::runtime_error("Guest mapping operation overlaps reserved syscall scratch page");
+}
+}
 
 // External functions from state_transition.cpp
 extern int analyze_choose(struct syscall_info &info);
@@ -78,6 +93,15 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         case SYS_gettimeofday:
         case SYS_nanosleep:
         case SYS_clock_nanosleep:
+        case SYS_clock_gettime:
+        case SYS_clock_getres:
+        case SYS_time:
+        case SYS_getrandom:
+        case SYS_sysinfo:
+        case SYS_rt_sigaction:
+        case SYS_setitimer:
+        case SYS_getitimer:
+        case SYS_umask:
             return SyscallRoute(SyscallCategory::EMULATED,
                                SyscallAction::EMULATE,
                                "Time syscall - emulated");
@@ -141,12 +165,13 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
             return SyscallRoute(SyscallCategory::UNSUPPORTED,SyscallAction::REJECT,
                                 "Unsupported virtual I/O or descriptor lifecycle");
 
-        // Clone syscalls - modified
+        // Physical lifecycle changes cannot yet be reconstructed on restore.
         case SYS_clone:
         case SYS_clone3:
-            return SyscallRoute(SyscallCategory::MODIFIED,
-                               SyscallAction::MODIFY,
-                               "Clone - add CLONE_PTRACE");
+        case SYS_exit:
+            return SyscallRoute(SyscallCategory::UNSUPPORTED,
+                               SyscallAction::REJECT,
+                               "Unsupported physical thread lifecycle");
 
         // Blocked syscalls
         case SYS_exit_group:
@@ -155,19 +180,23 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
                                "exit_group - blocked");
 
         // Special handling
-        case SYS_exit:
         case SYS_futex:
         case SYS_mmap:
-        case SYS_gettid:
             return SyscallRoute(SyscallCategory::SPECIAL,
                                SyscallAction::DEFERRED,
                                "Special handling required");
 
-        // Everything else - passthrough
-        default:
+        // Native queries are stable within the owned tracee. Private-memory
+        // effects are included in capture; argument restrictions run on entry.
+        case SYS_getpid: case SYS_gettid:
+        case SYS_getuid: case SYS_geteuid: case SYS_getgid: case SYS_getegid:
+        case SYS_brk: case SYS_mprotect: case SYS_munmap:
+        case SYS_prlimit64:
             return SyscallRoute(SyscallCategory::PASSTHROUGH,
                                SyscallAction::EXECUTE,
-                               "Passthrough");
+                               "Allowed owned-process query or private memory operation");
+        default:
+            return SyscallRoute();
     }
 }
 
@@ -243,8 +272,17 @@ bool SyscallDispatcher::on_enter(pid_t pid, int syscall_nr, syscall_info& info)
             return true;
 
         case SyscallAction::EXECUTE:
-        default:
+            if (syscall_nr == SYS_mprotect || syscall_nr == SYS_munmap)
+                validate_guest_mapping_range(info.args[0],info.args[1]);
+            if (syscall_nr == SYS_prlimit64 &&
+                (info.args[2] || (info.args[0] && info.args[0] != uint64_t(ptmc_state.pids[ptmc_state.cursor]))))
+                throw std::runtime_error("Only owned-process prlimit64 queries are supported");
+            if (syscall_nr == SYS_mprotect &&
+                (!(info.args[2] & PROT_READ) || (info.args[2] & ~(PROT_READ|PROT_WRITE|PROT_EXEC))))
+                throw std::runtime_error("Unreadable or extended-protection mappings are unsupported");
             return true;
+        default:
+            throw std::runtime_error("Invalid syscall action");
     }
 }
 
@@ -324,6 +362,14 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
         case SYS_clock_nanosleep:
             return handle_time_exit(pid, info);
 
+        case SYS_clock_gettime: case SYS_clock_getres: case SYS_time:
+        case SYS_getrandom: case SYS_sysinfo: case SYS_rt_sigaction:
+        case SYS_setitimer: case SYS_getitimer: case SYS_umask: {
+            const long result=emu_process_syscall(info);
+            tracee_set_rax(pid,result);info.rval=result;
+            return CKPT_YES;
+        }
+
         // Default - no checkpoint needed
         default:
             return CKPT_NO;
@@ -334,6 +380,11 @@ void SyscallDispatcher::handle_mmap_enter(pid_t pid, syscall_info& info)
 {
     vfs_mmap_state_ = {};
     const int flags=static_cast<int>(info.args[3]);
+    constexpr int supported_flags=MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED|MAP_FIXED_NOREPLACE|MAP_STACK|MAP_NORESERVE;
+    if (!(flags&MAP_PRIVATE) || (flags&~supported_flags) ||
+        !(info.args[2]&PROT_READ) || (info.args[2]&~uint64_t(PROT_READ|PROT_WRITE|PROT_EXEC)))
+        throw std::runtime_error("Only readable private mappings with ordinary protections are supported");
+    if (flags&(MAP_FIXED|MAP_FIXED_NOREPLACE)) validate_guest_mapping_range(info.args[0],info.args[1]);
     if (flags & MAP_ANONYMOUS) return; // fd is ignored by the kernel.
     auto& fs=ptmc_state.fs_states[ptmc_state.cursor];
     auto manager=ptmc_state.fd_managers[ptmc_state.cursor];
