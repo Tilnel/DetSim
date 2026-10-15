@@ -195,6 +195,61 @@ finally:
                 self.assertIn("exit_group(0)", output)
                 self.assertIn("Complete explore all", output)
 
+    def test_runtime_queries_restore_and_replay(self):
+        source = self.root / "runtime_queries.c"
+        source.write_text(r"""
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <stdint.h>
+#include <string.h>
+#include <fcntl.h>
+volatile int counter;
+static uint64_t mask[2];
+static char path[4096];
+int main(int argc, char **argv) {
+    (void)argc;
+    counter = 1; write(1, "start", 5);
+    mask[1] = 0x12345678;
+    if (syscall(SYS_sched_getaffinity, 0, sizeof(mask), mask) != 8 ||
+        mask[0] != 1 || mask[1] != 0x12345678) return 71;
+    counter = 2; write(1, "cpu", 3);
+    long n = syscall(SYS_readlink, "/proc/self/exe", path, sizeof(path));
+    if (n != (long)strlen(argv[0]) || memcmp(path, argv[0], n)) return 72;
+    counter = 3; write(1, "exe", 3);
+    n = syscall(SYS_readlinkat, AT_FDCWD, "/proc/self/exe", path, 3);
+    if (n != 3 || memcmp(path, argv[0], 3)) return 73;
+    counter = 4; write(1, "at", 2);
+    return 0;
+}
+""")
+        subprocess.run(shlex.split(os.environ.get("CC", "/usr/bin/gcc")) +
+            ["-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie", str(source),
+             "-o", str(self.root / "probe")], check=True)
+
+        def scenario(send):
+            send("sw 0")
+            send("si")
+            self.assertIn("counter = 1", send("p counter"))
+            for value in (2, 3, 4):
+                saved = re.findall(r"=> ([0-9a-f]{16})", send("info"))[-1]
+                send("si")  # query returns, before consuming the result
+                send("si")  # application validates result and writes marker
+                self.assertIn(f"counter = {value}", send("p counter"))
+                expected = re.findall(r"=> ([0-9a-f]{16})", send("info"))[-1]
+                for _ in range(3):
+                    self.assertIn("Loaded state", send("load " + saved))
+                    send("si")
+                    send("si")
+                    self.assertIn(f"counter = {value}", send("p counter"))
+                    self.assertEqual(re.findall(r"=> ([0-9a-f]{16})", send("info"))[-1], expected)
+            send("si")
+            self.assertIn("has exited with status 0", send("si"))
+
+        for backend in ("full", "pages"):
+            code, output = self.run_tracer(scenario, name="queries_" + backend,
+                extra_env={"DETSIM_SNAPSHOT_BACKEND": backend})
+            self.assertEqual(code, 0, output)
+
     def test_interactive_initial_state_and_clean_exit(self):
         code, output = self.run_tracer("sw 0\np counter\nq\n")
         self.assertRegex(output, r"(?m)^counter = 0\r?$", output)

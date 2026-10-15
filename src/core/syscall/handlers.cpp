@@ -232,6 +232,13 @@ int handle(pid_t pid, syscall_info &info) {
         case SYS_newfstatat:return handle_statat(pid,info);
         case SYS_getcwd:    return handle_getcwd(pid,info);
         case SYS_lstat:     return handle_stat(pid,info);
+        case SYS_readlink:
+        case SYS_readlinkat: {
+            const bool at = info.nr == SYS_readlinkat;
+            const long result = emu_vfs_readlinkat(at ? static_cast<int>(info.args[0]) : AT_FDCWD,
+                (const char*)info.args[at ? 1 : 0], (char*)info.args[at ? 2 : 1], info.args[at ? 3 : 2]);
+            tracee_set_rax(pid,result); info.rval=result; return CKPT_YES;
+        }
         default:            return CKPT_NO;
     }
 }
@@ -275,7 +282,8 @@ int handle_lseek(pid_t pid, syscall_info &info) {
 }
 
 int handle_stat(pid_t pid, syscall_info &info) {
-    long ret = emu_vfs_stat((const char *)info.args[0], (struct stat *)info.args[1]);
+    long ret = emu_vfs_statat(AT_FDCWD, (const char *)info.args[0], (struct stat *)info.args[1],
+        info.nr == SYS_lstat ? AT_SYMLINK_NOFOLLOW : 0);
     tracee_set_rax(pid, ret);
     info.rval = ret;
     return CKPT_NO;

@@ -1,7 +1,12 @@
 #include "fsstate.h"
+#include "monitor.h"
 #include "ncurses_ui.h"
 #include "cereal/archives/binary.hpp"
 #include <fcntl.h>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <unistd.h>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -14,6 +19,110 @@ int main()
 {
   try
   {
+    char temporary[] = "/tmp/detsim-readlink-XXXXXX";
+    CHECK(mkdtemp(temporary));
+    const std::filesystem::path root(temporary);
+    struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{root};
+    std::ofstream(root / "regular") << "payload";
+    CHECK(symlink("regular", (root / "link").c_str()) == 0);
+    CHECK(symlink("missing", (root / "dangling").c_str()) == 0);
+    CHECK(symlink("loop", (root / "loop").c_str()) == 0);
+    std::filesystem::create_directories(root / "real/deep");
+    std::ofstream(root / "real/regular") << "other executable";
+    CHECK(symlink("real/deep", (root / "directory_alias").c_str()) == 0);
+    bool dotdot_rejected = false;
+    try {
+      FileSystemState ambiguous;
+      ambiguous.capture_executable((root / "directory_alias/../regular").string());
+    } catch (const std::runtime_error&) { dotdot_rejected = true; }
+    CHECK(dotdot_rejected);
+    FileSystemState imported(std::make_shared<FdManager>());
+    imported.init_from_mappings({{root.string(), "/fixture"}});
+    CHECK(S_ISLNK(imported.filesystem.at("/fixture/link").metadata.st_mode));
+    CHECK(imported.filesystem.at("/fixture/link").content == std::vector<char>({'r','e','g','u','l','a','r'}));
+    CHECK(S_ISLNK(imported.filesystem.at("/fixture/dangling").metadata.st_mode));
+    CHECK(S_ISLNK(imported.filesystem.at("/fixture/loop").metadata.st_mode));
+    std::string target;
+    CHECK(imported.do_readlink("/fixture/link", target) == 0 && target == "regular");
+    CHECK(imported.do_readlink("/fixture/dangling", target) == 0 && target == "missing");
+    CHECK(imported.do_readlink("/fixture/regular", target) == -EINVAL);
+    CHECK(imported.do_readlink("/fixture/missing", target) == -ENOENT);
+    struct stat link_stat{};
+    CHECK(imported.do_stat("/fixture/link", &link_stat, false) == 0 && S_ISLNK(link_stat.st_mode));
+    CHECK(imported.do_open("/fixture/link", O_RDONLY|O_NOFOLLOW, 0) == -ELOOP);
+    CHECK(imported.do_open("/fixture/link", O_CREAT|O_EXCL|O_RDWR, 0) == -EEXIST);
+    for (const auto& path : {"/fixture/link", "/fixture/link/..", "/fixture/link/"}) {
+      bool rejected = false;
+      try { imported.do_stat(path, &link_stat); } catch (const std::runtime_error&) { rejected = true; }
+      CHECK(rejected);
+    }
+    CHECK(imported.do_readlink("/absent/../fixture/link", target) == -ENOENT);
+    CHECK(imported.do_readlink("/fixture/regular/../link", target) == -ENOTDIR);
+    CHECK(imported.do_open("/fixture/regular", O_RDONLY, 0) >= 0);
+    FileSystemState executable(std::make_shared<FdManager>());
+    executable.capture_executable("/bin/true");
+    const std::string canonical = std::filesystem::canonical("/bin/true").string();
+    CHECK(executable.do_readlink("/proc/self/exe", target) == 0 && target == canonical);
+    CHECK(executable.filesystem.contains(canonical));
+    CHECK(!executable.filesystem.at(canonical).content.empty());
+    CHECK(executable.do_open(canonical, O_WRONLY, 0) == -ETXTBSY);
+    CHECK(executable.do_open(canonical, O_RDONLY|O_TRUNC, 0) == -ETXTBSY);
+    CHECK(executable.do_open(canonical, O_CREAT|O_EXCL|O_WRONLY, 0600) == -EEXIST);
+    CHECK(executable.do_open(canonical, O_RDONLY, 0) >= 0);
+    CHECK(open("/proc/self/exe", O_WRONLY) == -1 && errno == ETXTBSY);
+    CHECK(open("/proc/self/exe", O_CREAT|O_EXCL|O_WRONLY, 0600) == -1 && errno == EEXIST);
+    CHECK(S_ISLNK(executable.filesystem.at("/bin").metadata.st_mode));
+    CHECK(executable.do_readlink("/bin", target) == 0);
+    for (bool stat_operation : {false, true}) {
+      bool rejected = false;
+      try {
+        if (stat_operation) executable.do_stat("/proc/./self", &link_stat, false);
+        else executable.do_readlink("/proc/./self", target);
+      } catch (const std::runtime_error&) { rejected = true; }
+      CHECK(rejected);
+    }
+    CHECK(open("/proc/self", O_RDONLY|O_NOFOLLOW) == -1 && errno == ELOOP);
+    bool proc_open_rejected = false;
+    try { executable.do_open("/proc/self", O_RDONLY|O_NOFOLLOW, 0); }
+    catch (const std::runtime_error&) { proc_open_rejected = true; }
+    CHECK(proc_open_rejected);
+    FileSystemState conflict(std::make_shared<FdManager>());
+    VFSNode conflict_node{}; conflict_node.metadata.st_mode = S_IFREG | 0600;
+    conflict.filesystem["/bin/true"] = conflict_node;
+    bool conflict_rejected = false;
+    try { conflict.capture_executable("/bin/true"); }
+    catch (const std::runtime_error&) { conflict_rejected = true; }
+    CHECK(conflict_rejected);
+    std::stringstream link_bytes;
+    { cereal::BinaryOutputArchive ar(link_bytes); ar(imported); }
+    FileSystemState link_restore;
+    { cereal::BinaryInputArchive ar(link_bytes); ar(link_restore); }
+    CHECK(link_restore.do_readlink("/fixture/link", target) == 0 && target == "regular");
+    link_restore.filesystem.at("/fixture/link").content[0] = 'X';
+    CHECK(imported.do_readlink("/fixture/link", target) == 0 && target == "regular");
+    // Remove host inputs: all later reads must come from the archived namespace.
+    CHECK(unlink((root / "link").c_str()) == 0);
+    CHECK(imported.do_readlink("/fixture/link", target) == 0 && target == "regular");
+    ptmc_state.cursor = 0;
+    ptmc_state.pids[0] = getpid();
+    ptmc_state.fs_states[0] = imported;
+    char actual[16], native[16];
+    for (size_t count : {size_t(1), size_t(7), size_t(16)}) {
+      memset(actual, '#', sizeof(actual)); memset(native, '#', sizeof(native));
+      const ssize_t expected = readlink((root / "dangling").c_str(), native, count);
+      CHECK(expected == emu_vfs_readlinkat(AT_FDCWD, "/fixture/dangling", actual, count));
+      CHECK(memcmp(actual, native, sizeof(actual)) == 0);
+    }
+    CHECK(emu_vfs_readlinkat(-7, "/fixture/link", actual, sizeof(actual)) == 7);
+    CHECK(emu_vfs_readlinkat(-7, "link", actual, sizeof(actual)) == -EBADF);
+    CHECK(emu_vfs_readlinkat(AT_FDCWD, "/fixture/link", actual, 0) == -EINVAL);
+    CHECK(emu_vfs_readlinkat(AT_FDCWD, "/fixture/link", actual, size_t(1)<<31) == -EINVAL);
+    CHECK(emu_vfs_readlinkat(AT_FDCWD, "/fixture/link", nullptr, 1) == -EFAULT);
+    CHECK(emu_vfs_readlinkat(AT_FDCWD, nullptr, actual, 1) == -EFAULT);
+    const int directory = ptmc_state.fs_states[0].do_open("/fixture", O_DIRECTORY|O_RDONLY, 0);
+    CHECK(directory >= 0);
+    CHECK(emu_vfs_readlinkat(directory, "link", actual, sizeof(actual)) == 7);
+    CHECK(emu_vfs_readlinkat(directory, "", actual, sizeof(actual)) == -ENOENT);
     auto manager = std::make_shared<FdManager>();
     FileSystemState fs(manager);
     char buffer[8]{};

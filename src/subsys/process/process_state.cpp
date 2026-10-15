@@ -173,6 +173,24 @@ long emu_process_syscall(const syscall_info& info) {
         state.random_state=seed;
         return count;
     }
+    case SYS_sched_getaffinity: {
+        // Fixed x86-64 machine profile: one available CPU, one kernel mask word.
+        // Linux accepts unsigned-int len (including its bit-count wrap), checks
+        // word alignment before PID lookup, and returns bytes copied, not zero.
+        const uint32_t length=info.args[1];
+        if(uint32_t(length*8U)<1 || length%sizeof(uint64_t)) return -EINVAL;
+        const int32_t target=info.args[0];
+        bool live=false;
+        for(int index=0;index<NP && !live;++index)
+            for(const auto& thread:ptmc_state.running_state.child[index].threads)
+                if(thread.alive && ((target==0 && index==node && thread.physical_tid==pid) ||
+                    (target>0 && logical_thread_id(index,thread.tid)==target))) {
+                    live=true;break;
+                }
+        if(!live) return -ESRCH;
+        const uint64_t mask=1;
+        return write(info.args[2],mask)?long(sizeof(mask)):-EFAULT;
+    }
     case SYS_sysinfo: {
         struct sysinfo value{};
         value.uptime=now.tv_sec;value.totalram=1ULL<<30;value.freeram=1ULL<<29;

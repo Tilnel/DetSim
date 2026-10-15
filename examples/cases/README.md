@@ -52,17 +52,21 @@ runner 只依赖 Python 标准库及已有编译器。不会下载依赖、修�
 | C | GCC14.2 | 通过 | 标记及退出0，搜索完成 |
 | C++ std | GCC14.2 | 通过 | 标记及退出0，搜索完成 |
 | Rust std | rustc1.51.0 | 通过 | 仍阻塞于 `sigaltstack`，syscall131 |
-| Go | gccgo14.2（非标准 gc） | 通过 | 仍阻塞于 `sched_getaffinity`，syscall204 |
-| Python | CPython3.13.5，`-I -S` | 通过 | 仍阻塞于 `readlink`，syscall89 |
-| Java | OpenJDK21.0.12.1 | 通过 | 仍阻塞于 `readlink`，syscall89 |
+| Go | gccgo14.2（非标准 gc） | 通过 | pages 推进到 `sigaltstack`；full 捕获发生 `bad_alloc` |
+| Python | CPython3.13.5，`-I -S` | 通过 | 已越过 `readlink`；缺少映射的标准库，退出1，验收失败 |
+| Java | OpenJDK21.0.12.1 | 通过 | 已越过 `readlink`，下一阻塞为 `access`，syscall21 |
 
 这些版本是本机实测，不代表整个语言、其他版本或所有库已受支持。Java 保留正常 JVM/JIT，只显式限制 heap/code cache/class space；没有把 JVM 私有结构补丁放进框架。标准 gc Go 的单独准入目标尚待可用工具链；不能用 gccgo 结果代替它。
 
 本次案例推动了三个通用修复：动态 argv（原数组在5参数写终止符时越界，9参数直接拒绝）、匿名零长度 mmap 的正常 `EINVAL` 路径、`poll(timeout=0)`。文件 mmap 的 `EBADF` 优先级和 huge-page 不支持边界仍保留；阻塞 poll 仍明确拒绝。
 
+后续这一批补了 `sched_getaffinity` 固定虚拟 CPU0 查询，以及 `readlink/readlinkat`：链接目标复用 VFS 节点内容保存，初始化捕获 executable 路径链和 `/proc/self/exe`，探索期间不查询宿主路径。普通链接遍历仍明确拒绝；未支持完整 procfs 或 CPU 拓扑。真实 syscall 的 full/pages 三次恢复重放另有回归。内核模型版本升为 v12，快照布局不变。
+
+为正确描述 executable 文件，当前捕获其完整字节，会增加 VFS 复制与哈希成本。12 组小案例单次总耗时旧版12.43秒、新版12.19秒（含编译），小案例未显示明显退化，但 Redis SET/GET 场景从先前7.691秒变为26.012秒，约3.38倍，属于实际性能回退。原因是现有 VFS 用独占 vector 保存文件，静态 executable 字节也随每个状态复制、哈希和序列化；后续应统一改为不可变内容块和分支写覆盖。不能把这称为 readlink 的必然成本。gccgo 的内存失败也单独保留，不以另一次 pages 的进展掩盖。
+
 ## 接下来的推进顺序
 
-1. 用上述未通过的 probe 驱动 `sigaltstack`、CPU 查询、readlink/procfs/只读运行环境文件的支持。每修一处先让原案例继续，再记录下一个阻塞；不要靠放宽未知 syscall passthrough 或跳过初始化来变绿。
+1. 用上述未通过的 probe 驱动 `sigaltstack`、`access`、只读运行环境文件及大规模保留映射捕获的支持。每修一处先让原案例继续，再记录下一个阻塞；不要靠放宽未知 syscall passthrough 或跳过初始化来变绿。
 2. 为各语言加入正常/注错小协议，保持相同的证据等级，而不仅是 Hello World。
 3. 接入 willemt Raft 与现有 RedisRaft **库驱动**，分别定义 leader/term/commit 性质及可解释的复制构建 mutation。已有 `benchmark-redisraft` 不是完整 Redis+RedisRaft module 的证明。
 4. 再推进完整 RedisRaft、真实多线程/多进程系统。只有具体案例要求时再扩展 actor/timeout/outcome 枚举和共享内存切换边界。

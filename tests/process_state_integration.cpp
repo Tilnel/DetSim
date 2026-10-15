@@ -2,6 +2,7 @@
 #include "monitor.h"
 #include "ncurses_ui.h"
 #include "guest.h"
+#include "engine/thread_pool.h"
 #include "signal_handler.h"
 #include "cereal/archives/binary.hpp"
 #include <array>
@@ -77,6 +78,62 @@ int main() {
     check(unsupported_clock,"unmodeled CPU clocks do not use host time");
     struct sysinfo si{};
     check(call(SYS_sysinfo,reinterpret_cast<uint64_t>(&si))==0 && si.totalram==(1ULL<<30) && si.mem_unit==1,"sysinfo uses deterministic machine profile");
+    // Raw Linux ABI returns copied bytes, unlike libc's zero success value.
+    auto native_affinity=[](long target,unsigned long size,void* mask) {
+        errno=0;
+        const long result=syscall(SYS_sched_getaffinity,target,size,mask);
+        return result<0 ? -long(errno) : result;
+    };
+    std::array<uint64_t,128> host_mask{};
+    const long host_bytes=native_affinity(0,sizeof(host_mask),host_mask.data());
+    check(host_bytes>0 && host_bytes<=long(sizeof(host_mask)) && host_bytes%8==0,
+          "native affinity returns whole-word copied byte count");
+    check(native_affinity(-1,0,nullptr)==-EINVAL &&
+          native_affinity(-1,sizeof(host_mask),nullptr)==-ESRCH &&
+          native_affinity(0,sizeof(host_mask)-1,host_mask.data())==-EINVAL &&
+          native_affinity(0,sizeof(host_mask),nullptr)==-EFAULT &&
+          native_affinity(0,1UL<<29,nullptr)==-EINVAL,
+          "native affinity validates size then target then copy");
+    auto& tasks=ptmc_state.running_state.child[0].threads;
+    thread_state affinity_main{};affinity_main.tid=1;affinity_main.physical_tid=getpid();affinity_main.alive=true;
+    thread_state affinity_peer{};affinity_peer.tid=2;affinity_peer.physical_tid=123456;affinity_peer.alive=true;
+    tasks={affinity_main,affinity_peer};
+    auto affinity=[&](uint64_t target,uint64_t size,uint64_t buffer) {
+        try {return call(SYS_sched_getaffinity,target,size,buffer);}
+        catch(const std::runtime_error&) {return -long(ENOSYS);}
+    };
+    std::array<uint64_t,2> mask{0,0xfeedbeef};
+    const auto mask_address=reinterpret_cast<uint64_t>(mask.data());
+    check(affinity(0,sizeof(mask),mask_address)==8 && mask[0]==1 && mask[1]==0xfeedbeef,
+          "affinity exposes only virtual CPU0 and preserves bytes past kernel mask");
+    check(affinity(logical_process_id(0),8,mask_address)==8 &&
+          affinity(logical_thread_id(0,2),8,mask_address)==8,
+          "affinity accepts logical process and sibling task IDs");
+    tasks[1].alive=false;
+    check(affinity(logical_thread_id(0,2),8,mask_address)==-ESRCH &&
+          affinity(123456,8,mask_address)==-ESRCH && affinity(-1,8,mask_address)==-ESRCH,
+          "affinity rejects dead tasks unknown IDs and physical carrier IDs");
+    check(affinity(-1,0,0)==-EINVAL && affinity(-1,8,0)==-ESRCH &&
+          affinity(0,8,0)==-EFAULT && affinity(0,7,mask_address)==-EINVAL &&
+          affinity(0,9,mask_address)==-EINVAL,
+          "affinity error precedence matches Linux");
+    check(affinity(1ULL<<32,(1ULL<<32)+8,mask_address)==8 &&
+          affinity(0,1ULL<<32,mask_address)==-EINVAL &&
+          affinity(0,1ULL<<29,mask_address)==-EINVAL,
+          "affinity uses signed pid32 and unsigned len32 including bit-count wrap");
+    const auto process_before_affinity=archive(ptmc_state.process_states[0]);
+    mask[0]=0;
+    check(affinity(0,8,mask_address)==8 && mask[0]==1 &&
+          archive(ptmc_state.process_states[0])==process_before_affinity,
+          "affinity query has no mutable process state");
+    if constexpr(NP>1) {
+        auto& peer_tasks=ptmc_state.running_state.child[1].threads;
+        peer_tasks={affinity_main};
+        check(affinity(logical_process_id(1),8,mask_address)==8,
+              "affinity recognizes live logical tasks in other modeled nodes");
+        peer_tasks.clear();
+    }
+    tasks.clear();
     itimerval timer{},timerold{};
     check(call(SYS_setitimer,ITIMER_REAL,reinterpret_cast<uint64_t>(&timer),reinterpret_cast<uint64_t>(&timerold))==0 && timerold.it_value.tv_sec==0,"disabled interval timers are modeled");
     timer.it_value.tv_sec=1;bool rejected=false;

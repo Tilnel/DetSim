@@ -329,3 +329,36 @@ all' and visited state is shared across CLI searches. The new runner uses fresh
 tracers per search and labels bounded results conservatively. Future core search
 work should fix reporting/coverage directly rather than treating this runner
 boundary as closure of C03/C25.
+
+### Runtime queries: captured paths and CPU affinity
+
+The next case-driven slice adds readlink/readlinkat over captured VFS symlink
+bytes, including the executable path chain and /proc/self/exe captured during
+initialization. No host pathname lookup occurs on a modeled query. Ordinary
+symlink traversal remains explicitly unsupported; readlink and nofollow stat
+can inspect final links. Missing/non-directory prefixes must be checked before
+lexical normalization. The synthetic proc projection does not claim general
+procfs support, and observing /proc/self itself as a link remains unsupported.
+
+sched_getaffinity exposes one fixed virtual CPU, validates logical live task
+identity and follows the raw x86-64 mask-copy ABI. No mutable affinity state was
+added; sched_setaffinity, CPUID/proc/vDSO topology coherence remain outside scope
+(C17). Kernel modelv12 distinguishes these semantics; byte layouts stay23/24.
+Executable bytes now enter the captured VFS, increasing state-copy/hash work by
+binary size; this is a correctness-first tradeoff, not a performance optimization.
+
+Runtime re-audit after these changes: Python now reaches an explicit failed
+probe exit (missing captured standard-library files), Java advances to access21,
+and gccgo pages reaches sigaltstack131. Full gccgo still fails allocation under
+the audit's2GiB address-space limit; a4GiB diagnostic caught a747,734,229-byte
+allocation in packed-save decompression. An intermittent pages allocation failure
+also occurred before the capacity fix, but was not reproduced in four bounded
+GDB runs. None of these results count as runtime admission.
+
+The audit found and fixed compressed-buffer retention: resize(encoded_size)
+kept compressBound(raw_size) capacity while warm-cache accounting charged only
+encoded_size. A regression now requires compact retained capacity and exact
+byte decompression. This does not bound transient raw capture, queued work and
+save-side decompression. Executable capture separately regressed the Redis
+SET/GET single-run time from7.691s to26.012s; prioritize immutable VFS payloads
+without weakening byte equality or branch isolation.

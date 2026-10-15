@@ -172,6 +172,7 @@ static void parse_fsmap(const json &cfg, const fs::path &cfg_dir)
       ptmc_state.fs_states[i].init_from_mappings(mappings);
     }
     ptmc_state.fs_states[i].set_cwd(workdir);
+    ptmc_state.fs_states[i].capture_executable(ptmc_state.tracee[i].executable);
   }
 }
 

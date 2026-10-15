@@ -121,6 +121,7 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         case SYS_time:
         case SYS_getrandom:
         case SYS_sysinfo:
+        case SYS_sched_getaffinity:
         case SYS_rt_sigaction:
         case SYS_setitimer:
         case SYS_getitimer:
@@ -148,6 +149,8 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         case SYS_newfstatat:
         case SYS_getcwd:
         case SYS_lstat:
+        case SYS_readlink:
+        case SYS_readlinkat:
             return SyscallRoute(SyscallCategory::EMULATED,
                                SyscallAction::EMULATE,
                                "VFS syscall - emulated");
@@ -181,7 +184,7 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         case SYS_removexattr: case SYS_lremovexattr: case SYS_fremovexattr:
         case SYS_mount: case SYS_umount2: case SYS_pivot_root: case SYS_chroot:
         case SYS_access: case SYS_faccessat: case SYS_faccessat2:
-        case SYS_statx: case SYS_readlink: case SYS_readlinkat:
+        case SYS_statx:
         case SYS_getxattr: case SYS_lgetxattr: case SYS_fgetxattr:
         case SYS_listxattr: case SYS_llistxattr: case SYS_flistxattr:
         case SYS_execve: case SYS_execveat:
@@ -382,6 +385,8 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
         case SYS_newfstatat:
         case SYS_getcwd:
         case SYS_lstat:
+        case SYS_readlink:
+        case SYS_readlinkat:
             return handle_fs_exit(pid, info);
 
         case SYS_getpid:
@@ -411,7 +416,7 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
             return handle_time_exit(pid, info);
 
         case SYS_clock_gettime: case SYS_clock_getres: case SYS_time:
-        case SYS_getrandom: case SYS_sysinfo: case SYS_rt_sigaction:
+        case SYS_getrandom: case SYS_sysinfo: case SYS_sched_getaffinity: case SYS_rt_sigaction:
         case SYS_setitimer: case SYS_getitimer: case SYS_umask: {
             const long result=emu_process_syscall(info);
             tracee_set_rax(pid,result);info.rval=result;

@@ -997,3 +997,47 @@ real distributed protocol mutations, complete actor/outcome enumeration and
 shared-memory atom boundaries. Same-process replay is not cross-ASLR portable
 replay; the pthread case establishes a concrete closed-world deadlock, not full
 interleaving coverage. Existing DFS completion text/visited reuse remains debt.
+
+## Runtime path/CPU admission and compressed capacity (2026-10-16)
+
+Changes: captured VFS symlink targets, scoped readlink/readlinkat and lstat,
+startup executable path/content capture, and fixed CPU0 sched_getaffinity using
+logical live task IDs. Existing VFS content/type serialization is reused; no new
+state fields or runtime-specific framework branches. Kernel modelv12, byte
+layouts23/24. Missing/non-directory prefixes, executable conflicts/ETXTBSY and
+unmodeled symlink/proc operations reject rather than manufacture success.
+
+Regression evidence with /usr/bin/gcc and /usr/bin/g++:
+- RED actual runtime-query scenario stopped at unsupported204; final native
+  scenario restores and replays affinity/readlink/readlinkat edges three times
+  each in full/pages. NP1 check-scenarios:19 tests; check-cases:12 rows plus
+  bounded/missing-toolchain runner checks.
+- NP2 check-process-state, check-syscall-policy, check-runtime-profile and
+  check-io-boundary pass. Native readlink/error/ABI oracles, archive branch
+  isolation, deletion of host link after capture, and affinity identity/error
+  oracles pass. Filesystem and process changed files pass strict C++ diagnostics.
+- NP2 check-redis passes SET/GET, client exit0;26.012s versus earlier7.691s.
+  This is a measured regression from importing a16MiB executable into an owned
+  VFS vector copied with every state. Small12-case run12.43s before/12.19s after
+  does not negate the large-target cost. Immutable VFS content needs a follow-up.
+- make check passes9 component cases and10 build contracts; NP1/NP2 production
+  builds pass. Independent read-only semantic review and diffcheck pass.
+
+The runtime audit additionally found compressed vector capacity retained at raw
+snapshot scale while cache accounting charged only compressed length. A separate
+focused fix constructs compact encoded storage; an8MiB compressible regression
+failed before and passes afterward with exact decompressed bytes. NP2
+check-store-packed and check-store-cache pass, strict C++ diagnostics pass.
+Save-side decompression validation remains unchanged. GDB localized a separate
+remaining full-mode transient747,734,229-byte allocation failure in decompress
+under4GiB; the compact-buffer fix is not a global memory budget guarantee.
+
+Logs: /tmp/detsim-v12-{release,boundaries,redis,final-cases,final-check}.log,
+/tmp/readlink-io-final.log, /tmp/detsim-compress-capacity-{red,green}.log.
+Runtime final artifacts: build/cases/run-z65kj5m2/results.json; Python controlled
+steps: build/cases/python-steps-lkpxv54e/session; full allocation diagnostic:
+build/cases/go-affinity-gdb-size-3uhecnub/gdb.log.
+Current failed probes: Rust/gccgo-pages sigaltstack131, gccgo-full allocation,
+Python missing standard-library mapping and exit1, Java access21. All retain
+non-green status. Generic symlink traversal, complete procfs, CPU-input coherence,
+standard gc Go and exhaustive scheduling remain outside this slice.

@@ -16,6 +16,8 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
+#include <filesystem>
+#include <unistd.h>
 #include <iostream>
 #include <limits>
 #include <libgen.h>
@@ -173,7 +175,12 @@ void FileSystemState::ensure_dir_exists(const std::string &path)
   if (filesystem.find(path) != filesystem.end())
     return;
 
-  VFSNode dir;
+  const size_t slash = path.find_last_of('/');
+  if (slash != std::string::npos && slash > 0)
+    ensure_dir_exists(path.substr(0, slash));
+  else if (path != "/")
+    ensure_dir_exists("/");
+  VFSNode dir{};
   dir.metadata.st_mode = S_IFDIR | 0755;
   dir.metadata.st_size = 0;
   filesystem[path] = std::move(dir);
@@ -212,7 +219,7 @@ void FileSystemState::init_from_mappings(
           continue;
         std::string host_p = cur + "/" + de->d_name;
         struct stat st;
-        if (stat(host_p.c_str(), &st) < 0)
+        if (lstat(host_p.c_str(), &st) < 0)
           continue;
 
         std::string rel = host_p.substr(host_base.size());
@@ -238,6 +245,19 @@ void FileSystemState::init_from_mappings(
           ensure_dir_exists(parent);
         }
 
+        if (S_ISLNK(st.st_mode)) {
+          std::vector<char> target(4096);
+          const ssize_t length = readlink(host_p.c_str(), target.data(), target.size());
+          if (length < 0 || static_cast<size_t>(length) == target.size())
+            throw std::runtime_error("Cannot capture VFS symlink: " + host_p);
+          target.resize(length);
+          VFSNode node{};
+          node.content = std::move(target);
+          node.metadata.st_mode = st.st_mode;
+          node.metadata.st_size = length;
+          filesystem[target_p] = std::move(node);
+          continue;
+        }
         std::ifstream ifs(host_p, std::ios::binary);
         std::vector<char> content;
         if (ifs)
@@ -330,7 +350,7 @@ std::string FileSystemState::resolve_path(int dirfd, const std::string &path)
   return out;
 }
 
-int FileSystemState::resolve_path_checked(int dirfd, const std::string& path, std::string& result)
+int FileSystemState::resolve_path_checked(int dirfd, const std::string& path, std::string& result, bool follow_final)
 {
   if (path.empty()) return -ENOENT;
   if (path[0]!='/' && dirfd!=AT_FDCWD) {
@@ -340,6 +360,27 @@ int FileSystemState::resolve_path_checked(int dirfd, const std::string& path, st
     const auto node=filesystem.find(open->second.path);
     if (node==filesystem.end()) throw std::runtime_error("Directory descriptor has no payload");
     if (!S_ISDIR(node->second.metadata.st_mode)) return -ENOTDIR;
+  }
+  // Inspect components before lexical normalization: link/.. still traverses a
+  // link in Linux. Unsupported traversal must not accidentally resolve elsewhere.
+  std::string current = path[0]=='/' ? "/" :
+      (dirfd==AT_FDCWD ? cwd : open_files.at(dirfd).path);
+  size_t position = 0;
+  while (position < path.size()) {
+    while (position < path.size() && path[position]=='/') ++position;
+    const size_t end = path.find('/', position);
+    const std::string part = path.substr(position, end-position);
+    if (part.empty()) break;
+    current = resolve_path(AT_FDCWD, join_paths(current, part));
+    const auto node = filesystem.find(current);
+    const bool final = end == std::string::npos;
+    if (!final && node == filesystem.end()) return -ENOENT;
+    if (node != filesystem.end() && S_ISLNK(node->second.metadata.st_mode) &&
+        (!final || follow_final))
+      throw std::runtime_error("Virtual symlink traversal is not modeled: " + current);
+    if (!final && !S_ISDIR(node->second.metadata.st_mode)) return -ENOTDIR;
+    if (end == std::string::npos) break;
+    position = end + 1;
   }
   result=resolve_path(dirfd,path);
   return 0;
@@ -358,7 +399,17 @@ int FileSystemState::do_open(const std::string &path, int flags, mode_t mode)
     throw std::runtime_error("Unsupported virtual open flags");
   if (!fd_manager_)
     return -EMFILE;
+  std::string checked;
+  const int path_error = resolve_path_checked(AT_FDCWD, path, checked, false);
+  if (path_error) return path_error;
+  if (checked == "/proc/self" && (flags & O_NOFOLLOW))
+    throw std::runtime_error("Virtual proc self nofollow open is not modeled");
   auto it = filesystem.find(path);
+  if (it != filesystem.end() && S_ISLNK(it->second.metadata.st_mode)) {
+    if ((flags & O_CREAT) && (flags & O_EXCL)) return -EEXIST;
+    if (flags & O_NOFOLLOW) return -ELOOP;
+    throw std::runtime_error("Virtual symlink traversal is not modeled: " + path);
+  }
   bool exists = (it != filesystem.end());
 
   if (exists)
@@ -397,6 +448,14 @@ int FileSystemState::do_open(const std::string &path, int flags, mode_t mode)
     {
       return -ENOENT;
     }
+  }
+
+  const auto executable_link = filesystem.find("/proc/self/exe");
+  if (executable_link != filesystem.end() && S_ISLNK(executable_link->second.metadata.st_mode)) {
+    const auto& bytes = executable_link->second.content;
+    const std::string executable_path(bytes.begin(), bytes.end());
+    if (path == executable_path && ((flags & O_ACCMODE) != O_RDONLY || (flags & O_TRUNC)))
+      return -ETXTBSY;
   }
 
   // If we got here, the file is accessible or was created.
@@ -550,8 +609,13 @@ off_t FileSystemState::do_lseek(int fd, off_t offset, int whence)
   return new_offset;
 }
 
-int FileSystemState::do_stat(const std::string &path, struct stat *statbuf)
+int FileSystemState::do_stat(const std::string &path, struct stat *statbuf, bool follow)
 {
+  std::string checked;
+  const int path_error = resolve_path_checked(AT_FDCWD, path, checked, follow);
+  if (path_error) return path_error;
+  if (!follow && checked == "/proc/self")
+    throw std::runtime_error("Virtual proc self link metadata is not modeled");
   auto it = filesystem.find(path);
   if (it == filesystem.end())
   {
@@ -585,7 +649,9 @@ int FileSystemState::do_fstat(int fd, struct stat *statbuf)
 int FileSystemState::do_chdir(const std::string &path)
 {
   if (path.empty()) return -ENOENT;
-  std::string resolved = resolve_path(AT_FDCWD, path);
+  std::string resolved;
+  const int error = resolve_path_checked(AT_FDCWD, path, resolved);
+  if (error) return error;
 
   auto it = filesystem.find(resolved);
   if (it == filesystem.end())
@@ -637,7 +703,7 @@ long emu_vfs_openat(int dirfd, const char *path_ptr, int flags, mode_t mode)
     return copied;
   auto& fs=ptmc_state.fs_states[ptmc_state.cursor];
   std::string resolved;
-  const int error=fs.resolve_path_checked(dirfd,path,resolved);
+  const int error=fs.resolve_path_checked(dirfd,path,resolved,false);
   if (error) return error;
   return fs.do_open(resolved,flags,mode);
 }
@@ -882,10 +948,10 @@ long emu_vfs_statat(int dirfd,const char* path_ptr,struct stat* destination,int 
     path=fs.get_cwd().empty()?"/":fs.get_cwd();
   }
   std::string resolved;
-  const int error=fs.resolve_path_checked(dirfd,path,resolved);
+  const int error=fs.resolve_path_checked(dirfd,path,resolved,!(flags&AT_SYMLINK_NOFOLLOW));
   if (error) return error;
   struct stat value{};
-  const int result=fs.do_stat(resolved,&value);
+  const int result=fs.do_stat(resolved,&value,!(flags&AT_SYMLINK_NOFOLLOW));
   if (result) return result;
   return guest_write_exact(ptmc_state.pids[ptmc_state.cursor],destination,&value,sizeof(value))?0:-EFAULT;
 }
@@ -896,4 +962,123 @@ long emu_getcwd(char* destination,size_t size)
   const std::string path=stored.empty()?"/":stored;
   if (size<path.size()+1) return -ERANGE;
   return guest_write_exact(ptmc_state.pids[ptmc_state.cursor],destination,path.c_str(),path.size()+1)?long(path.size()+1):-EFAULT;
+}
+
+long FileSystemState::do_readlink(const std::string& path, std::string& target)
+{
+  std::string resolved;
+  const int error = resolve_path_checked(AT_FDCWD, path, resolved, false);
+  if (error) return error;
+  if (resolved == "/proc/self")
+    throw std::runtime_error("Virtual proc self link target is not modeled");
+  const auto node = filesystem.find(resolved);
+  if (node == filesystem.end()) return -ENOENT;
+  if (!S_ISLNK(node->second.metadata.st_mode)) return -EINVAL;
+  target.assign(node->second.content.begin(), node->second.content.end());
+  return 0;
+}
+
+long emu_vfs_readlinkat(int dirfd, const char* path_ptr, char* buffer, size_t size)
+{
+  // Linux's ABI takes an int, even though libc exposes size_t.
+  const int count = static_cast<int>(size);
+  if (count <= 0) return -EINVAL;
+  std::string path;
+  const long copied = read_guest_string(path_ptr, path);
+  if (copied) return copied;
+  auto& fs = ptmc_state.fs_states[ptmc_state.cursor];
+  std::string resolved;
+  const int error = fs.resolve_path_checked(dirfd, path, resolved, false);
+  if (error) return error;
+  std::string target;
+  const long result = fs.do_readlink(resolved, target);
+  if (result) return result;
+  const size_t length = std::min(target.size(), static_cast<size_t>(count));
+  return guest_write_exact(ptmc_state.pids[ptmc_state.cursor], buffer, target.data(), length)
+      ? static_cast<long>(length) : -EFAULT;
+}
+
+void FileSystemState::capture_executable(const std::string& executable)
+{
+  namespace fs = std::filesystem;
+  const fs::path absolute = fs::absolute(executable);
+  const std::string canonical = fs::canonical(absolute).string();
+  std::string path = absolute.lexically_normal().string();
+  if (fs::canonical(path).string() != canonical)
+    throw std::runtime_error("Executable link/dot-dot traversal is not modeled");
+  for (unsigned depth = 0; ; ++depth) {
+    if (depth == 40) throw std::runtime_error("Executable symlink chain exceeds model limit");
+    struct stat metadata{};
+    if (lstat(path.c_str(), &metadata))
+      throw std::runtime_error("Cannot capture executable path: " + path);
+    VFSNode node{};
+    node.metadata.st_mode = metadata.st_mode;
+    if (S_ISLNK(metadata.st_mode)) {
+      node.content.resize(4096);
+      const ssize_t length = readlink(path.c_str(), node.content.data(), node.content.size());
+      if (length < 0 || static_cast<size_t>(length) == node.content.size())
+        throw std::runtime_error("Cannot capture executable symlink: " + path);
+      node.content.resize(length);
+    } else {
+      if (!S_ISREG(metadata.st_mode)) throw std::runtime_error("Executable is not a regular file");
+      std::ifstream input(path, std::ios::binary);
+      node.content.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+      if (!input || node.content.size() != static_cast<size_t>(metadata.st_size))
+        throw std::runtime_error("Cannot capture executable content: " + path);
+    }
+    node.metadata.st_size = node.content.size();
+    const bool link = S_ISLNK(metadata.st_mode);
+    const std::string target(node.content.begin(), link ? node.content.end() : node.content.begin());
+    // Capture ancestors, without flattening host directory symlinks into fake
+    // directories. Traversing those links remains explicitly unsupported.
+    fs::path prefix;
+    for (const auto& component : fs::path(path).parent_path()) {
+      prefix /= component;
+      const std::string name = prefix.string();
+      struct stat ancestor{};
+      if (lstat(name.c_str(), &ancestor)) throw std::runtime_error("Cannot capture executable ancestor: " + name);
+      VFSNode directory{};
+      directory.metadata.st_mode = ancestor.st_mode;
+      if (S_ISLNK(ancestor.st_mode)) {
+        directory.content.resize(4096);
+        const ssize_t length = readlink(name.c_str(), directory.content.data(), directory.content.size());
+        if (length < 0 || static_cast<size_t>(length) == directory.content.size())
+          throw std::runtime_error("Cannot capture executable ancestor link: " + name);
+        directory.content.resize(length);
+      }
+      directory.metadata.st_size = directory.content.size();
+      const auto existing = filesystem.find(name);
+      if (existing != filesystem.end() &&
+          ((existing->second.metadata.st_mode & S_IFMT) != (directory.metadata.st_mode & S_IFMT) ||
+           (S_ISLNK(directory.metadata.st_mode) && existing->second.content != directory.content)))
+        throw std::runtime_error("Executable ancestor conflicts with configured virtual file: " + name);
+      filesystem.emplace(name, std::move(directory));
+    }
+    const auto prior = filesystem.find(path);
+    if (prior != filesystem.end() &&
+        (prior->second.metadata.st_mode != node.metadata.st_mode || prior->second.content != node.content))
+      throw std::runtime_error("Executable conflicts with configured virtual file: " + path);
+    filesystem[path] = std::move(node);
+    if (!link) {
+      if (path != canonical) { path = canonical; continue; }
+      break;
+    }
+    const fs::path next = fs::path(target).is_absolute() ? fs::path(target) : fs::path(path).parent_path()/target;
+    path = next.lexically_normal().string();
+    if (fs::canonical(next).string() != fs::canonical(path).string())
+      throw std::runtime_error("Executable link/dot-dot traversal is not modeled");
+  }
+  VFSNode proc_link{};
+  proc_link.metadata.st_mode = S_IFLNK | 0777;
+  proc_link.content.assign(canonical.begin(), canonical.end());
+  proc_link.metadata.st_size = proc_link.content.size();
+  if (filesystem.contains("/proc/self/exe"))
+    throw std::runtime_error("Executable link conflicts with configured virtual file: /proc/self/exe");
+  ensure_dir_exists("/");
+  ensure_dir_exists("/proc");
+  ensure_dir_exists("/proc/self");
+  if (!S_ISDIR(filesystem.at("/proc").metadata.st_mode) ||
+      !S_ISDIR(filesystem.at("/proc/self").metadata.st_mode))
+    throw std::runtime_error("Executable proc projection conflicts with configured virtual filesystem");
+  filesystem["/proc/self/exe"] = std::move(proc_link);
 }

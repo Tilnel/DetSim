@@ -22,15 +22,16 @@ long emu_vfs_openat(int dirfd, const char *path, int flags, mode_t mode);
 long emu_vfs_lseek(int fd, off_t offset, int whence);
 long emu_vfs_stat(const char *path, struct stat *statbuf);
 long emu_vfs_statat(int dirfd, const char* path, struct stat* statbuf, int flags);
+long emu_vfs_readlinkat(int dirfd, const char* path, char* buffer, size_t size);
 long emu_getcwd(char* destination, size_t size);
 long emu_chdir(const char *path);
 long emu_pipe(int pipefd[2], int flags);
 long emu_pipe2(int pipefd[2], int flags);
 
-// Represents a node in the virtual file system. Can be a file or a directory.
+// Represents a regular file, directory, captured stream, or symbolic link.
 struct VFSNode
 {
-  // Complete file content. For directories, this is typically empty.
+  // Complete file content or symlink target bytes. Directories have no content.
   std::vector<char> content;
 
   // File metadata.
@@ -124,7 +125,9 @@ class FileSystemState
   ssize_t do_write(int fd, const void *buf, size_t count);
   int do_close(int fd);
   off_t do_lseek(int fd, off_t offset, int whence);
-  int do_stat(const std::string &path, struct stat *statbuf);
+  int do_stat(const std::string &path, struct stat *statbuf, bool follow = true);
+  long do_readlink(const std::string& path, std::string& target);
+  void capture_executable(const std::string& path);
   int do_fstat(int fd, struct stat *statbuf);
 
   // Initialize VFS from host mappings (may load files into memory)
@@ -134,7 +137,7 @@ class FileSystemState
   // Resolve a pathname according to dirfd and cwd. Returns an absolute VFS
   // path.
   std::string resolve_path(int dirfd, const std::string &path);
-  int resolve_path_checked(int dirfd, const std::string& path, std::string& result);
+  int resolve_path_checked(int dirfd, const std::string& path, std::string& result, bool follow_final = true);
 
   // Set/get cwd
   void set_cwd(const std::string &path);
