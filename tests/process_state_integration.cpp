@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <sstream>
 #include <sys/random.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
 #include <sys/time.h>
@@ -22,6 +23,7 @@
 
 extern "C" detsim::ui::NCursesUI* get_ncurses_ui() { return nullptr; }
 static int failures;
+static KernelResourceLimit guest_resource_output;
 static void check(bool value, const char* name) {
     printf("%s %s\n", value ? "PASS" : "FAIL", name);
     failures += !value;
@@ -33,10 +35,95 @@ static long call(int nr, uint64_t a=0,uint64_t b=0,uint64_t c=0,uint64_t d=0) {
 static std::string archive(ProcessKernelState& state) {
     std::ostringstream output; {cereal::BinaryOutputArchive a(output);a(state);} return output.str();
 }
+static void check_resource_queries() {
+    auto& state=ptmc_state.process_states[0];
+    const auto before=state;
+    for(unsigned resource=0;resource<16;++resource) {
+        KernelResourceLimit native{},legacy{},modeled{};
+        check(syscall(SYS_prlimit64,0,resource,nullptr,&native)==0 &&
+              syscall(SYS_getrlimit,resource,&legacy)==0 && native==legacy,
+              "native getrlimit and prlimit64 agree for all sixteen resources");
+        state.resource_limits[resource]=native;
+        check(call(SYS_getrlimit,resource,reinterpret_cast<uint64_t>(&modeled))==0 && modeled==native &&
+              call(SYS_prlimit64,0,resource,0,reinterpret_cast<uint64_t>(&modeled))==0 && modeled==native,
+              "modeled resource queries expose the same captured table");
+    }
+    KernelResourceLimit value{};
+    const auto target=reinterpret_cast<uint64_t>(&value);
+    for(uint64_t resource:{uint64_t(16),uint64_t(-1),uint64_t(0x100000010ULL)}) {
+        errno=0;
+        check(syscall(SYS_getrlimit,resource,nullptr)==-1 && errno==EINVAL,
+              "native invalid resource precedes bad output pointer");
+        errno=0;
+        check(syscall(SYS_prlimit64,0,resource,nullptr,nullptr)==-1 && errno==EINVAL,
+              "native prlimit null output still validates resource");
+        check(call(SYS_getrlimit,resource,0)==-EINVAL && call(SYS_prlimit64,0,resource,0,0)==-EINVAL,
+              "modeled invalid resource precedes pointer handling");
+    }
+    errno=0;
+    check(syscall(SYS_getrlimit,RLIMIT_NOFILE,nullptr)==-1 && errno==EFAULT &&
+          syscall(SYS_prlimit64,0,RLIMIT_NOFILE,nullptr,nullptr)==0,
+          "native resource query null pointer rules");
+    check(syscall(SYS_getrlimit,0x100000000ULL|RLIMIT_NOFILE,&value)==0 &&
+          value==state.resource_limits[RLIMIT_NOFILE] &&
+          syscall(SYS_prlimit64,0xffffffff00000000ULL,0x100000000ULL|RLIMIT_NOFILE,nullptr,&value)==0 &&
+          syscall(SYS_prlimit64,0x100000000ULL|uint64_t(getpid()),RLIMIT_NOFILE,nullptr,&value)==0,
+          "native resource and PID queries use their low32 ABI");
+    check(call(SYS_getrlimit,RLIMIT_NOFILE,0)==-EFAULT &&
+          call(SYS_prlimit64,0,RLIMIT_NOFILE,0,0)==0,"resource query null pointer rules");
+    check(call(SYS_getrlimit,0x100000000ULL|RLIMIT_NOFILE,target)==0 &&
+          value==state.resource_limits[RLIMIT_NOFILE] &&
+          call(SYS_prlimit64,0xffffffff00000000ULL,RLIMIT_NOFILE,0,target)==0 &&
+          call(SYS_prlimit64,0x100000000ULL|uint64_t(logical_process_id(0)),RLIMIT_NOFILE,0,target)==0,
+          "resource and logical self PID arguments use their low32 ABI");
+    for(int nr:{SYS_getrlimit,SYS_prlimit64}) {
+        auto* pages=static_cast<unsigned char*>(mmap(nullptr,8192,PROT_READ|PROT_WRITE,
+            MAP_PRIVATE|MAP_ANONYMOUS,-1,0));
+        if(pages==MAP_FAILED) throw std::runtime_error("resource partial copy fixture");
+        memset(pages,0x5a,8192);
+        if(mprotect(pages+4096,4096,PROT_READ)) throw std::runtime_error("resource partial copy protection");
+        for(size_t prefix:{size_t(1),size_t(7),size_t(8),size_t(15)}) {
+            auto* output=pages+4096-prefix;
+            memset(output,0x5a,prefix);
+            errno=0;
+            const long result=nr==SYS_getrlimit ? syscall(nr,RLIMIT_NOFILE,output) :
+                syscall(nr,0,RLIMIT_NOFILE,nullptr,output);
+            std::array<unsigned char,16> oracle{};memcpy(oracle.data(),output,oracle.size());
+            const bool native_fault=result==-1 && errno==EFAULT;
+            memset(output,0x5a,prefix);
+            const long model=nr==SYS_getrlimit ? call(nr,RLIMIT_NOFILE,reinterpret_cast<uint64_t>(output)) :
+                call(nr,0,RLIMIT_NOFILE,0,reinterpret_cast<uint64_t>(output));
+            check(native_fault && model==-EFAULT && !memcmp(output,oracle.data(),oracle.size()),
+                  "resource partial copy retains native writable prefix on EFAULT");
+        }
+        munmap(pages,8192);
+    }
+    const auto encoded=archive(state);
+    auto changed=state;
+    --changed.resource_limits[RLIMIT_NOFILE].current;
+    check(changed!=state && archive(changed)!=encoded,"resource-only change enters process identity without aliasing");
+    tracee_state original;original.process_state=state;
+    tracee_state different=original;different.process_state=changed;
+    check(!original.metadata_equal(different),"resource-only change enters tracee metadata identity");
+    ProcessKernelState restored;
+    {std::istringstream input(encoded);cereal::BinaryInputArchive a(input);a(restored);}
+    check(restored==state && archive(restored)==encoded,"all resource limits survive archive round trip");
+    std::string malformed=encoded;
+    const KernelResourceLimit invalid{1,0};
+    memcpy(malformed.data()+malformed.size()-16*16,&invalid,sizeof(invalid));
+    const auto unchanged=restored;
+    bool rejected=false;
+    try {std::istringstream input(malformed);cereal::BinaryInputArchive a(input);a(restored);}
+    catch(const std::runtime_error&) {rejected=true;}
+    check(rejected && restored==unchanged,"invalid resource cur above max rejects archive atomically");
+    state=before;
+}
+
 int main() {
     ptmc_state.cursor=0;ptmc_state.pids[0]=getpid();
     ptmc_state.process_states[0]=ProcessKernelState{};
     ptmc_state.time[0]={123,456789};
+    check_resource_queries();
     auto original=ptmc_state.process_states[0];
     std::array<unsigned char,40> bytes{},again{};
     check(call(SYS_getrandom,reinterpret_cast<uint64_t>(bytes.data()),bytes.size(),0)==40,"random returns bytes");
@@ -179,7 +266,51 @@ int main() {
            ptrace(PTRACE_SETOPTIONS,child,nullptr,PTRACE_O_TRACESYSGOOD|PTRACE_O_EXITKILL)==0) {
             try {
                 ptmc_state.pids[0]=child;
+                std::array<unsigned char,128> scratch_before{},scratch_after{};
+                scratch_before.fill(0x6b);
+                guest_write_exact(child,reinterpret_cast<void*>(scratch_page+0x800),scratch_before.data(),scratch_before.size());
                 capture_process_kernel_state(child,0);
+                check(guest_read_exact(child,reinterpret_cast<void*>(scratch_page+0x800),scratch_after.data(),scratch_after.size()) &&
+                      scratch_after==scratch_before,"resource capture preserves injected scratch bytes");
+                const auto captured=ptmc_state.process_states[0];
+                for(unsigned resource=0;resource<16;++resource) {
+                    KernelResourceLimit native{};
+                    check(tracee_do_syscall(child,SYS_prlimit64,0,resource,0,scratch_page+0x900,0,0)==0 &&
+                          guest_read_exact(child,reinterpret_cast<void*>(scratch_page+0x900),&native,sizeof(native)) &&
+                          captured.resource_limits[resource]==native,"bootstrap imports each native resource limit");
+                }
+                auto changed_limit=captured.resource_limits[RLIMIT_NOFILE];
+                if(!changed_limit.current) throw std::runtime_error("resource mutation fixture has zero soft limit");
+                --changed_limit.current;
+                guest_write_exact(child,reinterpret_cast<void*>(scratch_page+0x900),&changed_limit,sizeof(changed_limit));
+                check(tracee_do_syscall(child,SYS_prlimit64,0,RLIMIT_NOFILE,scratch_page+0x900,0,0,0)==0,
+                      "source host limit changes after capture");
+                KernelResourceLimit modeled{};
+                check(call(SYS_getrlimit,RLIMIT_NOFILE,reinterpret_cast<uint64_t>(&guest_resource_output))==0 &&
+                      guest_read_exact(child,&guest_resource_output,&modeled,sizeof(modeled)) &&
+                      modeled==captured.resource_limits[RLIMIT_NOFILE] && modeled!=changed_limit &&
+                      ptmc_state.process_states[0]==captured,"post-capture host limit cannot leak into modeled query");
+                std::array<unsigned char,4096> page_before{},page_after{};
+                check(guest_read_exact(child,reinterpret_cast<void*>(scratch_page),page_before.data(),page_before.size()),
+                      "read reserved page before resource queries");
+                user_regs_struct registers_before{},registers_after{};
+                if(ptrace(PTRACE_GETREGS,child,nullptr,&registers_before)) throw std::runtime_error("resource registers");
+                for(int nr:{SYS_getrlimit,SYS_prlimit64}) {
+                    for(uint64_t destination:{scratch_page+0x100,scratch_page+0xff0,scratch_page-8}) {
+                        bool rejected=false;
+                        try {
+                            if(nr==SYS_getrlimit) call(nr,RLIMIT_NOFILE,destination);
+                            else call(nr,0,RLIMIT_NOFILE,0,destination);
+                        } catch(const std::runtime_error&) {rejected=true;}
+                        check(rejected && guest_read_exact(child,reinterpret_cast<void*>(scratch_page),page_after.data(),page_after.size()) &&
+                              page_after==page_before && ptmc_state.process_states[0]==captured &&
+                              ptrace(PTRACE_GETREGS,child,nullptr,&registers_after)==0 &&
+                              !memcmp(&registers_before,&registers_after,sizeof(registers_before)),
+                              "resource queries reject reserved overlap without page register or model mutation");
+                        check((nr==SYS_getrlimit ? call(nr,16,destination) : call(nr,0,16,0,destination))==-EINVAL,
+                              "invalid resource precedes reserved output overlap");
+                    }
+                }
                 bootstrap_ok=ptmc_state.process_states[0].signal_actions.at(SIGINT).handler==1 &&
                     ptmc_state.fs_states[0].creation_mask()==0077;
                 const auto& bootstrap_task=ptmc_state.running_state.child[0].threads.front();

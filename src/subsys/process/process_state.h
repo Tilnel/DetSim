@@ -2,6 +2,7 @@
 #define DETSIM_PROCESS_STATE_H
 
 #include <cstdint>
+#include <array>
 #include <map>
 
 struct syscall_info;
@@ -16,11 +17,20 @@ struct KernelSigaction {
 };
 static_assert(sizeof(KernelSigaction)==32);
 
+// Linux x86-64 rlimit64 ABI. Infinity is UINT64_MAX.
+struct KernelResourceLimit {
+    uint64_t current = 0;
+    uint64_t maximum = 0;
+    bool operator==(const KernelResourceLimit&) const = default;
+};
+static_assert(sizeof(KernelResourceLimit)==16);
+
 class ProcessKernelState {
 public:
     // A fixed modeled stream, not exhaustive exploration of random outcomes.
     uint64_t random_state = 0x4d595df4d0f33173ULL;
     std::map<int, KernelSigaction> signal_actions;
+    std::array<KernelResourceLimit,16> resource_limits{};
     bool operator==(const ProcessKernelState&) const = default;
     template<class Archive> void serialize(Archive& ar);
 };

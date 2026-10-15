@@ -311,15 +311,54 @@ int main() {
             result = execute(dispatcher, child, SYS_munmap, {uint64_t(mapping.value), 4096, 0, 0, 0, 0});
             check(!result.rejected && result.value == 0, "munmap remains available");
         }
+        check(dispatcher.get_route(SYS_getrlimit).action==SyscallAction::EMULATE &&
+              dispatcher.get_route(SYS_prlimit64).action==SyscallAction::EMULATE,
+              "resource queries use captured process state instead of host execution");
+        result=execute(dispatcher,child,SYS_getrlimit,
+                       {RLIMIT_NOFILE,reinterpret_cast<uint64_t>(&guest_limit),0,0,0,0});
+        check(!result.rejected && result.value==0,"getrlimit query is available");
+        ptmc_state.process_states[0].resource_limits[RLIMIT_NOFILE]={321,654};
         result = execute(dispatcher, child, SYS_prlimit64,
                          {0, RLIMIT_NOFILE, 0, reinterpret_cast<uint64_t>(&guest_limit), 0, 0});
         rlimit limit{};
         check(!result.rejected && result.value == 0 &&
-              guest_read_exact(child, &guest_limit, &limit, sizeof(limit)) && limit.rlim_cur > 0,
-              "prlimit64 self query remains available");
+              guest_read_exact(child, &guest_limit, &limit, sizeof(limit)) && limit.rlim_cur == 321 && limit.rlim_max == 654,
+              "prlimit64 self query reads captured resource values");
         result=execute(dispatcher,child,SYS_prlimit64,
                        {uint64_t(logical_process_id(0)),RLIMIT_NOFILE,0,reinterpret_cast<uint64_t>(&guest_limit),0,0});
         check(!result.rejected && result.value==0,"logical self PID resolves to owned resource query");
+        result=execute(dispatcher,child,SYS_prlimit64,
+                       {0xffffffff00000000ULL|uint64_t(logical_process_id(0)),
+                        0x100000000ULL|RLIMIT_NOFILE,0,reinterpret_cast<uint64_t>(&guest_limit),0,0});
+        check(!result.rejected && result.value==0,"resource query entry admits low32 logical PID and resource aliases");
+        const auto resource_state=ptmc_state.process_states[0];
+        std::array<unsigned char,4096> resource_page_before{},resource_page_after{};
+        if(!guest_read_exact(child,reinterpret_cast<void*>(scratch_page),resource_page_before.data(),resource_page_before.size()))
+            throw std::runtime_error("resource reserved page fixture");
+        user_regs_struct resource_regs_before{},resource_regs_after{};
+        if(ptrace(PTRACE_GETREGS,child,nullptr,&resource_regs_before)) throw std::runtime_error("resource saved registers");
+        for(int nr:{SYS_getrlimit,SYS_prlimit64}) {
+            for(uint64_t destination:{scratch_page+0x100,scratch_page+0xff0,scratch_page-8}) {
+                const auto arguments=nr==SYS_getrlimit ?
+                    std::array<uint64_t,6>{RLIMIT_NOFILE,destination,0,0,0,0} :
+                    std::array<uint64_t,6>{0,RLIMIT_NOFILE,0,destination,0,0};
+                const auto rejected=execute(dispatcher,child,nr,arguments);
+                check(rejected.rejected &&
+                      guest_read_exact(child,reinterpret_cast<void*>(scratch_page),resource_page_after.data(),resource_page_after.size()) &&
+                      resource_page_after==resource_page_before && ptmc_state.process_states[0]==resource_state &&
+                      ptrace(PTRACE_GETREGS,child,nullptr,&resource_regs_after)==0 &&
+                      !memcmp(&resource_regs_before,&resource_regs_after,sizeof(resource_regs_before)),
+                      "actual resource queries reject reserved output without state or register mutation");
+                auto invalid=arguments;invalid[nr==SYS_getrlimit?0:1]=16;
+                const auto bad_resource=execute(dispatcher,child,nr,invalid);
+                check(!bad_resource.rejected && bad_resource.value==-EINVAL,
+                      "actual invalid resource precedes reserved output overlap");
+            }
+        }
+        const auto null_old=execute(dispatcher,child,SYS_prlimit64,{0,RLIMIT_NOFILE,0,0,0,0});
+        const auto null_output=execute(dispatcher,child,SYS_getrlimit,{RLIMIT_NOFILE,0,0,0,0,0});
+        check(!null_old.rejected && null_old.value==0 && !null_output.rejected && null_output.value==-EFAULT,
+              "actual resource null output behavior survives reserved-page guard");
         result = execute(dispatcher, child, SYS_prlimit64,
                          {0, RLIMIT_NOFILE, reinterpret_cast<uint64_t>(&guest_limit), 0, 0, 0});
         check(result.rejected, "prlimit64 mutation rejected before execution");

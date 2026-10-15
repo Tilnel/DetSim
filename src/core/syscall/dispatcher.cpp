@@ -127,6 +127,7 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         case SYS_setitimer:
         case SYS_getitimer:
         case SYS_umask:
+        case SYS_getrlimit: case SYS_prlimit64:
             return SyscallRoute(SyscallCategory::EMULATED,
                                SyscallAction::EMULATE,
                                "Time syscall - emulated");
@@ -222,7 +223,6 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         // effects are included in capture; argument restrictions run on entry.
         case SYS_getuid: case SYS_geteuid: case SYS_getgid: case SYS_getegid:
         case SYS_brk: case SYS_mprotect: case SYS_munmap: case SYS_madvise:
-        case SYS_prlimit64:
             return SyscallRoute(SyscallCategory::PASSTHROUGH,
                                SyscallAction::EXECUTE,
                                "Allowed owned-process query or private memory operation");
@@ -274,6 +274,10 @@ bool SyscallDispatcher::on_enter(pid_t pid, int syscall_nr, syscall_info& info)
         case SyscallAction::REJECT:
             throw std::runtime_error(std::string(route.description)+": syscall "+std::to_string(syscall_nr));
         case SyscallAction::EMULATE:
+            if (syscall_nr == SYS_prlimit64 && (info.args[2] ||
+                (static_cast<int32_t>(info.args[0]) != 0 &&
+                 static_cast<int32_t>(info.args[0]) != logical_process_id(ptmc_state.cursor))))
+                throw std::runtime_error("Only owned-process prlimit64 queries are supported");
             if (syscall_nr == SYS_clone) validate_logical_clone(info.args[0]);
             // Block the syscall - will be emulated on exit
             tracee_set_orig_rax(pid, -1);
@@ -306,10 +310,6 @@ bool SyscallDispatcher::on_enter(pid_t pid, int syscall_nr, syscall_info& info)
         case SyscallAction::EXECUTE:
             if (syscall_nr == SYS_mprotect || syscall_nr == SYS_munmap || syscall_nr == SYS_madvise)
                 validate_guest_mapping_range(info.args[0],info.args[1]);
-            if (syscall_nr == SYS_prlimit64 &&
-                (info.args[2] || (info.args[0] && info.args[0] != uint64_t(logical_process_id(ptmc_state.cursor)))))
-                throw std::runtime_error("Only owned-process prlimit64 queries are supported");
-            if (syscall_nr == SYS_prlimit64 && info.args[0]) tracee_set_rdi(pid,0);
             if (syscall_nr == SYS_mprotect &&
                 ((info.args[2] && !(info.args[2] & PROT_READ)) ||
                  (info.args[2] & ~uint64_t(PROT_READ|PROT_WRITE|PROT_EXEC))))
@@ -330,7 +330,6 @@ bool SyscallDispatcher::on_enter(pid_t pid, int syscall_nr, syscall_info& info)
 
 int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
 {
-    if (info.nr == SYS_prlimit64 && info.args[0]) tracee_set_rdi(pid,info.args[0]);
     // Handle choice for syscalls with multiple outcomes
     ptmc_state.n_choose = analyze_choose(info);
     if (ptmc_state.n_choose != 0) {
@@ -428,7 +427,8 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
 
         case SYS_clock_gettime: case SYS_clock_getres: case SYS_time:
         case SYS_getrandom: case SYS_sysinfo: case SYS_sched_getaffinity: case SYS_rt_sigaction:
-        case SYS_setitimer: case SYS_getitimer: case SYS_umask: {
+        case SYS_setitimer: case SYS_getitimer: case SYS_umask:
+        case SYS_getrlimit: case SYS_prlimit64: {
             const long result=emu_process_syscall(info);
             tracee_set_rax(pid,result);info.rval=result;
             return CKPT_YES;

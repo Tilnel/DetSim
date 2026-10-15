@@ -620,3 +620,24 @@ admits all three but first controlled search explicitly rejects prctl157:
 PR_CAPBSET_READ; native tracing also identifies worker PR_SET_NAME. Captured
 capability-query and per-thread name semantics are the next generic requirement,
 not a workload-specific state-extraction patch.
+
+
+### Captured resource query state
+
+ProcessKernelState now owns all16 x86-64 resource-limit pairs. Bootstrap imports
+inside its preserved scratch transaction and publishes after complete success;
+archives validate soft<=hard before committing the entire object. getrlimit and
+owned-self prlimit64 share saved-table emulation. Removing native prlimit execution
+also removes its live PID rewrite and ambient-query dependency. Native ABI
+oracles cover every resource, integer aliases, NULL/error priorities and partial
+copy prefixes. Changing only a child's native soft limit after capture leaves
+modeled answers unchanged. Copy/archive/identity distinguish single-field changes.
+
+Review caught control-page copyout; both API overlap guards now reject without
+modifying page/register/model state, while invalid-resource EINVAL and NULL query
+rules remain. Independently approved final source.495 NP2 assertions, full/pages
+snapshot/state-I/O gates, identity,24 native scenarios,12 case rows, make check and
+production build pass. Layout31/32, kernelv19 reject incompatible roots. Actual gc
+Go admission/concurrency now rerun against the new immutable binary. This is
+query closure only: no claim of restoring/enforcing physical resource limits,
+CPU budgets, complete virtual FD capacities or limit mutations.

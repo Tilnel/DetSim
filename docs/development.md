@@ -753,3 +753,18 @@ successors after hinted restore and unhinted recreation; NP2 policy/IO/capture
 also pass. Actual gc Go now reaches getrlimit97 after178states, not successful
 admission. Runtime audit `--startup-syscall` explicitly records its loader boundary;
 static gc Go uses9 instead of default11 to end the prelude before thread births.
+
+
+Resource-limit queries now use a captured16-entry table of uint64 soft/hard values.
+Bootstrap imports it once; getrlimit and owned-process prlimit64 return that saved
+table, including infinity, rather than querying live host limits after restore.
+Both interfaces use Linux argument widths and partial output-copy behavior;
+invalid resources precede pointer access. Reserved control-page output overlaps
+reject explicitly. Mutation, foreign-process queries and setrlimit remain
+unsupported. This closes query state, not native mmap/brk limit enforcement,
+CPU accounting or virtual FD capacity. Layout31/32 and kernelv19 identify it.
+
+Verification: NP2 process-state132, syscall-policy119 and IO244 checks; identity;
+NP1 page-snapshot/state-I/O gates;24 native scenarios;12 existing paired case rows;
+make check and production build. Native child-limit changes after capture do not
+change modeled answers; archive/copy/identity and malformed-table rejection pass.

@@ -25,14 +25,14 @@ void clear_snapshot_thread_bindings();
  * State Data Format (shared with StateStore)
  * ====================================================================== */
 
-inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 29;
-inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 30;
+inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 31;
+inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 32;
 
 /* Packed to avoid alignment padding */
 struct __attribute__((packed)) StateDataHeader
 {
   uint32_t magic;         // 'DSTM' = 0x4453544D
-  uint32_t version;       // 29: flat; 30: pages (precise VFS modification timestamps)
+  uint32_t version;       // 31: flat; 32: pages (captured resource-limit query state)
   uint32_t num_regions;   // number of memory regions
   uint64_t tstate_offset; // offset to serialized tracee_state
   uint64_t tstate_size;   // size of serialized tracee_state

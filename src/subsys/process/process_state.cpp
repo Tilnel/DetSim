@@ -47,20 +47,27 @@ template<class Archive> void ProcessKernelState::serialize(Archive& ar) {
     uint32_t count=signal_actions.size();
     ar(seed,count);
     if(!seed || count>62) throw std::runtime_error("Invalid process kernel state archive");
+    std::map<int,KernelSigaction> actions;
     if constexpr(Archive::is_loading::value) {
-        std::map<int,KernelSigaction> actions;
         for(uint32_t i=0;i<count;++i) {
             int signal;KernelSigaction action;
             ar(signal,action.handler,action.flags,action.restorer,action.mask);
             if(!valid_action(signal,action) || !actions.emplace(signal,action).second)
                 throw std::runtime_error("Invalid signal action archive");
         }
-        random_state=seed;signal_actions=std::move(actions);
     } else {
         for(const auto& [signal,action]:signal_actions) {
             if(!valid_action(signal,action)) throw std::runtime_error("Invalid signal action state");
             ar(signal,action.handler,action.flags,action.restorer,action.mask);
         }
+    }
+    auto limits=resource_limits;
+    for(auto& limit:limits) {
+        ar(limit.current,limit.maximum);
+        if(limit.current>limit.maximum) throw std::runtime_error("Invalid captured resource limit");
+    }
+    if constexpr(Archive::is_loading::value) {
+        random_state=seed;signal_actions=std::move(actions);resource_limits=limits;
     }
 }
 template void ProcessKernelState::serialize(cereal::BinaryInputArchive&);
@@ -90,6 +97,11 @@ void capture_process_kernel_state(int pid,int node) {
             throw std::runtime_error("Cannot read inherited process kernel state");
     };
     try {
+        for(unsigned resource=0;resource<captured.resource_limits.size();++resource) {
+            query(SYS_prlimit64,0,resource,0,address);
+            auto& limit=captured.resource_limits[resource];read(limit);
+            if(limit.current>limit.maximum) throw std::runtime_error("Invalid inherited resource limit");
+        }
         for(int signal=1;signal<=64;++signal) {
             query(SYS_rt_sigaction,signal,0,address,8);
             KernelSigaction action{};read(action);
@@ -151,6 +163,19 @@ long emu_process_syscall(const syscall_info& info) {
         return guest_read_exact(pid,reinterpret_cast<const void*>(address),&value,sizeof(value));
     };
     switch(info.nr) {
+    case SYS_getrlimit:case SYS_prlimit64: {
+        const bool extended=info.nr==SYS_prlimit64;
+        if(extended && (info.args[2] || (static_cast<int32_t>(info.args[0])!=0 &&
+            static_cast<int32_t>(info.args[0])!=logical_process_id(node))))
+            throw std::runtime_error("Only owned-process resource limit queries are supported");
+        const uint32_t resource=info.args[extended?1:0];
+        if(resource>=state.resource_limits.size()) return -EINVAL;
+        const uint64_t destination=info.args[extended?3:1];
+        if(extended && !destination) return 0;
+        if(destination<scratch_page+4096 && destination>scratch_page-sizeof(KernelResourceLimit))
+            throw std::runtime_error("Resource limit output overlaps reserved syscall scratch page");
+        return write(destination,state.resource_limits[resource])?0:-EFAULT;
+    }
     case SYS_clock_gettime:case SYS_clock_getres: {
         validate_clock(static_cast<int>(info.args[0]));
         const timespec value=info.nr==SYS_clock_getres ? timespec{0,1000} : timespec{now.tv_sec,now.tv_usec*1000};
