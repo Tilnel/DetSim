@@ -57,7 +57,7 @@ runner 只依赖 Python 标准库及已有编译器。不会下载依赖、修�
 | Python | CPython3.13.5，`-I -S` | 通过 | full/pages 各273状态，输出/退出0及3x重放通过 |
 | Java | OpenJDK21.0.12.1 | 通过 | 文件身份和系统动态库输入已补；SIGBUS-backed 映射尚不支持；条件目标 |
 
-这些版本是本机实测，不代表整个语言、其他版本或所有库已受支持。Java 保留正常 JVM/JIT，只显式限制 heap/code cache/class space；没有把 JVM 私有结构补丁放进框架。标准 gc Go 的单独准入目标尚待可用工具链；不能用 gccgo 结果代替它。
+这些版本是本机实测，不代表整个语言、其他版本或所有库已受支持。Java 保留正常 JVM/JIT，只显式限制 heap/code cache/class space；没有把 JVM 私有结构补丁放进框架。标准 gc 与 gccgo 使用独立工具链和实际矩阵；两者不能互相替代。
 
 本次案例推动了三个通用修复：动态 argv（原数组在5参数写终止符时越界，9参数直接拒绝）、匿名零长度 mmap 的正常 `EINVAL` 路径、`poll(timeout=0)`。文件 mmap 的 `EBADF` 优先级和 huge-page 不支持边界仍保留；阻塞 poll 仍明确拒绝。
 

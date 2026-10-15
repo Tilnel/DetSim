@@ -768,3 +768,19 @@ Verification: NP2 process-state132, syscall-policy119 and IO244 checks; identity
 NP1 page-snapshot/state-I/O gates;24 native scenarios;12 existing paired case rows;
 make check and production build. Native child-limit changes after capture do not
 change modeled answers; archive/copy/identity and malformed-table rejection pass.
+
+
+Standalone EOF-backing native oracle (not a DetSim mapping acceptance gate):
+
+```sh
+/usr/bin/g++ -std=c++20 -O2 -g -Wall -Wextra -Werror tests/file_eof_native_oracle.cpp -o build/file-eof-native-oracle/oracle
+build/file-eof-native-oracle/oracle
+```
+
+It compares ordinary private file mappings with empty-memfd fault tails, including
+closing mapping descriptors, normal/half-page COW data and exact signals/codes/
+relative fault addresses. The current host passes912comparisons/1824reaped children
+per run with memfd_noexec=0 and zero execution-policy skips; strict and UBSan
+runs pass. Clang analysis is clean. GCC14 fanalyzer reports a policy-fd leak despite
+an unconditional close and stable runtime descriptor counts; its failing log is
+retained rather than suppressed. Framework EOF capture/restore remains unimplemented.

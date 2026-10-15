@@ -661,3 +661,21 @@ compiler identity: explicit -compiler overrides oppositeGOFLAGS;13runner tests,
 build/case-jobs/go-compiler-audit-7sy2joyc/report.json. This is language/runtime
 protocol capability under current actor policy; Go runtime OS-thread count does
 not establish goroutine-to-OS-thread assignment or exhaustive scheduling.
+
+
+### EOF fault backing: native feasibility evidence only
+
+Independent native oracle tests/file_eof_native_oracle.cpp compares ordinary file
+mappings against empty-memfd tail overlays with requested permissions and closed
+FDs.912read/write/execute comparisons per run,1824children all reaped, stable FD
+count, exact signal/si_code/relative address and normal-page bytes; half-page tail
+zero/COW leaves original file unchanged. Native and UBSan runs pass; current
+hostmemfd_noexec=0, zero execute skips. Independent review approves evidence.
+Clang analysis has no diagnostic; GCC14 fanalyzer fails with a documented apparent
+policy_fd false positive despite immediate close, not mislabeled as clean.
+
+This does not close the framework gap. Approved next-slice contract requires
+explicit FileEofFault regions, no fabricated zero payload, both readers unavailable
+on faults, target-snapshot restore of genuine fault backing, serialized provenance
+and fixed-image mutation guards. Python Queue/Java/module claims remain non-green
+until actual program execution, property and replay gates pass.

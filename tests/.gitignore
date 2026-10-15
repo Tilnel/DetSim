@@ -133,3 +133,5 @@
 !concurrency_case_runner_test.py
 
 !redisraft_case_runner_test.py
+
+!file_eof_native_oracle.cpp
