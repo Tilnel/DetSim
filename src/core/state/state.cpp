@@ -337,8 +337,7 @@ sys_state::sys_state(hash_type hash) : sys_state()
   {
     if (!ts_hash[i])
       throw std::runtime_error("Missing tracee identity in system-state metadata");
-    if (DISALIVE(status[i]))
-      child[i] = tracee_state(ts_hash[i]);
+    child[i] = tracee_state(ts_hash[i]);
   }
 }
 
@@ -599,18 +598,28 @@ void tracee_state::restore_thread_registers(pid_t main_pid) const
   }
 }
 
+static void validate_parked_threads(const tracee_state& state, int index)
+{
+  const auto current_threads = get_thread_list(ptmc_state.pids[index]);
+  std::set<pid_t> live(current_threads.begin(), current_threads.end());
+  std::set<pid_t> saved;
+  for (const auto& thread : state.threads)
+    if (thread.physical_tid) saved.insert(thread.physical_tid);
+  if (live.empty() || live != saved)
+    throw std::runtime_error("Unsupported snapshot restore across thread creation or exit");
+  for (pid_t tid : saved) {
+    user_regs_struct registers{};
+    if (ptrace(PTRACE_GETREGS, tid, nullptr, &registers) == -1)
+      throw std::runtime_error("Snapshot restore requires owned stopped physical threads");
+  }
+}
+
 void tracee_state::recover_running_state(int index, hash_type ts_hash) const
 {
   pid_t main_pid = ptmc_state.pids[index];
-  // Lifecycle restoration needs a real virtual-to-physical remapping contract.
-  // Refuse changed thread sets before touching memory instead of guessing by position.
-  const auto current_threads = get_thread_list(main_pid);
-  std::set<pid_t> live(current_threads.begin(), current_threads.end());
-  std::set<pid_t> saved;
-  for (const auto& thread : threads)
-    if (thread.physical_tid) saved.insert(thread.physical_tid);
-  if (live != saved)
-    throw std::runtime_error("Unsupported snapshot restore across thread creation or exit");
+  // Logical termination does not destroy the parked physical image. Its
+  // registers, memory and modeled resources must still belong to this branch.
+  validate_parked_threads(*this, index);
   /* Restore the kernel heap extent before reconciling VMAs. */
   if (tracee_do_syscall(main_pid, SYS_brk, brk, 0, 0, 0, 0, 0) != brk)
     throw std::runtime_error("Cannot restore snapshot brk");
@@ -1170,14 +1179,12 @@ void sys_state::recover_running_state() const
     if (ts_hash[i] == ptmc_state.running_state.ts_hash[i]) {
       // The register/memory image is unchanged, but runtime runnability and
       // selection can have changed independently of its stored hash.
+      validate_parked_threads(child[i], i);
       child[i].restore_runtime_state(i);
       continue;
     }
 
-    if (DISALIVE(status[i]))
-    {
-      child[i].recover_running_state(i, ts_hash[i]);
-    }
+    child[i].recover_running_state(i, ts_hash[i]);
   }
   // Select the complete product state, including its branch-owned monitor.
   // Restoring only process resources leaves generic captures/CLI loads attached

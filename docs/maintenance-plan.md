@@ -633,3 +633,38 @@ Separate read-only review found no remaining blocker in this slice. Injection
 failure on an unexpected signal is explicit but lacks a dedicated signal-injection
 regression. Thread lifecycle, general signal delivery and complete enabled actor
 enumeration remain separate work.
+
+## Parked terminal branch restoration (2026-10-15)
+
+Invariant: a virtual-exit or intercepted-fatal node retains an owned stopped OS
+image. Loading its state and continuing a live peer must use that branch's image
+and resources, not the last live branch left in the OS process. Truly dead OS
+tasks reject; physical thread creation/exit reconstruction remains unsupported.
+
+The initial NP=2 production-linked regression failed with `exited node retained
+another branch's memory`. The fix removes the alive-only conditions from both
+persisted child loading and physical-image restoration, and shares stopped-thread
+validation with the same-hash path. The transition entry rejects invalid/terminated
+actors before restore or execution. Kernel-model v2 invalidates old semantic
+contexts; flat11/page12 layouts are unchanged.
+
+Verification with `CC=/usr/bin/gcc CXX=/usr/bin/g++`:
+
+- `make check`: 8 component cases and 10 build-contract tests.
+- NP=2 `check-capture`, default and `DETSIM_SNAPSHOT_BACKEND=verify-pages`, normal
+  and tiny caches: real virtual exit, live peer transition, SIGILL fault, persisted
+  reload, memory/RNG/umask/time branch isolation, recapture/predecessor identity,
+  terminated-actor rejection and actual physical death rejection.
+- NP=2 `check-identity check-state-view check-plugins check-runtime-profile
+  check-process-state check-redis` under verify-pages; Redis SET/GET completes.
+  Identity fixtures now use valid manifests and reject missing terminal images.
+- NP=1 `check-scenarios check-exec check-futex-snapshot check-futex
+  check-state-io check-page-snapshot`: all pass, including 14 native scenarios.
+- Strict `-Wall -Wextra -Werror -fsyntax-only` on both changed C++ tests.
+- NP=3 production build and one depth8 Raft run per backend. Both visit 2,582
+  states / 1,347 new states. Flat single-run throughput was about394 states/s
+  versus the preceding smoke's396; no statistically controlled performance claim.
+  Artifacts: `build/terminal-restore-raft{,-pages}`.
+
+Separate read-only review found no blocker. This closes the reproduced C08 parked
+terminal branch leak, not C02 lifecycle reconstruction or C03/C25 scheduling.

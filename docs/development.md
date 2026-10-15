@@ -246,9 +246,9 @@ execution, faithful restore and exhaustive exploration are separate support leve
 
 | Area | Main remaining gap | Consequence |
 | --- | --- | --- |
-| Kernel-state closure (P0) | Unclassified syscalls still pass through; clock/random/signal/timer and CPU nondeterminism are not fully modeled | A program can run while its future still depends on unrecorded host state |
+| Kernel-state closure (P0) | Unclassified syscalls reject; signal/timer delivery and CPU nondeterminism are not fully modeled | Explicit syscall support is scoped; asynchronous and CPU inputs still need a complete contract |
 | Scheduling/atoms (P0) | Runnable thread/outcome enumeration, all-thread stop barrier, bounded pure computation and shared-memory access boundaries | Syscall stepping does not cover all concurrent behavior; weak-memory semantics also require an explicit model |
-| Lifecycle/restore (P0) | Thread creation/exit reconstruction, process trees/fork/exec and cross-branch virtual-exit closure | Changed physical thread sets are rejected; dead-peer branch isolation needs a reproducer and repair (C02/C08) |
+| Lifecycle/restore (P0) | Thread creation/exit reconstruction and process trees/fork/exec | Changed physical thread sets are rejected; parked virtual-exit/fatal images now restore across branches (C02/C08) |
 | Blocking/event loop (P1) | Wait registration, readiness wakeups, deadlines, timeout ordering and signal interruption | Returning EAGAIN/zero is not Linux blocking semantics; sleep and epoll timing are incomplete |
 | Files/IPC/network (P1) | Reusable rootfs and external inputs, shared filesystem/open-file descriptions, dup/vector/positioned I/O, directory mutations, Unix/IPv6 sockets, eventfd/timerfd/io_uring | Many common runtime interfaces explicitly reject; fsync does not model crash durability |
 | Mappings (P1) | Shared/unreadable mappings, guard/reserved pages and mutable file-backed coherence | Common allocators/JITs/shared-memory applications can hit explicit unsupported cases |
@@ -256,7 +256,7 @@ execution, faithful restore and exhaustive exploration are separate support leve
 | Scale/search (P2) | Runtime process count, state equivalence/canonicalization, partial-order reduction and liveness/fairness algorithms | Fixed NP and bounded safety searches are not arbitrary process-graph or liveness support |
 
 Next work should first close the unsoundness paths: classify/reject uncontrolled
-host effects, repair branch restoration (including virtual exit), then establish
+host effects, extend lifecycle restoration beyond parked terminal images, then establish
 stop-all + explicit actor/outcome selection. Expand syscall coverage on top of
 those contracts, with restore/replay and successor-set tests. Keep shared-memory
 instruction boundaries as a separate substantial backend effort; adding syscall

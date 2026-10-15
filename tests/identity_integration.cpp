@@ -4,6 +4,7 @@
 #include "ncurses_ui.h"
 #include "proc_status.h"
 #include "state/sysstate_store.h"
+#include "state/page_snapshot.h"
 #include "cereal/archives/binary.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -41,6 +42,7 @@ struct StoreDirectory
   }
   ~StoreDirectory()
   {
+    StateStore::instance().shutdown();
     SysStateStore::instance().shutdown();
     std::filesystem::current_path(old);
     std::filesystem::remove_all(path);
@@ -52,9 +54,19 @@ int main()
   static_assert(NP == 2);
   loglevel = 4;
   try {
+    StoreDirectory directory;
+    StateStore::instance().init(StateStore::Config{});
+    auto snapshot = [](uint64_t seed) {
+      tracee_state saved;saved.process_state.random_state=seed;
+      std::ostringstream output;{cereal::BinaryOutputArchive ar(output);ar(saved);}
+      const auto bytes=output.str();
+      const std::vector<uint8_t> metadata(bytes.begin(),bytes.end());
+      const auto manifest=encode_page_manifest({},metadata,"",user_regs_struct{},{});
+      return StateStore::instance().save(manifest.data(),manifest.size());
+    };
     sys_state original;
-    original.ts_hash[0] = 0x1111;
-    original.ts_hash[1] = 0x2222;
+    original.ts_hash[0] = snapshot(1);
+    original.ts_hash[1] = snapshot(2);
     original.status[0] = original.status[1] = dstatus_exit(0);
     original.error_bound = 5;
     auto ordered = original.identity_hash();
@@ -68,9 +80,9 @@ int main()
     budget.error_bound = 4;
     require(budget.identity_hash() != ordered, "remaining error budget disappeared from identity");
     auto repeated = original;
-    repeated.ts_hash[0] = repeated.ts_hash[1] = 0x1111;
+    repeated.ts_hash[0] = repeated.ts_hash[1] = original.ts_hash[0];
     auto other = repeated;
-    other.ts_hash[0] = other.ts_hash[1] = 0x2222;
+    other.ts_hash[0] = other.ts_hash[1] = original.ts_hash[1];
     require(repeated.identity_hash() != other.identity_hash(), "equal node hashes cancelled out");
     require(original.identity_hash() == ordered, "identity is not deterministic");
     auto monitored = original;
@@ -93,8 +105,13 @@ int main()
     state_tree_add(parent_b, failed, 0, 0);
     require(std::get<0>(state_tree.at(failed.ss_hash)) == parent_b.ss_hash,
             "failing edge reused an earlier valid witness");
-    rejects([&] { state_transition(failed, 0); }, "terminal source executed before rejection");
-    StoreDirectory directory;
+    auto failed_live=failed;failed_live.status[0]=dstatus_normal();
+    bool terminal_rejected=false;
+    try {(void)state_transition(failed_live,0);}
+    catch(const std::runtime_error& error) {
+      terminal_rejected=std::string(error.what()).find("terminal property violation")!=std::string::npos;
+    }
+    require(terminal_rejected,"terminal property verdict did not reject at entry");
     original.ss_hash = ordered;
     require(original.save_metadata() == 1, "save original metadata");
     require(original.save_metadata() == 0, "identical metadata deduplicates");
@@ -105,6 +122,9 @@ int main()
             loaded.ts_hash[1] == original.ts_hash[1] &&
             loaded.error_bound == original.error_bound &&
             loaded.status[0] == original.status[0], "metadata round trip");
+    auto dangling=original;dangling.ts_hash[0]=0x1111;dangling.commit_metadata();
+    rejects([&] {sys_state missing_image(dangling.ss_hash);},
+            "terminated node with missing snapshot was accepted");
     monitored.commit_metadata();
     sys_state monitor_loaded(monitored.ss_hash);
     require(monitor_loaded.monitor_states == monitored.monitor_states, "monitor archive roundtrip");

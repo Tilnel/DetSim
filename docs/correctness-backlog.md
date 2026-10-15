@@ -15,7 +15,7 @@ relationship to the native-binary model-checking goal.
 | C05 | Fixed (scoped) | Removed filename heuristics; corrected libelf string-table index in Go-section detection. | Native `test_probe` starts at the same boundary as `probe`; ordinary/Go-section ELF fixtures and two existing gc Go binaries classified correctly. gccgo and actual Go runtime execution remain unverified. |
 | C06 | Fixed (framework boundary) | Removed Raft fields, implicit role pruning, message inference and example parser from the production link. Versioned plugins inspect explicit snapshots; branch-owned opaque monitors enter product identity before successor publication. | `check-state-view`, `check-plugins`, `check-identity` and native counter-plugin restore/violation scenarios cover readonly inspection, ABI failures, history isolation, terminal witnesses and decoder noninterference. Raft examples have separate projection/history contracts; this does not certify every Raft property. |
 | C07 | Fixed | Snapshot reads now require saved bytes and reject missing/corrupt data; no live-memory substitution. | `check-state-io` covers missing/invalid archives and reads spanning saved regions. |
-| C08 | Partial | Native same-edge replay preserves hash; storage tests now cover immutable reader lifetime, cache pressure/zero budgets, short I/O, prefetch and fresh-process reload. | `check-storage`, `check-state-io`, `check-capture` full-byte oracle, mapping and native replay gates pass. Full exploration equivalence across cache policies and general multi-node semantic canonicalization remain unproven. Also reproduce cross-branch virtual-exit closure: restore currently skips dead physical images, while later captures still walk every node; reading a saved snapshot correctly does not establish that a later dead-node capture used the right branch. |
+| C08 | Partial | Native same-edge replay preserves hash; storage tests now cover immutable reader lifetime, cache pressure/zero budgets, short I/O, prefetch and fresh-process reload. | `check-storage`, `check-state-io`, `check-capture` full-byte oracle, mapping and native replay gates pass. Full exploration equivalence across cache policies and general multi-node semantic canonicalization remain unproven. Virtual-exit/fatal-stop branch closure now has real ptrace regressions: persisted terminated images load and restore along with live peers; recapture preserves identity. Physical process death still rejects; lifecycle reconstruction remains C02. |
 | C09 | Fixed (scoped) | Replaced process-group termination with owned-child kill/reap; signal handler avoids store shutdown locks. | NP=1 scenarios verify unrelated sibling survives both normal exit and SIGTERM, and SIGTERM reaps tracees. Fork descendants, multithread races and initialization failures need additional coverage. |
 | C10 | Fixed | Migrated removed libdwarf calls to supported APIs; validated with installed libdwarf 0.11.1 and GCC 14.2. | Real production parser tests pass DWARF 4/5, two CUs, sizes/member offsets, symbols, arrays and cleanup/reinit; tracer compiles and links. Split DWARF and PIE relocation remain outside coverage. |
 | C11 | Fixed (distinct addresses) | Direct `futex_requeue` now updates `waiter_map_` when moving a waiter. | Both entry points agree on queue/address; archive round trip followed by `wake_thread` succeeds. Same-address and syscall requeue ABI now have C16 regressions. |
@@ -137,3 +137,25 @@ policy and actual startup inheritance. `check-capture` perturbs RNG/actions to
 prove identity changes and repeated restore for flat/page snapshots. These tests
 close the default unknown-call escape; C02/C03/C08/C23/C25 remain scoped/open.
 General signal delivery and exhaustive random outcomes are not implemented.
+
+## Parked terminal images (2026-10-15)
+
+Virtual exit and intercepted fatal signals leave an owned physical task parked.
+Loading and restoring their product states must include those images: skipping
+terminated-node metadata or memory mixes a different branch into later captures.
+The restore path now loads every node and restores every differing image. Even
+same-hash restores validate the owned stopped physical thread set; a genuinely
+dead task rejects instead of reporting success. The transition entry rejects an
+invalid or terminated actor before selecting/restoring it. The kernel-model
+compatibility marker advances to v2; snapshot byte layouts stay flat11/page12.
+
+`check-capture` reproduces the old virtual-exit memory leak, then covers a real
+`exit_group` and `ud2`/SIGILL, alternate memory/RNG/umask/time branches, persisted
+reload, exact recapture identity, predecessor restore and actual OS death. Both
+normal and tiny caches run against flat and verify-pages backends. This closes
+that C08 branch-contamination case; changed physical thread sets, stop-all
+coordination and general canonicalization remain open.
+
+Virtual termination still retains modeled descriptors; Linux exit-driven close/EOF
+and other resource teardown semantics require a separate lifecycle model. The
+regressions above establish branch-image isolation, not complete exit semantics.

@@ -175,6 +175,10 @@ static bool check_assertions(const sys_state& state, unsigned actor)
 TransitionResult state_transition(const sys_state &source_state,
                                   int process_index)
 {
+  if (process_index < 0 || process_index >= NP)
+    throw std::runtime_error("Transition process index out of range");
+  if (DISDEAD(source_state.status[process_index]))
+    throw std::runtime_error("Cannot execute a terminated process; load a predecessor state first");
   if (source_state.property_failed)
     throw std::runtime_error("Cannot execute a terminal property violation; load a predecessor state first");
   TransitionResult result;

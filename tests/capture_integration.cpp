@@ -6,6 +6,8 @@
 #include "guest.h"
 #include "proc_status.h"
 #include "page_snapshot.h"
+#include "engine/exec_engine.h"
+#include "state_transition.h"
 #include <array>
 #include <cstdio>
 #include <arpa/inet.h>
@@ -242,10 +244,94 @@ int main(int argc, char**)
         sys_state generic(info);
         require(StateStore::instance().get_stats().save_calls == before_generic + NP,
                 "unanchored capture bypassed the ordinary store path");
+        // A virtual exit parks the OS task. Restoring its product-state image
+        // must restore memory/resources even while that node cannot execute.
+        source.recover_running_state();
+        ExecutionEngine engine;
+        syscall_info exit_info{};
+        ptmc_state.cursor=1;
+        require(engine.execute_syscall(children[1],exit_info)==2 && exit_info.nr==SYS_exit_group &&
+                DISEXITED(ptmc_state.status[1]), "fixture must exit through the virtual lifecycle path");
+        syscall_info dead_info[NP][MAX_THREADS_PER_PROCESS];
+        memcpy(dead_info,info,sizeof(dead_info));dead_info[1][0]=exit_info;
+        sys_state exited(dead_info,&source);
+        ptmc_state.running_state=exited;
+        source.recover_running_state();
+        require(ptrace(PTRACE_POKEDATA,children[1],&guest_value,99)==0,"edit alternate live branch");
+        ptmc_state.process_states[1].random_state^=0x5678;
+        ptmc_state.fs_states[1].set_creation_mask(0077);
+        ptmc_state.time[1].tv_sec+=7;
+        sys_state alternate(info,&source);
+        ptmc_state.running_state=alternate;
+        // Decode persisted state too: this is not only an in-memory copy test.
+        sys_state loaded_exit(exited.ss_hash);
+        loaded_exit.recover_running_state();
+        long exited_value=0;
+        require(guest_read_exact(children[1],&guest_value,&exited_value,sizeof(exited_value)) &&
+                exited_value==17,"exited node retained another branch's memory");
+        require(ptmc_state.process_states[1]==exited.child[1].process_state &&
+                ptmc_state.fs_states[1].creation_mask()==exited.child[1].fs_state.creation_mask() &&
+                ptmc_state.time[1].tv_sec==exited.child[1].tv.tv_sec,
+                "exited node retained another branch's modeled resources");
+        ptmc_state.cursor=0;
+        for (int actor : {-1,1,NP}) {
+            bool rejected=false;
+            try {(void)state_transition(loaded_exit,actor);}catch(const std::runtime_error&){rejected=true;}
+            require(rejected && ptmc_state.cursor==0,"invalid or terminated actor reached transition execution");
+        }
+        sys_state recaptured_exit(dead_info,&loaded_exit);
+        require(recaptured_exit.ss_hash==exited.ss_hash,"exited branch recapture identity drift");
+        exec::init_all();
+        const auto peer_step=state_transition(loaded_exit,0);
+        require(peer_step.code==CKPT_EXIT && peer_step.new_state.ts_hash[1]==exited.ts_hash[1] &&
+                peer_step.new_state.status[1]==exited.status[1],
+                "stepping a live peer contaminated the parked terminal image");
+        source.recover_running_state();
+        sys_state resurrected(info,&source);
+        require(resurrected.ss_hash==source.ss_hash && DISALIVE(ptmc_state.status[1]),
+                "virtual exit predecessor cannot replay faithfully");
+        // Fatal signal stops also park an image: exercise a real fault, not
+        // merely a synthetic status flag, before switching branches again.
+        const unsigned char fault_instruction[]={0x0f,0x0b}; // ud2 -> SIGILL
+        require(guest_write_exact(children[1],reinterpret_cast<void*>(scratch_page+0x100),
+                fault_instruction,sizeof(fault_instruction)),"write fault fixture");
+        user_regs_struct fault_regs{};
+        require(ptrace(PTRACE_GETREGS,children[1],nullptr,&fault_regs)==0,"read fault registers");
+        fault_regs.rip=scratch_page+0x100;
+        require(ptrace(PTRACE_SETREGS,children[1],nullptr,&fault_regs)==0,"arm native fault");
+        ptmc_state.cursor=1;
+        syscall_info fault_info{};
+        require(engine.execute_syscall(children[1],fault_info)==3 && DISCRASHED(ptmc_state.status[1]),
+                "fixture must crash at a real fatal signal stop");
+        sys_state crashed(info,&source);
+        ptmc_state.running_state=crashed;
+        source.recover_running_state();
+        require(ptrace(PTRACE_POKEDATA,children[1],&guest_value,123)==0,"edit alternate crash branch");
+        ptmc_state.process_states[1].random_state^=0xabcd;
+        sys_state crash_alternate(info,&source);
+        ptmc_state.running_state=crash_alternate;
+        sys_state loaded_crash(crashed.ss_hash);
+        loaded_crash.recover_running_state();
+        long crash_value=0;
+        require(guest_read_exact(children[1],&guest_value,&crash_value,sizeof(crash_value)) &&
+                crash_value==17 && ptmc_state.process_states[1]==crashed.child[1].process_state,
+                "crashed node retained another branch's image");
+        sys_state recaptured_crash(info,&loaded_crash);
+        require(recaptured_crash.ss_hash==crashed.ss_hash,"crash branch recapture identity drift");
+        ptmc_state.running_state=recaptured_crash;
+        source.recover_running_state();
+        sys_state crash_predecessor(info,&source);
+        require(crash_predecessor.ss_hash==source.ss_hash,"crash predecessor restore identity drift");
         if (argc > 1) require(StateStore::instance().get_stats().disk_reads > 0, "oracle did not exercise cache eviction");
+        // Even the same-hash shortcut may not declare a vanished task restored.
+        ptmc_state.running_state=resurrected;
+        kill(children[1],SIGKILL);waitpid(children[1],nullptr,0);children[1]=0;
+        bool vanished_rejected=false;
+        try {resurrected.recover_running_state();}catch(const std::runtime_error&){vanished_rejected=true;}
+        require(vanished_rejected,"same-hash restore accepted an actually dead physical process");
         StateStore::instance().shutdown();
         SysStateStore::instance().shutdown();
-        for (pid_t &child : children) { kill(child, SIGKILL); waitpid(child, nullptr, 0); child = 0; }
+        for (pid_t &child : children) if (child > 0) { kill(child, SIGKILL); waitpid(child, nullptr, 0); child = 0; }
         std::filesystem::current_path(cwd); std::filesystem::remove_all(directory);
         puts("PASS capture: idle reuse, full byte oracle, branch restore, memory/socket updates, active capture, cache eviction");
         return 0;
