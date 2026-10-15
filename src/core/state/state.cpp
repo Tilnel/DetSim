@@ -9,6 +9,7 @@
 #include <poll.h>
 #include "soft_dirty_experiment.h"
 #include "page_capture.h"
+#include "snapshot_memory.h"
 #include "page_restore_stats.h"
 #include <stdexcept>
 #include <climits>
@@ -890,8 +891,10 @@ hash_type tracee_state::capture_stopped(pid_t pid, hash_type comparison_hash)
                             item.end, item.flags, item.offset, item.a, item.b,
                             item.inode, item.name);
     if (excluded_mapping(item)) continue;
-    if (item.flags[3] != 'p' || item.flags[0] != 'r')
-      throw std::runtime_error(fmt::format("Unsupported snapshot mapping {:x}-{:x} {} {}: requires private readable memory",
+    const bool anonymous_guard = !strcmp(item.flags, "---p") &&
+                                 !item.inode && !item.name[0];
+    if (item.flags[3] != 'p' || (item.flags[0] != 'r' && !anonymous_guard))
+      throw std::runtime_error(fmt::format("Unsupported snapshot mapping {:x}-{:x} {} {}: requires private readable or anonymous PROT_NONE memory",
                                          item.start, item.end, item.flags, item.name));
     RegionInfo info{};
     info.start = item.start; info.end = item.end;
@@ -972,6 +975,9 @@ hash_type tracee_state::capture_stopped(pid_t pid, hash_type comparison_hash)
 
   auto* soft_dirty = detsim::experiment::configured_capture();
   if (soft_dirty) {
+    for (const auto& region : regions)
+      if (region.prot == PROT_NONE)
+        throw std::runtime_error("Soft-dirty capture does not support PROT_NONE mappings");
     std::vector<detsim::experiment::Region> raw_regions;
     raw_regions.reserve(regions.size());
     for (size_t i = 0; i < regions.size(); ++i) {
@@ -985,6 +991,7 @@ hash_type tracee_state::capture_stopped(pid_t pid, hash_type comparison_hash)
     soft_dirty->capture(pid, raw_regions, maps_text);
   }
 
+  detsim::GuardMemoryReader guard_memory(pid);
   constexpr int MAX_IOV_BATCH = 256;
   for (size_t batch_start = 0; batch_start < regions.size();
        batch_start += MAX_IOV_BATCH)
@@ -994,6 +1001,7 @@ hash_type tracee_state::capture_stopped(pid_t pid, hash_type comparison_hash)
 
     struct iovec local_iov[MAX_IOV_BATCH];
     struct iovec remote_iov[MAX_IOV_BATCH];
+    size_t readable_count = 0;
 
     for (size_t i = 0; i < batch_count; i++)
     {
@@ -1004,14 +1012,17 @@ hash_type tracee_state::capture_stopped(pid_t pid, hash_type comparison_hash)
       region_infos[idx].offset = region_data_offset + regions[idx].offset;
 
       uint8_t *dest = all_data + region_infos[idx].offset;
-      local_iov[i].iov_base = dest;
-      local_iov[i].iov_len = src.size;
-      remote_iov[i].iov_base = (void *)src.start;
-      remote_iov[i].iov_len = src.size;
+      if (regions[idx].prot == PROT_NONE) {
+        if (!soft_dirty) guard_memory.read(src.start, dest, src.size);
+      } else {
+        local_iov[readable_count] = {dest, src.size};
+        remote_iov[readable_count] = {reinterpret_cast<void*>(src.start), src.size};
+        ++readable_count;
+      }
     }
 
     if (!soft_dirty)
-      checked_memory_io(false, pid, local_iov, remote_iov, batch_count);
+      checked_memory_io(false, pid, local_iov, remote_iov, readable_count);
 
     for (size_t i = 0; i < batch_count; i++)
     {

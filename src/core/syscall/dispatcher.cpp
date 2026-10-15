@@ -5,6 +5,7 @@
 #include "dispatcher.h"
 #include "handlers.h"
 #include "guest.h"
+#include "utils.h"
 #include "log_wrapper.h"
 #include "monitor.h"
 #include "thread_manager.h"
@@ -33,6 +34,24 @@ void validate_guest_mapping_range(uint64_t address,uint64_t length) {
     if (address<scratch_page+page_size && address+rounded>scratch_page)
         throw std::runtime_error("Guest mapping operation overlaps reserved syscall scratch page");
 }
+
+void validate_guard_mapping(pid_t pid, uint64_t address, uint64_t length) {
+    // Invalid alignment/empty extents retain the kernel's normal errno behavior.
+    if (!length || address % 4096) return;
+    const uint64_t end = address + ((length + 4095) & ~uint64_t(4095));
+    auto file = fileutils::open_cfile("/proc/" + std::to_string(pid) + "/maps", "r");
+    if (!file) throw std::runtime_error("Cannot inspect guard mapping backing");
+    std::vector<maps_item> maps;
+    get_maps_item(maps, file.get());
+    if (ferror(file.get()) || maps.empty())
+        throw std::runtime_error("Cannot read complete guard mapping backing");
+    for (const auto& map : maps) {
+        if (map.end <= address || map.start >= end) continue;
+        if (map.flags[3] != 'p' || map.inode || map.name[0])
+            throw std::runtime_error("Guard protections require unnamed private anonymous mappings");
+    }
+}
+
 }
 
 // External functions from state_transition.cpp
@@ -277,8 +296,11 @@ bool SyscallDispatcher::on_enter(pid_t pid, int syscall_nr, syscall_info& info)
                 throw std::runtime_error("Only owned-process prlimit64 queries are supported");
             if (syscall_nr == SYS_prlimit64 && info.args[0]) tracee_set_rdi(pid,0);
             if (syscall_nr == SYS_mprotect &&
-                (!(info.args[2] & PROT_READ) || (info.args[2] & ~(PROT_READ|PROT_WRITE|PROT_EXEC))))
-                throw std::runtime_error("Unreadable or extended-protection mappings are unsupported");
+                ((info.args[2] && !(info.args[2] & PROT_READ)) ||
+                 (info.args[2] & ~uint64_t(PROT_READ|PROT_WRITE|PROT_EXEC))))
+                throw std::runtime_error("Only readable or guard protections are supported");
+            if (syscall_nr == SYS_mprotect && info.args[2] == PROT_NONE)
+                validate_guard_mapping(pid, info.args[0], info.args[1]);
             return true;
         default:
             throw std::runtime_error("Invalid syscall action");
@@ -388,8 +410,10 @@ void SyscallDispatcher::handle_mmap_enter(pid_t pid, syscall_info& info)
     const int flags=static_cast<int>(info.args[3]);
     constexpr int supported_flags=MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED|MAP_FIXED_NOREPLACE|MAP_STACK|MAP_NORESERVE;
     if (!(flags&MAP_PRIVATE) || (flags&~supported_flags) ||
-        !(info.args[2]&PROT_READ) || (info.args[2]&~uint64_t(PROT_READ|PROT_WRITE|PROT_EXEC)))
-        throw std::runtime_error("Only readable private mappings with ordinary protections are supported");
+        (info.args[2] && !(info.args[2]&PROT_READ)) ||
+        (!info.args[2] && !(flags&MAP_ANONYMOUS)) ||
+        (info.args[2]&~uint64_t(PROT_READ|PROT_WRITE|PROT_EXEC)))
+        throw std::runtime_error("Only readable private mappings or anonymous guards are supported");
     if (flags&(MAP_FIXED|MAP_FIXED_NOREPLACE)) validate_guest_mapping_range(info.args[0],info.args[1]);
     if (flags & MAP_ANONYMOUS) return; // fd is ignored by the kernel.
     auto& fs=ptmc_state.fs_states[ptmc_state.cursor];

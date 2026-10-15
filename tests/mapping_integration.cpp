@@ -5,16 +5,29 @@
 #include "guest.h"
 #include "page_restore_stats.h"
 #include <cstdio>
+#include <cerrno>
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
 #include <sys/mman.h>
+#include <sys/rseq.h>
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 
 extern "C" detsim::ui::NCursesUI *get_ncurses_ui() { return nullptr; }
+extern "C" ssize_t __real_pread(int, void*, size_t, off_t);
+static uintptr_t guard_address = 0;
+static int guard_read_failure = 0;
+extern "C" ssize_t __wrap_pread(int fd, void* buffer, size_t size, off_t offset)
+{
+    if (guard_read_failure && uint64_t(offset) == guard_address) {
+        if (guard_read_failure == 2) { errno = EIO; return -1; }
+        return size ? ssize_t(size - 1) : 0;
+    }
+    return __real_pread(fd, buffer, size, offset);
+}
 static void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
 static int protection(pid_t pid, uintptr_t address)
 {
@@ -29,13 +42,16 @@ static int protection(pid_t pid, uintptr_t address)
                    (map.flags[2] == 'x' ? PROT_EXEC : 0);
     return -1;
 }
-int main()
+int main(int argc, char** argv)
 {
     pid_t child = -1;
     char directory[] = "/tmp/detsim-mapping-XXXXXX";
     auto cwd = std::filesystem::current_path();
     try {
         require(mkdtemp(directory) && chdir(directory) == 0, "temporary directory");
+        StateStore::Config store_config;
+        if (argc == 2 && !strcmp(argv[1], "--tiny-cache"))
+            store_config.hot_cache_size = store_config.warm_cache_size = 1;
         FILE* maps_fixture = tmpfile();
         require(maps_fixture, "maps parser fixture");
         fputs("100000-102000 r--p 100000000 ab:cd 5000000000 /tmp/backing\n"
@@ -62,6 +78,10 @@ int main()
         require(backed != MAP_FAILED, "file mapping");
         child = fork(); require(child >= 0, "fork");
         if (!child) {
+            // This fixture owns raw memory snapshots, not the process rseq model.
+            if (__rseq_size && syscall(SYS_rseq,
+                    static_cast<char*>(__builtin_thread_pointer()) + __rseq_offset,
+                    32, RSEQ_FLAG_UNREGISTER, RSEQ_SIG)) _exit(5);
             if (mmap(reinterpret_cast<void*>(scratch_page), 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
                      MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED) _exit(2);
             auto* code = reinterpret_cast<unsigned char*>(scratch_page + 0xff0);
@@ -74,6 +94,7 @@ int main()
         int status;
         require(waitpid(child, &status, 0) == child && WIFSTOPPED(status), "child stop");
         require(ptrace(PTRACE_SETOPTIONS, child, nullptr, PTRACE_O_TRACESYSGOOD) == 0, "ptrace options");
+        StateStore::instance().init(store_config);
         tracee_state saved;
         auto hash = saved.save_full_state_to_state_store(child);
         char* literal = static_cast<char*>(read_mem(child, hash, reinterpret_cast<uintptr_t>("read-only fixture"), 17));
@@ -135,10 +156,68 @@ int main()
         restore();
         require(tracee_do_syscall(child, SYS_mprotect, reinterpret_cast<uintptr_t>(page), 8192,
                                  PROT_NONE, 0, 0, 0) == 0, "PROT_NONE mutation");
-        bool no_read_failed = false;
+        guard_address = reinterpret_cast<uintptr_t>(page);
+        for (int failure : {1, 2}) {
+            guard_read_failure = failure;
+            const auto saves = StateStore::instance().get_stats().save_calls;
+            bool failed_read = false;
+            try { saved.save_full_state_to_state_store(child); }
+            catch (const std::runtime_error&) { failed_read = true; }
+            guard_read_failure = 0;
+            require(failed_read, "guard short/failed read accepted");
+            require(StateStore::instance().get_stats().save_calls == saves,
+                    "guard read failure published snapshot");
+            require(protection(child, guard_address) == PROT_NONE,
+                    "failed guard capture changed protection");
+        }
+        const auto guard_hash = saved.save_full_state_to_state_store(child);
+        require(protection(child, reinterpret_cast<uintptr_t>(page)) == PROT_NONE,
+                "capture changed guard protection");
+        unsigned char hidden = 0;
+        require(!guest_read_exact(child, page, &hidden, 1), "guest read bypassed guard protection");
+        auto* guard_bytes = static_cast<unsigned char*>(read_mem(child, guard_hash,
+                reinterpret_cast<uintptr_t>(page), 8192));
+        require(guard_bytes[0] == 11 && guard_bytes[4096] == 12,
+                "guard snapshot omitted hidden bytes");
+        free(guard_bytes);
+        mutate();
+        require(tracee_do_syscall(child, SYS_mprotect, reinterpret_cast<uintptr_t>(page), 8192,
+                                 PROT_NONE, 0, 0, 0) == 0, "hide mutated guard bytes");
+        const auto changed_guard_hash = saved.save_full_state_to_state_store(child);
+        require(changed_guard_hash != guard_hash, "hidden guard contents missing from identity");
+        auto restore_guard = [&] {
+            std::vector<maps_item> guard_maps;
+            saved.restore_memory_mappings(guard_hash, child, guard_maps);
+            saved.recover_mem_reg_snapshot(guard_maps, guard_hash, child);
+            require(protection(child, reinterpret_cast<uintptr_t>(page)) == PROT_NONE &&
+                    protection(child, reinterpret_cast<uintptr_t>(page) + 4096) == PROT_NONE,
+                    "guard restore lost permissions");
+            require(!guest_read_exact(child, page, &hidden, 1), "restored guard is guest-readable");
+            require(saved.save_full_state_to_state_store(child) == guard_hash,
+                    "guard restore changed snapshot identity");
+            require(tracee_do_syscall(child, SYS_mprotect, reinterpret_cast<uintptr_t>(page), 8192,
+                                     PROT_READ, 0, 0, 0) == 0, "unhide restored guard");
+            require(guest_read_exact(child, page, &hidden, 1) && hidden == 11,
+                    "guard restore lost hidden data");
+        };
+        StateStore::instance().shutdown();
+        StateStore::instance().init(store_config);
+        restore_guard();
+        // No content mutation: this must repair permissions even without writes.
+        require(tracee_do_syscall(child, SYS_mprotect, reinterpret_cast<uintptr_t>(page), 8192,
+                                 PROT_READ | PROT_WRITE, 0, 0, 0) == 0, "unprotect identical guard");
+        restore_guard();
+        mutate(); restore_guard();
+        require(tracee_do_syscall(child, SYS_munmap, reinterpret_cast<uintptr_t>(page), 8192,
+                                 0, 0, 0, 0) == 0, "remove guard backing");
+        restore_guard();
+        restore();
+        require(tracee_do_syscall(child, SYS_mprotect, reinterpret_cast<uintptr_t>(backed), 4096,
+                                 PROT_NONE, 0, 0, 0) == 0, "file guard mutation");
+        bool file_guard_failed = false;
         try { saved.save_full_state_to_state_store(child); }
-        catch (const std::runtime_error&) { no_read_failed = true; }
-        require(no_read_failed, "unreadable mapping silently omitted from snapshot");
+        catch (const std::runtime_error&) { file_guard_failed = true; }
+        require(file_guard_failed, "unreadable file mapping admitted by capture");
         restore();
         // Extending the reserved injection VMA must not hide the extra guest page.
         require(tracee_do_syscall(child, SYS_mremap, scratch_page, 4096, 8192, 0, 0, 0) == scratch_page,
@@ -178,7 +257,7 @@ int main()
         StateStore::instance().shutdown();
         munmap(page, 8192); munmap(sparse, sparse_size); munmap(backed, 4096); fclose(file);
         std::filesystem::current_path(cwd); std::filesystem::remove_all(directory);
-        puts("PASS mappings: RO data/literal capture, repeated restore, split/merge permissions, anonymous recreation, file-backed rejection");
+        puts("PASS mappings: RO/guard bytes, identity, persisted replay, read faults, permissions, anonymous recreation, unsupported backing");
         return 0;
     } catch (const std::exception& error) {
         if (child > 0) { kill(child, SIGKILL); waitpid(child, nullptr, 0); }

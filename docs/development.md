@@ -136,8 +136,9 @@ Default snapshot format is version 19; older formats are rejected without migrat
 This branch additionally reads opt-in version 20 page manifests, selected with
 `DETSIM_SNAPSHOT_BACKEND=pages`; `verify-pages` adds a full memory oracle.
 See [page snapshots and whole-exploration measurements](page-snapshots.md).
-Private readable mappings are captured; shared/unreadable mappings, overlaps with
-the reserved scratch page and missing file-backed restore mappings fail explicitly.
+Private readable mappings and unnamed anonymous PROT_NONE guards are captured;
+shared and other unreadable mappings, overlaps with the reserved scratch page
+and missing file-backed restore mappings fail explicitly.
 Logical thread slots and futex queues survive restore. Raw-thread births/exits
 restore onto retained stopped carriers; unexpected host thread death or creation rejects. Timed/PI futex operations
 are unsupported and fail explicitly; successful waits remain suspended until wake.
@@ -474,3 +475,24 @@ altstack or Go's asynchronous preemption.
 The unmodified pthread TLS/join probe now advances past syscall14 and stops at
 the readable-private mapping restriction. Guard mappings remain the next observed
 boundary; this smoke does not demonstrate complete pthread execution.
+
+## Anonymous guard mappings
+
+Private unnamed anonymous `PROT_NONE` mappings are captured with all hidden bytes,
+using a snapshot-only exact `/proc/<pid>/mem` read. Readable mappings retain the
+batched process_vm path. No capture-time permission changes occur, and ordinary
+guest copies still fail on guards. Both flat19/page20 store the original zero
+protection; restoring a guard temporarily permits writes and reinstalls zero.
+Kernel model v7 distinguishes the expanded execution contract; the archive layout
+is unchanged. File/named unreadable mappings, shared mappings, write-only and
+execute-only protection remain unsupported. The soft-dirty experiment explicitly
+rejects guards; full/pages/verify-pages support them.
+
+`check-mappings` runs six backend/cache variants: nonzero hidden bytes, identity,
+read errors/short reads without publication or permission changes, persisted
+reopen, anonymous recreation, repeated restore and permission-only changes.
+The fixture unregisters inherited rseq: otherwise kernel CPU-id updates at the
+registered TLS address can contaminate its raw-memory identity oracle.
+The unmodified pthread probe now advances to the active-rseq clone rejection.
+This does not establish complete pthread support. Restoring an unreadable region
+currently writes its full saved contents, so large reserved ranges can be costly.

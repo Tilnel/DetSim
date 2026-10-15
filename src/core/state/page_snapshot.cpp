@@ -133,9 +133,9 @@ SnapshotView::SnapshotView(std::shared_ptr<const std::vector<uint8_t>> data, uin
   uint64_t previous_end = 0;
   uint64_t next_data = paged ? 0 : header_.maps_offset + header_.maps_size;
   for (const auto& region : regions_) {
-    const uint32_t prot = PROT_READ | (region.flags[1] == 'w' ? PROT_WRITE : 0) |
+    const uint32_t prot = (region.flags[0] == 'r' ? PROT_READ : 0) | (region.flags[1] == 'w' ? PROT_WRITE : 0) |
         (region.flags[2] == 'x' ? PROT_EXEC : 0);
-    require(region.flags[0] == 'r' && (region.flags[1] == 'w' || region.flags[1] == '-') &&
+    require((region.flags[0] == 'r' || !memcmp(region.flags, "---p", 4)) && (region.flags[1] == 'w' || region.flags[1] == '-') &&
         (region.flags[2] == 'x' || region.flags[2] == '-') && region.flags[3] == 'p' &&
         region.flags[4] == 0 && region.prot == prot, "Invalid snapshot memory region protection");
     require(region.end > region.start && region.start >= previous_end && region.offset == next_data,

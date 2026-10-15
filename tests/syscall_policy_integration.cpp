@@ -176,9 +176,30 @@ int main() {
         check(result.rejected,"shared anonymous mmap rejected before kernel");
         result=execute(dispatcher,child,SYS_mmap,
                        {0,4096,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,uint64_t(-1),0});
-        check(result.rejected,"unreadable anonymous mmap rejected before kernel");
+        check(!result.rejected && result.value > 0,"anonymous guard mmap supported");
+        if (!result.rejected && result.value > 0) {
+            const auto guard = uint64_t(result.value);
+            char byte = 0;
+            check(!guest_read_exact(child, reinterpret_cast<void*>(guard), &byte, 1),
+                  "guard mapping remains unreadable to guest copies");
+            result=execute(dispatcher,child,SYS_mprotect,{guard,4096,PROT_READ|PROT_WRITE,0,0,0});
+            check(!result.rejected && result.value==0,"guard can become writable");
+            result=execute(dispatcher,child,SYS_mprotect,{guard,4096,PROT_NONE,0,0,0});
+            check(!result.rejected && result.value==0,"anonymous mprotect can install guard");
+            result=execute(dispatcher,child,SYS_munmap,{guard,4096,0,0,0,0});
+            check(!result.rejected && result.value==0,"guard can be unmapped");
+        }
+        result=execute(dispatcher,child,SYS_mmap,
+                       {0,4096,PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,uint64_t(-1),0});
+        check(result.rejected,"write-only mappings remain unsupported");
+        result=execute(dispatcher,child,SYS_mmap,
+                       {0,4096,PROT_NONE,MAP_PRIVATE,uint64_t(-1),0});
+        check(result.rejected,"file-backed guard mappings remain unsupported");
+        result=execute(dispatcher,child,SYS_mprotect,
+                       {reinterpret_cast<uint64_t>(&replacement_name)&~uint64_t(4095),4096,PROT_NONE,0,0,0});
+        check(result.rejected,"file-backed guard mprotect rejected before kernel");
         result=execute(dispatcher,child,SYS_mprotect,{scratch_page,4096,PROT_NONE,0,0,0});
-        check(result.rejected,"unreadable mprotect rejected before kernel");
+        check(result.rejected,"guard cannot replace reserved scratch page");
         result=execute(dispatcher,child,SYS_mprotect,{scratch_page,4096,PROT_READ,0,0,0});
         check(result.rejected,"mprotect cannot change reserved syscall scratch page");
         result=execute(dispatcher,child,SYS_munmap,{scratch_page,4096,0,0,0,0});

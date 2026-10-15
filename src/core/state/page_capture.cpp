@@ -1,4 +1,6 @@
 #include "page_capture.h"
+#include "snapshot_memory.h"
+#include <sys/mman.h>
 #include "soft_dirty_experiment.h"
 #include <cstdlib>
 #include <climits>
@@ -24,18 +26,28 @@ struct Stats {
     uint64_t captures=0, pages=0, reused=0, saved=0, read_bytes=0, oracle_bytes=0;
 } stats;
 
-void read_regions(pid_t pid, const std::vector<detsim::experiment::Region>& ranges) {
+void read_regions(pid_t pid, const std::vector<detsim::experiment::Region>& ranges,
+                  const std::vector<RegionInfo>& regions) {
+    if (ranges.size() != regions.size()) throw std::runtime_error("Page capture region mismatch");
+    detsim::GuardMemoryReader guard_memory(pid);
     for (size_t start=0; start<ranges.size(); start+=256) {
         iovec local[256], remote[256];
         const size_t count=std::min(size_t(256),ranges.size()-start);
-        size_t expected=0;
+        size_t expected=0, readable_count=0;
         for (size_t i=0;i<count;++i) {
             const auto& r=ranges[start+i];
+            if (regions[start+i].prot == PROT_NONE) {
+                guard_memory.read(r.address,r.data,r.size);
+                continue;
+            }
             if (r.size>size_t(SSIZE_MAX)-expected) throw std::runtime_error("Page capture transfer overflow");
             expected+=r.size;
-            local[i]={r.data,r.size}; remote[i]={reinterpret_cast<void*>(r.address),r.size};
+            local[readable_count]={r.data,r.size};
+            remote[readable_count]={reinterpret_cast<void*>(r.address),r.size};
+            ++readable_count;
         }
-        const auto got=process_vm_readv(pid,local,count,remote,count,0);
+        if (!readable_count) continue;
+        const auto got=process_vm_readv(pid,local,readable_count,remote,readable_count,0);
         if (got<0 || size_t(got)!=expected) throw std::runtime_error("Page capture read failed or short");
     }
 }
@@ -83,11 +95,14 @@ hash_type save_paged_snapshot(pid_t pid, const std::vector<RegionInfo>& regions,
         offset+=r.end-r.start;
     }
     if (auto* experiment=detsim::experiment::configured_capture()) {
+        for (const auto& region:regions)
+            if (region.prot == PROT_NONE)
+                throw std::runtime_error("Soft-dirty capture does not support PROT_NONE mappings");
         const auto before=experiment->stats().bytes_read;
         experiment->capture(pid,reads,std::string(maps));
         stats.read_bytes+=experiment->stats().bytes_read-before;
     } else {
-        read_regions(pid,reads);
+        read_regions(pid,reads,regions);
         stats.read_bytes+=total;
     }
     normalize(work.memory,regions,rseq_address,rseq_length);
@@ -125,7 +140,7 @@ hash_type save_paged_snapshot(pid_t pid, const std::vector<RegionInfo>& regions,
         std::vector<uint8_t> oracle(total);
         offset=0;
         for (auto& read:reads) {read.data=oracle.data()+offset;offset+=read.size;}
-        read_regions(pid,reads);stats.oracle_bytes+=total;
+        read_regions(pid,reads,regions);stats.oracle_bytes+=total;
         normalize(oracle,regions,rseq_address,rseq_length);
         const auto view=SnapshotView::open(root);
         if (view->maps_text()!=maps || view->metadata().size()!=metadata.size() ||

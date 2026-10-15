@@ -26,9 +26,9 @@ relationship to the native-binary model-checking goal.
 | C16 | Fixed (scoped) | WAKE unblocks removed waiters, successful WAIT saves a suspended successor with return 0; requeue uses arg4 count/arg6 comparison, returns total affected and handles same address safely. | `check-futex` covers real ptrace WAIT/WAKE/bitset/requeue/errors; unsupported timed/realtime/PI operations explicitly fail. Exhaustive wake-order outcomes remain outside coverage. |
 | C17 | P1 | The glibc-private CPU-feature patch has been removed; general nondeterministic CPU instructions/runtime inputs still need a supported execution contract. | Define and test which nondeterministic CPU/runtime state must be normalized; avoid assuming this patch worked from a successful scenario. |
 | C20 | Fixed (host user XSTATE) | Capture/archive/restore NT_X86_XSTATE for each thread; snapshot version 5 rejects old formats. | `check-xstate` covers XMM/AVX/x87/MXCSR; native SIMD scenario repeatedly restores observed=0 and replays observed=11. Cross-host layouts and supervisor state are outside coverage. |
-| C21 | Fixed (scoped) | Save private readable mappings including RO pages; restore protections/backing and canonicalize equivalent VMA partitions. Reject shared/unreadable maps and missing file/named backing. | `check-mappings` covers RO contents, permissions, split/merge, anonymous recreation, explicit unsupported cases and wide map fields. Native replay preserves successor identity. |
+| C21 | Fixed (scoped) | Save private readable mappings and unnamed anonymous guards including hidden bytes; restore protections/backing and canonicalize equivalent VMA partitions. Reject shared and other unreadable maps and missing file/named backing. | `check-mappings` covers RO contents, permissions, split/merge, anonymous recreation, explicit unsupported cases and wide map fields. Native replay preserves successor identity. |
 | C22 | Fixed (snapshot I/O) | Exact read/write counts and archive bounds required; failures propagate, without zero-fill or live fallback. | `check-state-io` fault-injects short/failed process_vm I/O and corrupt/missing/old archives. Failed restore is fatal; no successor may execute afterward. |
-| C23 | P0 / partial | TCP source ports now derive from saved socket state, independent of search RNG; clocks/getrandom now use saved virtual state; custom signal delivery, masks and asynchronous kernel inputs remain unsupported. | `check-port` covers replay, RNG independence, source addresses, uniqueness and exhaustion. Closed syscall policy and process-model regressions cover rejection, deterministic replay and archives; this does not close general asynchronous inputs. |
+| C23 | P0 / partial | TCP source ports now derive from saved socket state, independent of search RNG; clocks/getrandom now use saved virtual state; per-task masks now persist; custom signal delivery and asynchronous kernel inputs remain unsupported. | `check-port` covers replay, RNG independence, source addresses, uniqueness and exhaustion. Closed syscall policy and process-model regressions cover rejection, deterministic replay and archives; this does not close general asynchronous inputs. |
 | C24 | Fixed | Populate current syscall number/arguments before the entry handler. | `check-exec` exercises real ptrace FUTEX_WAKE suppression using current arguments. |
 | C25 | P0 / partial | Auto execution now returns after each completed syscall, including CKPT_NO. Runnable threads/outcomes are still not exhaustively enumerated; pure user loops and blocking kernel calls are not bounded. | `check-exec` verifies empty receive, sleep and getpid loops return control. Futex waiting successors are now preserved; enabled actor enumeration and shared-memory atom boundaries remain open. |
 | C26 | Fixed | Pending accounting covers queued and executing work; completion waits and synchronizes packed data/index. Async and sync errors poison subsequent operations. | `check-store-cache` holds a worker at compression, proves barrier stays blocked, then opens a fresh read-only process while writer remains alive. Sync failure and shutdown/reinit also covered. |
@@ -209,3 +209,18 @@ variants and eight clone/clone3 TID variants pass. Actual pending bits (thread
 and shared) reject before restore; no pending queue is silently discarded.
 General signal delivery, altstack, timed/temporary-mask waits, cancellation and
 external asynchronous input remain open. This is not complete pthread/Go support.
+
+## Anonymous guard follow-up
+
+C21 now includes private unnamed anonymous PROT_NONE capture and restore. Six
+full/pages/verify-pages x normal/tiny-cache regressions cover hidden-byte identity,
+persisted reload, mapping recreation, permission-only restore and exact-read
+failure without root publication. Guest copies retain native permission checks.
+Read errors are never replaced with zeros or live memory. Dispatcher guard
+mprotect preflights backing before kernel effects; unsupported file/shared maps
+remain rejected. Snapshot layout remains19/20; kernel model isv7.
+
+The pthread smoke now stops at active rseq registration during clone. That existing
+whole-region rseq masking/live-byte preservation shortcut still needs a real
+per-task kernel ABI contract; guard support does not resolve it. Large guard
+reservations currently require full hidden-byte reads and full restore writes.

@@ -15,7 +15,7 @@
 syscall 参数在 enter handler 前填充；自动执行以每个已完成 syscall 为边界，
 不再吞掉 CKPT_NO 循环。TCP 临时端口只依赖可保存的 socket 状态。
 
-这些修复不代表一般模型检验已经成立：共享/不可读映射与缺失文件 backing 明确
+这些修复不代表一般模型检验已经成立：共享/匿名 guard 之外的不可读映射与缺失文件 backing 明确
 拒绝，线程/futex 保存、actor 枚举、共享内存细粒度边界、时钟/随机/信号仍需修复。
 具体测试及剩余范围以 [correctness-backlog.md](correctness-backlog.md) 为准。
 

@@ -788,3 +788,32 @@ With CC=/usr/bin/gcc and CXX=/usr/bin/g++:
 
 No workload-specific state extraction was added. Pending signal queues, delivery,
 altstack, cancellation and Go asynchronous preemption remain unsupported.
+
+## Anonymous guard verification (2026-10-15)
+
+Red: the new mapping fixture failed at capture of its explicit PROT_NONE range.
+The implementation adds only snapshot-specific hidden-memory reads; ordinary
+guest reads still return EFAULT. Existing restore writes/reprotects are reused.
+
+Using CC=/usr/bin/gcc and CXX=/usr/bin/g++:
+- `make NP=1 -j4 check-mappings check-state-io check-page-snapshot
+  check-thread-signal-mask check-thread-tid check-thread-lifecycle check-exec
+  check-scenarios` passes: six mapping variants, eight mask variants, eight TID
+  variants, lifecycle coverage and fourteen tracer scenarios.
+- `make NP=2 -j4 check-syscall-policy check-capture check-runtime-profile
+  check-process-state check-io-boundary check-redis` passes.
+- `make check` passes nine component and ten build-contract tests.
+- Production NP1/NP2/NP3 builds pass. GCC strict syntax checks pass for capture
+  source and the mapping fixture; combined dispatcher check disables only its
+  existing unused-parameter warnings. Independent review and diff check pass.
+- Raft depth8 single-run full/pages both produce 2,582 visits/1,347 new states,
+  about361/549 states/s. Artifacts build/guard-raft{,-pages}; not a statistical
+  performance claim. Large unreadable reservations still require full reads and
+  restore writes.
+- The actual pthread TLS/join probe now reaches the active-rseq clone rejection;
+  build/tid-pthread-probe/guard-transcript.log records it.
+
+An intermittent identity failure in the old mapping fixture was traced to exactly
+rseq cpu_id_start/cpu_id at FS_BASE+__rseq_offset. The fixture now unregisters the
+inherited registration, matching existing raw-memory fixtures. No product rseq
+normalization or thread-runtime-specific patch was added.

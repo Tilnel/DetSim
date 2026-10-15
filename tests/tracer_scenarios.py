@@ -285,7 +285,7 @@ finally:
                     "sw 0\n" + command + "\nq\n", name=command.split()[0],
                     verify_failure_cleanup=True,
                 )
-                self.assertIn("Only readable private mappings with ordinary protections are supported", output)
+                self.assertIn("Only readable private mappings or anonymous guards are supported", output)
                 self.assertIn("DetSim state/execution error:", output)
                 self.assertNotIn("terminate called", output)
                 self.assertNotIn("Complete explore all", output)
