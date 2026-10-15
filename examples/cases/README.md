@@ -21,7 +21,7 @@ runner 只依赖 Python 标准库及已有编译器。不会下载依赖、修�
 
 `results.json` 保留工具链实际版本、编译和启动参数、源码/二进制/plugin/tracer 哈希、显式环境、profile、阶段结果和日志路径。`config.json`、`commands.json`、`transcript.log` 和 `witness.json` 可用于复现。哈希重放验证在同一 tracee 生命周期内进行；新的进程可能有不同地址，不能直接搬用旧状态哈希。
 
-## 已落地的两个问题
+## 已落地的案例
 
 ### 两次扣款：C 与 C++
 
@@ -134,3 +134,24 @@ Python程序已可检验。gccgo full也已完成控制、探索、退出和终�
 其默认munmap启动边界晚于线程创建；显式改为mmap边界后控制/恢复通过，
 实际搜索停在MADV_NOHUGEPAGE，尚不计绿色。官方工具链清单及校验依据：
 https://go.dev/dl/?mode=json&include=all 。
+
+
+### willemt Raft：真实三节点库与双 leader 反例
+
+先构建NP=3 tracer，再运行：
+
+```sh
+python3 examples/cases/raft_run.py --tracer ./tracer --depth 3 --timeout 240
+python3 tests/raft_case_runner_test.py
+```
+
+runner复制现有库输入到独立build目录，仅将一次`switch(r->vote_granted)`改为
+固定grant分支。原生对照证明：C投A并拒B，正常版B保持candidate；注错版B
+误计拒票成为同任期第二个leader。模型中受控执行选举前缀，再由DFS发现该
+违例；full/pages均检查精确诊断、任期、角色和实际拒票消息，三次重放同一边。
+
+健康版三节点提交两条不同命令；保存状态中的命令内容由例子侧checker检查。
+仅在确认时钟调用时推进leader时间，DFS前要求正预算。本轮两后端从预算1
+出发各42次访问/27个unique状态；搜索仍受深度3及错误预算约束，不是Raft
+一般安全证明。提交后的状态边三次恢复一致。日志payload由owned driver深拷贝
+并在pop释放，无Raft日志压缩；DetSim的full/pages快照均实际使用。

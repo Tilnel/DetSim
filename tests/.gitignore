@@ -127,3 +127,7 @@
 !history_presentation.py
 !history_presentation.mk
 !history_presentation_integration.cpp
+
+!raft_case_runner_test.py
+
+!concurrency_case_runner_test.py

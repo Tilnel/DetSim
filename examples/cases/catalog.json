@@ -43,17 +43,19 @@
       "command": "make audit-runtimes CC=/usr/bin/gcc CXX=/usr/bin/g++",
       "property": "saved stdout contains RUNTIME_OK before zero process exit",
       "expectation": "Known unsupported runtimes remain non-green, with exact first blocker and control-replay evidence"
-    }
-  ],
-  "next_targets": [
+    },
     {
       "id": "willemt-raft",
-      "path": "examples/raft/raft/raft",
+      "path": "examples/cases/raft_fixture.c",
       "processes": 3,
       "property": "one leader per term and consistent committed prefix",
       "mutation": "disable a vote/term guard in a copied build",
-      "status": "existing workload/plugins; paired mutant case and replay adapter not yet implemented"
-    },
+      "status": "healthy/mutant native and full/pages bounded suffix search plus3x replay pass",
+      "command": "python3 examples/cases/raft_run.py --tracer ./tracer --depth 3 --timeout 240",
+      "scope": "NP3 controlled election prefix;2 commands;no Raft compaction;explicit depth and error budget"
+    }
+  ],
+  "next_targets": [
     {
       "id": "redisraft-library",
       "path": "examples/redisraft/raft/raft",

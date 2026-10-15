@@ -560,3 +560,20 @@ protections, provenance and successor identity. Independent review approved the
 implementation; its requested unhinted-replay test correction is now green.
 NP2 syscall-policy/IO/capture and NP1 mapping gates passed. Actual gc Go advances
 to getrlimit97; captured resource-limit query closure is the next bounded task.
+
+
+### willemt paired case acceptance
+
+Owned three-node driver retains log payloads and initializes entry types. Native
+healthy/mutant use an exactly-once copied-source vote-response change. Actual
+full/pages DFS discovers the intended denied-vote dual leader at term1 and replays
+its predecessor edge3x. Healthy all nodes commit two distinct commands, then a
+positive-budget bounded suffix searches42states/27unique in each backend; a
+post-commit edge restores3x. Evidence: build/raft-cases/run-i1nlq358/result.json.
+
+Independent review caught/rejected the first healthy audit (budget0) and overly
+broad mutant diagnostics. Corrected heartbeat opportunities, positive-budget gate,
+exact election receipts and9 negative acceptance tests close those runner defects.
+The final-state cutoff flag is only an observation of the final state, never proof
+that all branches avoided budget cutoffs. This finite case does not close C03/C25
+or establish general Raft/snapshot compaction correctness. No vendor tree changed.
