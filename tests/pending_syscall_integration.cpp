@@ -4,6 +4,7 @@
 #include "engine/exec_engine.h"
 #include "engine/thread_manager.h"
 #include "engine/pending_syscall.h"
+#include "pending_io.h"
 #include "guest.h"
 #include "state_store.h"
 #include "cereal/archives/binary.hpp"
@@ -24,6 +25,7 @@
 
 extern "C" detsim::ui::NCursesUI *get_ncurses_ui() { return nullptr; }
 static timespec sleep_request{2, 1234};
+static timespec select_request{0, 20000};
 static void require(bool value, const char* why) { if (!value) throw std::runtime_error(why); }
 int main(int argc, char** argv)
 {
@@ -33,6 +35,25 @@ int main(int argc, char** argv)
     try {
         loglevel = 4;
         require(mkdtemp(directory) && chdir(directory) == 0, "temporary directory");
+        timespec zero{};
+        errno = 0;
+        require(syscall(SYS_pselect6, 0, 1, 1, 1, &zero, nullptr) == 0,
+                "native zero-descriptor pselect read ignored fdsets");
+        auto* readonly_timeout = static_cast<timespec*>(mmap(nullptr, 4096,
+            PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        require(readonly_timeout != MAP_FAILED, "native timeout mapping");
+        *readonly_timeout = select_request;
+        require(mprotect(readonly_timeout, 4096, PROT_READ) == 0 &&
+                syscall(SYS_pselect6, 0, 0, 0, 0, readonly_timeout, nullptr) == 0 &&
+                readonly_timeout->tv_nsec == 20000,
+                "native readonly timeout should succeed without writeback");
+        timespec invalid_timeout{-1, 0};
+        errno = 0;
+        require(syscall(SYS_pselect6, -1, 0, 0, 0, reinterpret_cast<void*>(1), nullptr) == -1 &&
+                errno == EFAULT, "native timeout EFAULT must precede negative nfds");
+        errno = 0;
+        require(syscall(SYS_pselect6, 0, 0, 0, 0, &invalid_timeout, nullptr) == -1 &&
+                errno == EINVAL, "native invalid timeout");
         int word = 7;
         child = fork();
         require(child >= 0, "fork");
@@ -51,6 +72,8 @@ int main(int argc, char** argv)
             syscall(SYS_futex, &word, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 7, 0, 0, 0);
             syscall(SYS_getpid);
             syscall(SYS_nanosleep, &sleep_request, nullptr);
+            syscall(SYS_getpid);
+            syscall(SYS_pselect6, 0, 1, 1, 1, &select_request, nullptr);
             syscall(SYS_getpid);
             _exit(0);
         }
@@ -240,11 +263,157 @@ int main(int argc, char** argv)
         }
         require(engine.execute_syscall(child, info) == 1 && info.nr == SYS_getpid,
                 "user execution did not resume after sleep completion");
+        ptmc_state.time[0] = {20, 100000};
+        require(engine.execute_syscall(child, info) == 1 && info.nr == SYS_pselect6 &&
+                state.threads[0].pending_syscall &&
+                state.threads[0].pending_syscall->reason == PendingReason::Timer &&
+                state.threads[0].pending_syscall->phase == PendingPhase::Waiting,
+                "zero-descriptor positive pselect did not suspend");
+        require(ptrace(PTRACE_GETREGS, child, nullptr, &regs) == 0 &&
+                static_cast<long>(regs.rax) == -ENOSYS, "pselect exposed premature success");
+        state.si[0] = info;
+        tracee_state select_wait(0, state.si);
+        const auto select_hash = select_wait.save(child);
+        tracee_state disk_select(select_hash);
+        const auto select_deadline = *disk_select.threads[0].pending_syscall->deadline;
+        require(select_deadline.sec == 20 && select_deadline.nsec == 100020000,
+                "pselect did not freeze relative timeout");
+        auto malformed_select = select_wait;
+        malformed_select.threads[0].pending_syscall->deadline.reset();
+        bool malformed_select_rejected = false;
+        try { validate_pending_syscalls(malformed_select); }
+        catch (const std::runtime_error&) { malformed_select_rejected = true; }
+        require(malformed_select_rejected, "timed pselect archive accepted missing deadline");
+        auto select_branch = select_wait;
+        ++select_branch.threads[0].pending_syscall->deadline->nsec;
+        require(!select_branch.metadata_equal(select_wait) &&
+                select_wait.threads[0].pending_syscall->deadline->nsec == 100020000,
+                "pselect deadline copy or identity failed");
+        for (int replay = 0; replay < 3; ++replay) {
+            disk_select.recover_running_state(0, select_hash);
+            require(!expire_pending_syscall(0, 1), "pselect expired early");
+            timespec changed{99, 1};
+            require(guest_write_exact(child, &select_request, &changed, sizeof(changed)),
+                    "mutate timeout after admission");
+            ptmc_state.time[0] = {20, 100020};
+            refresh_pending_syscalls();
+            require(state.threads[0].pending_syscall->phase == PendingPhase::Waiting &&
+                    state.threads[0].pending_syscall->deadline->nsec == 100020000,
+                    "pselect deadline changed or auto-expired");
+            require(expire_pending_syscall(0, 1), "pselect explicit expiry failed");
+            if (!replay) {
+                tracee_state granted_select(0, state.si);
+                const auto granted_select_hash = granted_select.save(child);
+                tracee_state disk_granted_select(granted_select_hash);
+                disk_granted_select.recover_running_state(0, granted_select_hash);
+                require(state.threads[0].pending_syscall->phase == PendingPhase::Ready,
+                        "pselect Ready archive lost phase");
+            }
+            require(engine.execute_syscall(child, info) == 1 && info.nr == SYS_pselect6 && info.rval == 0,
+                    "pselect completion failed");
+            timespec remaining{};
+            require(guest_read_exact(child, &select_request, &remaining, sizeof(remaining)) &&
+                    !remaining.tv_sec && !remaining.tv_nsec, "pselect did not write back zero timeout");
+            require(ptrace(PTRACE_GETREGS, child, nullptr, &after) == 0 &&
+                    after.rip == regs.rip && after.rax == 0, "pselect completion executed user code");
+        }
+        require(engine.execute_syscall(child, info) == 1 && info.nr == SYS_getpid,
+                "pselect did not resume user execution after completion");
+        auto probe = [&](uint64_t nfds, uint64_t timeout, long expected) {
+            syscall_info call{};
+            call.nr = SYS_pselect6;
+            call.args[0] = nfds;
+            call.args[1] = call.args[2] = call.args[3] = 1;
+            call.args[4] = timeout;
+            start_pselect_timer(0, child, call);
+            require(static_cast<long>(call.rval) == expected && !state.threads[0].pending_syscall,
+                    "pselect immediate argument/error result mismatch");
+        };
+        probe(0, reinterpret_cast<uint64_t>(&zero), 0);
+        probe(-1, 1, -EFAULT);
+        probe(0, 1, -EFAULT);
+        probe(0, reinterpret_cast<uint64_t>(&invalid_timeout), -EINVAL);
+        probe(-1, reinterpret_cast<uint64_t>(&zero), -EINVAL);
+        timespec malformed{0, 1000000000};
+        require(guest_write_exact(child, &select_request, &malformed, sizeof(malformed)),
+                "write malformed pselect timeout");
+        probe(0, reinterpret_cast<uint64_t>(&select_request), -EINVAL);
+        for (int unsupported = 0; unsupported < 2; ++unsupported) {
+            syscall_info call{};
+            call.nr = SYS_pselect6;
+            call.args[0] = unsupported ? 0 : 1;
+            call.args[4] = reinterpret_cast<uint64_t>(&zero);
+            call.args[5] = unsupported ? 1 : 0;
+            bool rejected = false;
+            try { start_pselect_timer(0, child, call); }
+            catch (const std::runtime_error&) { rejected = true; }
+            require(rejected && !state.threads[0].pending_syscall,
+                    "unsupported pselect descriptors/mask accepted");
+        }
+        unsigned char control_before[4096]{}, control_after[4096]{};
+        require(guest_read_exact(child, reinterpret_cast<void*>(scratch_page),
+                                 control_before, sizeof(control_before)), "read control page before pselect");
+        for (uint64_t address : {scratch_page, scratch_page + 0xff0, scratch_page - 15,
+                                 scratch_page - 1, scratch_page + 4095}) {
+            syscall_info reserved{};
+            reserved.nr = SYS_pselect6;
+            reserved.args[4] = address;
+            user_regs_struct before_reserved{}, after_reserved{};
+            require(ptrace(PTRACE_GETREGS, child, nullptr, &before_reserved) == 0,
+                    "read registers before reserved pselect");
+            bool reserved_rejected = false;
+            try { start_pselect_timer(0, child, reserved); }
+            catch (const std::runtime_error&) { reserved_rejected = true; }
+            require(reserved_rejected && !state.threads[0].pending_syscall &&
+                    guest_read_exact(child, reinterpret_cast<void*>(scratch_page),
+                                     control_after, sizeof(control_after)) &&
+                    !memcmp(control_before, control_after, sizeof(control_before)) &&
+                    ptrace(PTRACE_GETREGS, child, nullptr, &after_reserved) == 0 &&
+                    !memcmp(&before_reserved, &after_reserved, sizeof(before_reserved)),
+                    "reserved pselect timeout did not reject without mutation");
+            auto malformed_reserved = select_wait;
+            malformed_reserved.threads[0].pending_syscall->args[4] = address;
+            reserved_rejected = false;
+            try { validate_pending_syscalls(malformed_reserved); }
+            catch (const std::runtime_error&) { reserved_rejected = true; }
+            require(reserved_rejected, "saved pselect timeout overlaps reserved control page");
+        }
+        for (uint64_t address : {scratch_page - sizeof(timespec), scratch_page + 4096}) {
+            auto adjacent_select = select_wait;
+            adjacent_select.threads[0].pending_syscall->args[4] = address;
+            validate_pending_syscalls(adjacent_select);
+        }
+        syscall_info readonly_call{};
+        readonly_call.nr = SYS_pselect6;
+        readonly_call.args[4] = reinterpret_cast<uint64_t>(readonly_timeout);
+        start_pselect_timer(0, child, readonly_call);
+        require(state.threads[0].pending_syscall &&
+                state.threads[0].pending_syscall->deadline, "readonly positive pselect must suspend");
+        ptmc_state.time[0].tv_usec += 20;
+        require(expire_pending_syscall(0, 1) && engine.execute_syscall(child, info) == 1 &&
+                info.rval == 0, "readonly timeout copyout fault changed success");
+        timespec preserved{};
+        require(guest_read_exact(child, readonly_timeout, &preserved, sizeof(preserved)) &&
+                preserved.tv_sec == 0 && preserved.tv_nsec == 20000,
+                "readonly pselect timeout was overwritten");
+        syscall_info forever{};
+        forever.nr = SYS_pselect6;
+        start_pselect_timer(0, child, forever);
+        require(state.threads[0].pending_syscall && !state.threads[0].pending_syscall->deadline &&
+                !expire_pending_syscall(0, 1), "NULL pselect timeout did not remain blocked");
+        state.si[0] = forever;
+        tracee_state infinite_select(0, state.si);
+        const auto infinite_hash = infinite_select.save(child);
+        tracee_state disk_infinite(infinite_hash);
+        disk_infinite.recover_running_state(0, infinite_hash);
+        require(state.threads[0].pending_syscall && !state.threads[0].pending_syscall->deadline &&
+                ptmc_state.thread_blocked[0][0], "untimed pselect archive lost permanent wait");
         kill(child, SIGKILL); waitpid(child, nullptr, 0); child = -1;
+        munmap(readonly_timeout, 4096);
         StateStore::instance().shutdown();
         std::filesystem::current_path(cwd);
         std::filesystem::remove_all(directory);
-        std::puts("PASS pending registration, wake, explicit completion, archive identity and repeated restore");
+        std::puts("PASS pending registration, wake, pselect timers, explicit completion, archive identity and repeated restore");
         return 0;
     } catch (const std::exception& error) {
         if (child > 0) { kill(child, SIGKILL); waitpid(child, nullptr, 0); }

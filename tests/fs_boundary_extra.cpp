@@ -18,6 +18,119 @@
 extern "C" detsim::ui::NCursesUI *get_ncurses_ui() { return nullptr; }
 #define CHECK(condition) do { if (!(condition)) throw std::runtime_error(#condition); } while (false)
 
+// Use the same absolute namespace on both sides so absolute link targets and
+// relative targets can share one native Linux oracle without rewriting bytes.
+static void check_symlink_walk(const std::filesystem::path& root)
+{
+  const auto base = root / "walk";
+  const std::string long_name(256, 'n');
+  std::filesystem::create_directories(base / "tree/deep");
+  std::ofstream(base / "file") << "root";
+  std::ofstream(base / std::string(255, 'n')) << "name boundary";
+  std::ofstream(base / "tree/file") << "target";
+  for (const auto& [name, target] : std::vector<std::pair<std::string,std::string>>{
+      {"long_target", long_name}, {"relative", "tree/file"}, {"absolute", (base / "tree/file").string()},
+      {"directory", "tree/deep"}, {"dangling", "tree/new"},
+      {"badparent", "absent/new"}, {"badtype", "file/new"},
+      {"cycle_a", "cycle_b"}, {"cycle_b", "cycle_a"},
+      {"target_slash", "tree/"}, {"missing_slash", "missing/"},
+      {"badparent_slash", "absent/missing/"}, {"up", "directory/../file"}}) {
+    CHECK(symlink(target.c_str(), (base / name).c_str()) == 0);
+  }
+  for (int count = 0; count <= 40; ++count) {
+    const std::string target = count == 40 ? "tree/file" : "hop" + std::to_string(count+1);
+    CHECK(symlink(target.c_str(), (base / ("hop" + std::to_string(count))).c_str()) == 0);
+  }
+  FileSystemState fs(std::make_shared<FdManager>());
+  fs.init_from_mappings({{base.string(), base.string()}});
+  const int host_dir = open(base.c_str(), O_RDONLY | O_DIRECTORY);
+  const int guest_dir = fs.do_open(base.string(), O_RDONLY | O_DIRECTORY, 0);
+  CHECK(host_dir >= 0 && guest_dir >= 0);
+  const std::vector<std::string> paths = {
+      std::string(255, 'n'), long_name, long_name + "/", "long_target", "long_target/child",
+      "absent/" + long_name, "file/" + long_name,
+      "relative", "absolute", "directory/../file", "up", "directory//../file",
+      "relative/..", "relative/", "directory/", "target_slash", "missing_slash", "badparent_slash", "dangling",
+      "badparent", "badtype", "cycle_a", "hop0", "hop1", "absent/../file",
+      "file/../file", "tree/./deep/../../file", "tree//deep/..", "missing/", "/"};
+  for (const auto& path : paths) {
+    for (bool follow : {true, false}) {
+      struct stat native{}, modeled{};
+      errno = 0;
+      const int result = fstatat(host_dir, path.c_str(), &native,
+                                follow ? 0 : AT_SYMLINK_NOFOLLOW);
+      const int expected = result < 0 ? -errno : 0;
+      const int actual = fs.do_stat(path[0] == '/' ? path : (base/path).string(), &modeled, follow);
+      CHECK(actual == expected);
+      if (!actual) CHECK((native.st_mode & S_IFMT) == (modeled.st_mode & S_IFMT));
+    }
+    for (int flags : {O_RDONLY, O_RDONLY|O_NOFOLLOW, O_RDONLY|O_DIRECTORY,
+                      O_RDONLY|O_DIRECTORY|O_NOFOLLOW, O_CREAT|O_EXCL|O_RDWR, O_CREAT|O_RDWR}) {
+      // Do not create oracle-only objects when testing missing paths.
+      if ((flags & O_CREAT) && !(flags & O_EXCL) && path == "dangling") continue;
+      errno = 0;
+      const int native = openat(host_dir, path.c_str(), flags, 0600);
+      const int expected = native < 0 ? -errno : 0;
+      const int actual = fs.do_openat(guest_dir, path, flags, 0600);
+      if ((actual < 0 ? actual : 0) != expected)
+        throw std::runtime_error("open oracle " + path + " flags=" + std::to_string(flags) +
+                                 " expected=" + std::to_string(expected) + " actual=" + std::to_string(actual));
+      if (native >= 0) CHECK(close(native) == 0);
+      if (actual >= 0) CHECK(fs.do_close(actual) == 0);
+    }
+    char native_link[4096]{}, modeled_link[4096]{};
+    errno = 0;
+    const ssize_t length = readlinkat(host_dir, path.c_str(), native_link, sizeof(native_link));
+    const long expected_link = length < 0 ? -errno : length;
+    std::string target;
+    const long link_error = fs.do_readlink(path[0] == '/' ? path : (base/path).string(), target);
+    const long actual_link = link_error ? link_error : static_cast<long>(target.size());
+    CHECK(actual_link == expected_link);
+    if (!link_error) {
+      memcpy(modeled_link, target.data(), target.size());
+      CHECK(memcmp(native_link, modeled_link, sizeof(native_link)) == 0);
+    }
+    for (int flags : {0, AT_SYMLINK_NOFOLLOW}) {
+      errno = 0;
+      const long native = syscall(SYS_faccessat2, host_dir, path.c_str(), F_OK, flags);
+      CHECK(fs.do_access(guest_dir, path, F_OK, flags) == (native < 0 ? -errno : 0));
+    }
+  }
+  CHECK(fs.do_openat(guest_dir, "missing_slash", O_CREAT|O_RDWR, 0600) == -EISDIR);
+  CHECK(fs.do_openat(guest_dir, "badparent_slash", O_CREAT|O_RDWR, 0600) == -ENOENT);
+  CHECK(fs.do_openat(guest_dir, "dangling", O_CREAT|O_EXCL|O_RDWR, 0600) == -EEXIST);
+  CHECK(fs.do_openat(guest_dir, "dangling", O_CREAT|O_RDWR|O_NOFOLLOW, 0600) == -ELOOP);
+  const int created = fs.do_openat(guest_dir, "dangling", O_CREAT|O_RDWR, 0600);
+  CHECK(created >= 0 && fs.open_files.at(created).path == (base / "tree/new").string());
+  CHECK(fs.do_write(created, "created", 7) == 7 && fs.do_close(created) == 0);
+  CHECK(S_ISLNK(fs.filesystem.at((base / "dangling").string()).metadata.st_mode));
+  CHECK(fs.do_chdir((base / "directory").string()) == 0);
+  CHECK(fs.get_cwd() == (base / "tree/deep").string());
+  const int relative = fs.do_open("../file", O_RDONLY, 0);
+  CHECK(relative >= 0 && fs.open_files.at(relative).path == (base / "tree/file").string());
+  CHECK(fs.do_close(relative) == 0);
+  // Archive and copied branches follow the same saved aliases after host removal.
+  std::stringstream bytes;
+  { cereal::BinaryOutputArchive archive(bytes); archive(fs); }
+  FileSystemState restored;
+  { cereal::BinaryInputArchive archive(bytes); archive(restored); }
+  restored.set_fd_manager(std::make_shared<FdManager>());
+  FileSystemState branch = restored;
+  branch.set_fd_manager(std::make_shared<FdManager>());
+  CHECK(close(host_dir) == 0);
+  std::filesystem::remove_all(base);
+  const int writer = branch.do_open((base / "relative").string(), O_RDWR, 0);
+  CHECK(writer >= 0 && branch.do_write(writer, "X", 1) == 1);
+  CHECK(branch.filesystem.at((base / "tree/file").string()).content[0] == 'X');
+  CHECK(restored.filesystem.at((base / "tree/file").string()).content[0] == 't');
+  std::string target;
+  CHECK(restored.do_readlink((base / "relative").string(), target) == 0 && target == "tree/file");
+  const int reader = restored.do_open((base / "absolute").string(), O_RDONLY, 0);
+  char content[6]{};
+  CHECK(reader >= 0 && restored.do_read(reader, content, sizeof(content)) == 6);
+  CHECK(std::string(content, sizeof(content)) == "target");
+}
+
 int main()
 {
   try
@@ -40,6 +153,7 @@ int main()
       ambiguous.capture_executable((root / "directory_alias/../regular").string());
     } catch (const std::runtime_error&) { dotdot_rejected = true; }
     CHECK(dotdot_rejected);
+    check_symlink_walk(root);
     // A mapping root is an object, not an implicitly manufactured directory.
     std::ofstream(root / ".hidden", std::ios::binary) << std::string("a\0b", 3);
     CHECK(chmod((root / "real").c_str(), 0711) == 0);
@@ -112,11 +226,10 @@ int main()
     CHECK(imported.do_stat("/fixture/link", &link_stat, false) == 0 && S_ISLNK(link_stat.st_mode));
     CHECK(imported.do_open("/fixture/link", O_RDONLY|O_NOFOLLOW, 0) == -ELOOP);
     CHECK(imported.do_open("/fixture/link", O_CREAT|O_EXCL|O_RDWR, 0) == -EEXIST);
-    for (const auto& path : {"/fixture/link", "/fixture/link/..", "/fixture/link/"}) {
-      bool rejected = false;
-      try { imported.do_stat(path, &link_stat); } catch (const std::runtime_error&) { rejected = true; }
-      CHECK(rejected);
-    }
+    // Native path walking oracles must resolve link bytes before a following .. .
+    CHECK(imported.do_stat("/fixture/link", &link_stat) == 0 && S_ISREG(link_stat.st_mode));
+    CHECK(imported.do_stat("/fixture/link/..", &link_stat) == -ENOTDIR);
+    CHECK(imported.do_stat("/fixture/link/", &link_stat) == -ENOTDIR);
     CHECK(imported.do_readlink("/absent/../fixture/link", target) == -ENOENT);
     CHECK(imported.do_readlink("/fixture/regular/../link", target) == -ENOTDIR);
     CHECK(imported.do_open("/fixture/regular", O_RDONLY, 0) >= 0);
@@ -130,6 +243,9 @@ int main()
     CHECK(executable.do_open(canonical, O_RDONLY|O_TRUNC, 0) == -ETXTBSY);
     CHECK(executable.do_open(canonical, O_CREAT|O_EXCL|O_WRONLY, 0600) == -EEXIST);
     CHECK(executable.do_open(canonical, O_RDONLY, 0) >= 0);
+    CHECK(executable.do_open("/proc/self/exe", O_WRONLY, 0) == -ETXTBSY);
+    CHECK(executable.do_open("/proc/self/exe", O_RDONLY|O_NOFOLLOW, 0) == -ELOOP);
+    CHECK(executable.do_open("/proc/self/exe", O_RDONLY, 0) >= 0);
     CHECK(open("/proc/self/exe", O_WRONLY) == -1 && errno == ETXTBSY);
     CHECK(open("/proc/self/exe", O_CREAT|O_EXCL|O_WRONLY, 0600) == -1 && errno == EEXIST);
     CHECK(S_ISLNK(executable.filesystem.at("/bin").metadata.st_mode));
@@ -217,11 +333,10 @@ int main()
           emu_vfs_accessat(-7, nullptr, F_OK, 0x40000000));
     CHECK(native_access(host_directory, nullptr, F_OK, 0) ==
           emu_vfs_accessat(directory, nullptr, F_OK, 0));
-    for (const auto& path : {"/fixture/link", "/fixture/dangling", "/fixture/link/../regular"}) {
-      bool rejected = false;
-      try { emu_vfs_accessat(AT_FDCWD, path, F_OK, 0); }
-      catch (const std::runtime_error&) { rejected = true; }
-      CHECK(rejected);
+    for (const auto& relative : {"dangling", "loop", "directory_alias/../regular",
+                                  "directory_alias/", "regular/", "real//deep/.."}) {
+      CHECK(native_access(host_directory, relative, F_OK, 0) ==
+            emu_vfs_accessat(directory, relative, F_OK, 0));
     }
     for (int mode : {R_OK, W_OK, X_OK, R_OK | W_OK | X_OK}) {
       bool rejected = false;

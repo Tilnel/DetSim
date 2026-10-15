@@ -1148,3 +1148,25 @@ and build/dfs-residency-red2. Python full/pages now reach217 with same2GiB cap:
 build/cases/run-r0hsdkcb/results.json. make check passes, Python compile/diffcheck
 pass, production NP1 build passes; independent architect review approves. Scope
 is this finite NP1 equivalence and replay, not arbitrary scheduling completeness.
+
+## Runtime iteration4: pselect and symlinks (2026-10-16)
+
+Zero-FD pselect timer reuses pending syscall state (no layout fields); positive
+wait/deadline, NULL infinite wait, explicit completion, native timeout-copy/error
+semantics and scratch protection. Captured-only symlink walker adds40-link and
+NAME_MAX bounds, canonical open/fstat, nofollow/O_EXCL and trailing creation rules.
+
+RED old syscall270 rejection and old symlink traversal rejection; review found
+scratch output risk and long-name behavior, each fixed with RED→GREEN regression.
+Root NP1 pending4variants,21native scenarios,12cases+runnernegative gates pass;
+NP2 IO/syscall policy pass; compiler syntax/warnings and diffcheck pass. Independent
+review approves both corrected slices. make check passes. Kernelv14, layout27/28.
+Runner's successful endpoint now replayed3x, with completion artifact; explicit
+memorylimit flag is reported rather than hidden budget changes.
+
+Audit build/cases/run-6m_rj7fv/results.json: Rust bothbackends complete+3xreplay;
+gccgo full4GiB/90s times out in progress, pages exposes fatal nanotimezero then
+blockedthreads; Java bothbackendsexit6 after libjvm dlopen (fileidentityhypothesis).
+No newruntimegreen exceptRust. Next generic fixes: initialvirtualclock profile,
+consistent file inode identity/getdents64, then actual next blockers. Logs:
+/tmp/detsim-iteration4-{final-np1,final-np2,runtime-audit,runner,check}.log.

@@ -618,7 +618,7 @@ COMPLETED, STOPPED or THREAD_EXITED events. Only COMPLETED has a valid return
 value. Fatal stops clear stale syscall metadata. StateView exposes nullable
 pending result/deadline; CLI history labels pending calls without printing a
 fictional return. ABI1 shared objects must be rebuilt and adapted to phases.
-Flat27/page28 and kernel modelv13 reject incompatible execution contexts.
+Flat27/page28 and kernel modelv14 reject incompatible execution contexts.
 
 Pending I/O keeps its numeric descriptor stable: close, F_SETFL and FIONBIO on a
 referenced FD reject before mutation, pending a true pinned-open-resource model.
@@ -685,3 +685,15 @@ Runtime cases explicitly capture Python stdlib and JDK lib/conf/release plus lin
 referents, recording input hashes. They check protocol outputs, not interpreter
 heap extraction. Java is conditional per user tradeoff: JVM-specific major work
 may remain a non-green research target instead of blocking other runtime cases.
+
+
+Zero-FD pselect6 is modeled as a captured pending timer: zero timeout completes,
+positive timeout freezes a deadline, NULL timeout waits indefinitely. Completion
+requires explicit expiry; it best-effort writes remaining zero timeout exactly as
+the raw ABI does. Descriptor multiplexing and temporary signal masks remain
+unsupported. Reserved control-page overlaps reject before mutation.
+
+Captured symlinks now resolve component by component with a40-link limit and
+NAME_MAX checking. Relative targets and dotdot preserve traversal order; open
+stores the resolved path. readlink/lstat and O_NOFOLLOW/O_EXCL retain their own
+final-component semantics. No host pathname lookup occurs during exploration.

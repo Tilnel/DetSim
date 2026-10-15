@@ -18,6 +18,7 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 ENV = {"LC_ALL": "C", "LANG": "C", "PYTHONHASHSEED": "0"}
+MODEL_ADDRESS_SPACE_LIMIT = 2 * 1024**3
 
 
 def digest(path):
@@ -26,7 +27,7 @@ def digest(path):
 
 def limits():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    resource.setrlimit(resource.RLIMIT_AS, (2 * 1024**3, 2 * 1024**3))
+    resource.setrlimit(resource.RLIMIT_AS, (MODEL_ADDRESS_SPACE_LIMIT, MODEL_ADDRESS_SPACE_LIMIT))
 
 
 def command(args, cwd, timeout=30):
@@ -214,8 +215,22 @@ def search(tracer, argv, plugin, directory, backend, timeout, *, bug=False, dept
             else:
                 terminal = session.send("si 0")
                 require("has exited with status 0" in terminal,"search finished but guest success not established")
-                row.update(status="pass",guest_exit=0,
+                edges = re.findall(r"([0-9a-f]{16}) => ([0-9a-f]{16})", history)
+                require(edges, "checked completion lacks predecessor edge")
+                predecessor, successor = edges[-1]
+                recipe = list(session.commands)
+                for _ in range(3):
+                    require("Loaded state" in session.send("load " + predecessor), "completion predecessor unavailable")
+                    replay = session.send("si 0")
+                    require("Reach illegal state" not in replay and session.current_hash() == successor,
+                            "completion replay changed outcome or identity")
+                    require("has exited with status 0" in session.send("si 0"), "completion replay did not exit zero")
+                row.update(status="pass",guest_exit=0,replay="same_process_hash_match_3x",
+                           predecessor=predecessor,completion=successor,
                            search="finite_fixture_exhausted" if depth is None else "bounded_guest_completed")
+                (directory / "completion.json").write_text(json.dumps({"commands": recipe,
+                    "predecessor": predecessor, "successor": successor, "replay_action": "si 0",
+                    "scope": "same tracee lifecycle; checked output/zero exit preserved"}, indent=2))
         return row
     except Exception as error:
         row.update(classify_error(error, session.log)); return row
@@ -437,16 +452,20 @@ def runtimes(args, out, cc, cxx):
 
 
 def main():
+    global MODEL_ADDRESS_SPACE_LIMIT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("inputs", "threads", "runtimes", "checks", "all"), default="inputs")
     parser.add_argument("--tracer", type=Path, default=ROOT / "tracer")
     parser.add_argument("--output", type=Path, default=ROOT / "build/cases")
     parser.add_argument("--backend", choices=("full", "pages", "both"), default="both")
     parser.add_argument("--languages", default="c,cpp,rust,go,python,java")
+    parser.add_argument("--memory-mb", type=int, default=2048, help="explicit tracer/tracee address-space limit")
     parser.add_argument("--timeout", type=float, default=20)
     parser.add_argument("--depth", type=int, default=100)
     args = parser.parse_args()
-    if args.timeout <= 0 or args.depth < 1: parser.error("positive timeout and depth required")
+    if args.timeout <= 0 or args.depth < 1 or args.memory_mb < 1:
+        parser.error("positive timeout, depth and memory limit required")
+    MODEL_ADDRESS_SPACE_LIMIT = args.memory_mb * 1024**2
     args.tracer = args.tracer.resolve(); require(args.tracer.is_file(), "build NP=1 tracer first")
     args.backends = ("full", "pages") if args.backend == "both" else (args.backend,)
     import tempfile
@@ -456,7 +475,7 @@ def main():
     report = {"git_head_at_run": command(["git","rev-parse","HEAD"],ROOT).stdout.strip(),
               "product_diff_sha256": hashlib.sha256(command(["git","diff","--","src"],ROOT).stdout.encode()).hexdigest(),
               "tracer": str(args.tracer), "tracer_sha256": digest(args.tracer), "environment": ENV,
-              "depth": args.depth, "session_timeout_s": args.timeout, "tracer_address_space_limit_bytes": 2*1024**3,
+              "depth": args.depth, "session_timeout_s": args.timeout, "tracer_address_space_limit_bytes": MODEL_ADDRESS_SPACE_LIMIT,
               "scope": "fixed NP1 profile; bounded runtime search is not a safety proof", "cases": []}
     try:
         if args.mode in ("inputs", "checks", "all"): report["cases"] += inputs(args, out, cc, cxx)

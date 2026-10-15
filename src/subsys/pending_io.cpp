@@ -185,3 +185,37 @@ void close_process_io(int node) {
   for (const int fd : descriptors)
     if (emu_close(fd) != 0) throw std::runtime_error("Virtual descriptor close failed during process exit");
 }
+
+void start_pselect_timer(int node, pid_t tid, syscall_info& call) {
+  // pselect6 imports its optional mask wrapper before inspecting the timeout.
+  // Temporary signal masks and descriptor multiplexing have no model yet.
+  if (call.args[5]) throw std::runtime_error("Unsupported pselect6 signal mask");
+  if (call.args[4] < scratch_page + 4096 && call.args[4] > scratch_page - sizeof(timespec))
+    throw std::runtime_error("pselect6 timeout overlaps reserved control memory");
+  timespec timeout{};
+  long result = 0;
+  if (call.args[4] && !guest_read_exact(tid, reinterpret_cast<void*>(call.args[4]),
+                                       &timeout, sizeof(timeout))) result = -EFAULT;
+  else if (timeout.tv_sec < 0 || timeout.tv_nsec < 0 || timeout.tv_nsec >= 1000000000)
+    result = -EINVAL;
+  else if (static_cast<int>(call.args[0]) < 0) result = -EINVAL;
+  else if (static_cast<int>(call.args[0]) != 0)
+    throw std::runtime_error("Unsupported pselect6 descriptor multiplexing");
+  if (result || (call.args[4] && !timeout.tv_sec && !timeout.tv_nsec)) {
+    call.rval = result;
+    tracee_set_rax(tid, call.rval);
+    return;
+  }
+  // nfds=0 ignores all three descriptor pointers, including invalid addresses.
+  suspend_syscall(node, tid, call, PendingReason::Timer);
+  if (!call.args[4]) return; // Infinite sleep; only explicit external grant can finish it.
+  const auto deadline = make_pending_deadline(node, CLOCK_MONOTONIC,
+      timeout.tv_sec, timeout.tv_nsec, true, 0);
+  for (const auto& thread : ptmc_state.running_state.child[node].threads) {
+    if (thread.alive && thread.physical_tid == tid) {
+      set_pending_deadline(node, thread.tid, deadline);
+      return;
+    }
+  }
+  throw std::runtime_error("Pending pselect6 has no live bound actor");
+}

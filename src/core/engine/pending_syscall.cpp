@@ -170,6 +170,13 @@ bool complete_pending_syscall(int node, pid_t physical_tid, syscall_info& info)
         }
     } else {
         info.rval = static_cast<uint64_t>(pending.result);
+        if (pending.nr == SYS_pselect6 && pending.result == 0 && pending.args[4]) {
+            // Linux raw pselect6 writes remaining time back best-effort: even a
+            // readable but read-only timeout returns success when copyout fails.
+            const timespec remaining{};
+            (void)guest_write_exact(physical_tid, reinterpret_cast<void*>(pending.args[4]),
+                                    &remaining, sizeof(remaining));
+        }
     }
     tracee_set_rax(physical_tid, info.rval);
     thread.pending_syscall.reset();
@@ -238,9 +245,18 @@ void validate_pending_syscalls(const tracee_state& state)
             (pending.nr != SYS_futex || pending.phase == PendingPhase::Retry))
             throw std::runtime_error("Invalid unfinished futex syscall");
         if (pending.reason == PendingReason::Timer &&
-            ((pending.nr != SYS_nanosleep && pending.nr != SYS_clock_nanosleep) ||
-             pending.phase == PendingPhase::Retry || !pending.deadline))
+            ((pending.nr != SYS_nanosleep && pending.nr != SYS_clock_nanosleep && pending.nr != SYS_pselect6) ||
+             pending.phase == PendingPhase::Retry ||
+             (!pending.deadline && pending.nr != SYS_pselect6)))
             throw std::runtime_error("Invalid pending timer syscall");
+        if (pending.nr == SYS_pselect6 &&
+            (pending.reason != PendingReason::Timer || static_cast<int>(pending.args[0]) != 0 ||
+             pending.args[5] || pending.deadline.has_value() != bool(pending.args[4]) ||
+             (pending.args[4] < scratch_page + 4096 &&
+              pending.args[4] > scratch_page - sizeof(timespec)) ||
+             (pending.deadline && (pending.deadline->clock_id != CLOCK_MONOTONIC ||
+                                   pending.deadline->timeout_result != 0))))
+            throw std::runtime_error("Invalid pending pselect6 timer");
         if (pending.reason == PendingReason::Io && !supports_pending_io(pending.nr))
             throw std::runtime_error("Unsupported unfinished I/O syscall");
         if (pending.deadline) {

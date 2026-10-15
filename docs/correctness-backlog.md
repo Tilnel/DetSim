@@ -428,3 +428,23 @@ branches; file-mutation and terminal edges each replay three times with identica
 hash. Existing DFS searched82 vs BFS81 reporting discrepancy remains unchanged;
 actual event multisets match. Real Python now advances to getdents64(217) in both
 backends without the former allocation failure. C03/C25 remain open.
+
+### Timed pselect and captured path traversal
+
+Zero-descriptor pselect6 uses existing Waiting/Ready/deadline state, including
+NULL infinite wait and best-effort timeout copyout; fd multiplexing and temporary
+sigmasks remain unsupported. Native oracles verify timeout validation priority,
+ignored fdset pointers at nfds0 and readonly timeout behavior. Control-page overlap
+is rejected at admission and archive validation. No automatic timer expiry added.
+
+Captured symlink traversal now follows at most40 links, checksNAME_MAX, preserves
+relative/dotdot/trailing-slash semantics, canonicalizes open descriptions, and
+honors nofollow/exclusive creation. Native stat/open/access/readlink matrices plus
+archive/host-unlink/branch tests pass. Kernelv14, unchanged layouts27/28.
+
+Rust now has checked endpoint3x replay. gccgo actual history exposes fatal
+nanotime returning zero before both threads wait; the model's zero clock origin
+needs an explicit generic profile decision.4GiB full run avoids earlierallocation
+failure but hits90s bound, not successful admission. Java reaches dlopen(libjvm)
+then exits6 with undefined JNI_CreateJavaVM; zero virtual inode metadata is the
+next concrete hypothesis. Neither result is counted green.

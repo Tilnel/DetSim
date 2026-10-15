@@ -569,6 +569,8 @@ int handle(pid_t pid, syscall_info &info) {
     switch (info.nr) {
         case SYS_gettimeofday:    return handle_gettimeofday(pid, info);
         case SYS_nanosleep:       return handle_nanosleep(pid, info);
+        case SYS_pselect6:
+            start_pselect_timer(ptmc_state.cursor,pid,info); return CKPT_YES;
         case SYS_clock_nanosleep: return handle_clock_nanosleep(pid, info);
         default:                  return CKPT_NO;
     }

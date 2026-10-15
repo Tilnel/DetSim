@@ -172,6 +172,7 @@ class FileSystemState
   // --- Syscall Implementations ---
   // These will be implemented in fsstate.cpp
   int do_open(const std::string &path, int flags, mode_t mode);
+  int do_openat(int dirfd, const std::string &path, int flags, mode_t mode);
   ssize_t do_read(int fd, void *buf, size_t count);
   ssize_t do_write(int fd, const void *buf, size_t count);
   int do_close(int fd);
@@ -189,7 +190,8 @@ class FileSystemState
   // Resolve a pathname according to dirfd and cwd. Returns an absolute VFS
   // path.
   std::string resolve_path(int dirfd, const std::string &path);
-  int resolve_path_checked(int dirfd, const std::string& path, std::string& result, bool follow_final = true, bool check_search = false);
+  // Captured-only walk; a missing final component is returned for O_CREAT.
+  int resolve_path_checked(int dirfd, const std::string& path, std::string& result, bool follow_final = true, bool check_search = false, bool creating = false);
 
   // Set/get cwd
   void set_cwd(const std::string &path);

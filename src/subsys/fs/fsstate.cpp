@@ -178,6 +178,7 @@ void FileSystemState::serialize(Archive &ar)
 
 FileSystemState::FileSystemState() : cwd(""), fd_manager_()
 {
+  ensure_dir_exists("/");
   // Embedded NUL keys cannot be named by a guest pathname.
   for (int fd = 0; fd < 3; ++fd)
   {
@@ -448,7 +449,7 @@ std::string FileSystemState::resolve_path(int dirfd, const std::string &path)
   return out;
 }
 
-int FileSystemState::resolve_path_checked(int dirfd, const std::string& path, std::string& result, bool follow_final, bool check_search)
+int FileSystemState::resolve_path_checked(int dirfd, const std::string& path, std::string& result, bool follow_final, bool check_search, bool creating)
 {
   if (path.empty()) return -ENOENT;
   if (path[0]!='/' && dirfd!=AT_FDCWD) {
@@ -459,45 +460,81 @@ int FileSystemState::resolve_path_checked(int dirfd, const std::string& path, st
     if (node==filesystem.end()) throw std::runtime_error("Directory descriptor has no payload");
     if (!S_ISDIR(node->second.metadata.st_mode)) return -ENOTDIR;
   }
-  // Inspect components before lexical normalization: link/.. still traverses a
-  // link in Linux. Unsupported traversal must not accidentally resolve elsewhere.
+  // Resolve one component at a time. In particular, link/.. walks the target
+  // before interpreting ..; normalizing the input first changes Linux behavior.
   std::string current = path[0]=='/' ? "/" :
-      (dirfd==AT_FDCWD ? cwd : open_files.at(dirfd).path);
-  size_t position = 0;
-  while (position < path.size()) {
-    while (position < path.size() && path[position]=='/') ++position;
-    const size_t end = path.find('/', position);
-    const std::string part = path.substr(position, end-position);
-    if (part.empty()) break;
-    if (check_search) {
-      const auto parent = filesystem.find(current);
-      if (parent == filesystem.end()) return -ENOENT;
-      if (!S_ISDIR(parent->second.metadata.st_mode)) return -ENOTDIR;
-      if ((parent->second.metadata.st_mode & 0111) != 0111)
-        throw std::runtime_error("VFS search permission requires captured credentials: " + current);
+      (dirfd==AT_FDCWD ? (cwd.empty() ? "/" : cwd) : open_files.at(dirfd).path);
+  std::deque<std::string> pending;
+  auto prepend = [&](const std::string& value) {
+    std::deque<std::string> parts;
+    size_t position = 0;
+    while (position < value.size()) {
+      const size_t end = value.find('/', position);
+      if (end != position) parts.push_back(value.substr(position, end-position));
+      if (end == std::string::npos) break;
+      position = end + 1;
     }
-    current = resolve_path(AT_FDCWD, join_paths(current, part));
-    const auto node = filesystem.find(current);
-    const bool final = end == std::string::npos;
-    if (!final && node == filesystem.end()) return -ENOENT;
+    // A slash after the final component still requires a directory and follows
+    // a final symlink, even for lstat/readlink/O_NOFOLLOW.
+    if (!value.empty() && value.back() == '/' && pending.empty()) parts.push_back("");
+    pending.insert(pending.begin(), parts.begin(), parts.end());
+  };
+  prepend(path);
+  unsigned links = 0;
+  while (!pending.empty()) {
+    const auto parent = filesystem.find(current);
+    if (parent == filesystem.end()) return -ENOENT;
+    if (!S_ISDIR(parent->second.metadata.st_mode)) return -ENOTDIR;
+    if (check_search && (parent->second.metadata.st_mode & 0111) != 0111)
+      throw std::runtime_error("VFS search permission requires captured credentials: " + current);
+    // On open(O_CREAT), a final name followed by / fails after searching
+    // its parent, even if that name is a missing file or a looping link.
+    if (creating && pending.size() == 2 && pending.back().empty()) return -EISDIR;
+    const std::string part = pending.front();
+    pending.pop_front();
+    // The virtual Linux namespace uses the fixed Linux NAME_MAX.
+    // Check after reaching the parent, including components from link bytes.
+    if (part.size() > NAME_MAX) return -ENAMETOOLONG;
+    if (part.empty() || part == ".") continue;
+    if (part == "..") {
+      const size_t slash = current.find_last_of('/');
+      current = slash == 0 ? "/" : current.substr(0, slash);
+      continue;
+    }
+    const std::string next = join_paths(current, part);
+    const auto node = filesystem.find(next);
     if (node != filesystem.end() && S_ISLNK(node->second.metadata.st_mode) &&
-        (!final || follow_final))
-      throw std::runtime_error("Virtual symlink traversal is not modeled: " + current);
-    if (!final && !S_ISDIR(node->second.metadata.st_mode)) return -ENOTDIR;
-    if (end == std::string::npos) break;
-    position = end + 1;
+        (!pending.empty() || follow_final)) {
+      if (++links > 40) return -ELOOP;
+      const auto& bytes = node->second.content;
+      const std::string target(bytes.begin(), bytes.end());
+      if (target.empty()) return -ENOENT;
+      if (target.find('\0') != std::string::npos)
+        throw std::runtime_error("Captured symlink contains a null byte: " + next);
+      if (target[0] == '/') current = "/";
+      prepend(target);
+      continue;
+    }
+    current = next;
   }
-  result=resolve_path(dirfd,path);
+  result = current;
   return 0;
 }
 
 int FileSystemState::do_open(const std::string &path, int flags, mode_t mode)
 {
+  return do_openat(AT_FDCWD, path, flags, mode);
+}
+
+int FileSystemState::do_openat(int dirfd, const std::string &input, int flags, mode_t mode)
+{
+  std::string path = input;
   if (path.empty())
     return -ENOENT;
   if (path.find('\0') != std::string::npos)
     return -EINVAL;
-  if ((flags & O_ACCMODE) == O_ACCMODE)
+  if ((flags & O_ACCMODE) == O_ACCMODE ||
+      ((flags & O_CREAT) && (flags & O_DIRECTORY)))
     return -EINVAL;
   if ((flags & (O_ASYNC | O_DIRECT | O_NOATIME | O_PATH)) ||
       (flags & O_TMPFILE) == O_TMPFILE)
@@ -505,28 +542,28 @@ int FileSystemState::do_open(const std::string &path, int flags, mode_t mode)
   if (!fd_manager_)
     return -EMFILE;
   std::string checked;
-  const int path_error = resolve_path_checked(AT_FDCWD, path, checked, false);
+  const bool exclusive = (flags & O_CREAT) && (flags & O_EXCL);
+  const int path_error = resolve_path_checked(dirfd, path, checked,
+                                              !exclusive && !(flags & O_NOFOLLOW), false, flags & O_CREAT);
   if (path_error) return path_error;
-  if (checked == "/proc/self" && (flags & O_NOFOLLOW))
+  path = checked;
+  if (path == "/proc/self" && (flags & O_NOFOLLOW))
     throw std::runtime_error("Virtual proc self nofollow open is not modeled");
   auto it = filesystem.find(path);
   if (it != filesystem.end() && S_ISLNK(it->second.metadata.st_mode)) {
-    if ((flags & O_CREAT) && (flags & O_EXCL)) return -EEXIST;
-    if (flags & O_NOFOLLOW) return -ELOOP;
-    throw std::runtime_error("Virtual symlink traversal is not modeled: " + path);
+    if (exclusive) return -EEXIST;
+    return (flags & O_DIRECTORY) ? -ENOTDIR : -ELOOP;
   }
   bool exists = (it != filesystem.end());
 
   if (exists)
   {
+    if (exclusive) return -EEXIST;
     if ((flags & O_DIRECTORY) && !S_ISDIR(it->second.metadata.st_mode))
       return -ENOTDIR;
-    if (S_ISDIR(it->second.metadata.st_mode) && (flags & O_ACCMODE) != O_RDONLY)
+    if (S_ISDIR(it->second.metadata.st_mode) &&
+        ((flags & O_CREAT) || (flags & O_ACCMODE) != O_RDONLY))
       return -EISDIR;
-    if ((flags & O_CREAT) && (flags & O_EXCL))
-    {
-      return -EEXIST;
-    }
   }
   else
   {
@@ -708,6 +745,18 @@ off_t FileSystemState::do_lseek(int fd, off_t offset, int whence)
   return new_offset;
 }
 
+static void copy_vfs_stat(const VFSNode& node, struct stat* statbuf)
+{
+#ifdef FSSTATE_DETAILED_METADATA
+  memcpy(statbuf, &node.metadata, sizeof(struct stat));
+#else
+  // Minimal mode: only fill size and mode, zero out the rest
+  memset(statbuf, 0, sizeof(struct stat));
+  statbuf->st_size = node.metadata.st_size;
+  statbuf->st_mode = node.metadata.st_mode;
+#endif
+}
+
 int FileSystemState::do_stat(const std::string &path, struct stat *statbuf, bool follow)
 {
   std::string checked;
@@ -715,20 +764,13 @@ int FileSystemState::do_stat(const std::string &path, struct stat *statbuf, bool
   if (path_error) return path_error;
   if (!follow && checked == "/proc/self")
     throw std::runtime_error("Virtual proc self link metadata is not modeled");
-  auto it = filesystem.find(path);
+  auto it = filesystem.find(checked);
   if (it == filesystem.end())
   {
     return -ENOENT;
   }
 
-#ifdef FSSTATE_DETAILED_METADATA
-  memcpy(statbuf, &it->second.metadata, sizeof(struct stat));
-#else
-  // Minimal mode: only fill size and mode, zero out the rest
-  memset(statbuf, 0, sizeof(struct stat));
-  statbuf->st_size = it->second.metadata.st_size;
-  statbuf->st_mode = it->second.metadata.st_mode;
-#endif
+  copy_vfs_stat(it->second, statbuf);
   return 0;
 }
 
@@ -742,7 +784,13 @@ int FileSystemState::do_fstat(int fd, struct stat *statbuf)
 
   if (!fd_manager_ || !fd_manager_->is_allocated(fd))
     return -EBADF;
-  return do_stat(it->second.path, statbuf);
+  // Descriptions already name the opened object, including unnameable stdio
+  // payloads. fstat must not perform a pathname walk or follow a later alias.
+  const auto node = filesystem.find(it->second.path);
+  if (node == filesystem.end())
+    throw std::runtime_error("Open descriptor has no captured payload");
+  copy_vfs_stat(node->second, statbuf);
+  return 0;
 }
 
 int FileSystemState::do_chdir(const std::string &path)
@@ -801,10 +849,7 @@ long emu_vfs_openat(int dirfd, const char *path_ptr, int flags, mode_t mode)
   if (copied < 0)
     return copied;
   auto& fs=ptmc_state.fs_states[ptmc_state.cursor];
-  std::string resolved;
-  const int error=fs.resolve_path_checked(dirfd,path,resolved,false);
-  if (error) return error;
-  return fs.do_open(resolved,flags,mode);
+  return fs.do_openat(dirfd,path,flags,mode);
 }
 
 long emu_vfs_lseek(int fd, off_t offset, int whence)
@@ -1161,7 +1206,7 @@ void FileSystemState::capture_executable(const std::string& executable)
     const bool link = S_ISLNK(metadata.st_mode);
     const std::string target(node.content.begin(), link ? node.content.end() : node.content.begin());
     // Capture ancestors, without flattening host directory symlinks into fake
-    // directories. Traversing those links remains explicitly unsupported.
+    // directories. Modeled traversal uses only these captured link bytes.
     fs::path prefix;
     for (const auto& component : fs::path(path).parent_path()) {
       prefix /= component;

@@ -115,6 +115,7 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         // Time syscalls - emulated
         case SYS_gettimeofday:
         case SYS_nanosleep:
+        case SYS_pselect6:
         case SYS_clock_nanosleep:
         case SYS_clock_gettime:
         case SYS_clock_getres:
@@ -164,7 +165,7 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         case SYS_preadv: case SYS_pwritev: case SYS_preadv2: case SYS_pwritev2:
         case SYS_sendmsg: case SYS_recvmsg: case SYS_sendmmsg: case SYS_recvmmsg:
         case SYS_socketpair: case SYS_shutdown:
-        case SYS_ppoll: case SYS_select: case SYS_pselect6:
+        case SYS_ppoll: case SYS_select:
         case SYS_sendfile: case SYS_splice: case SYS_tee: case SYS_vmsplice: case SYS_copy_file_range:
         case SYS_getdents: case SYS_getdents64: case SYS_ftruncate:
         case SYS_fchdir: case SYS_flock: case SYS_sync: case SYS_syncfs:
@@ -418,6 +419,7 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
         // Time syscalls
         case SYS_gettimeofday:
         case SYS_nanosleep:
+        case SYS_pselect6:
         case SYS_clock_nanosleep:
             return handle_time_exit(pid, info);
 
