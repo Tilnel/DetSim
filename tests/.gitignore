@@ -131,3 +131,5 @@
 !raft_case_runner_test.py
 
 !concurrency_case_runner_test.py
+
+!redisraft_case_runner_test.py

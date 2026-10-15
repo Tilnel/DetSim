@@ -595,3 +595,28 @@ matrix acceptance and per-combination failure recording now pass7 negative tests
 Existing12actual rows were revalidated without altering evidence. This is bounded
 case capability, not full language/runtime or exhaustive interleaving support.
 Go gc/gccgo concurrency and OpenJDK conditional target remain separately pending.
+
+
+### RedisLabs library paired case
+
+The independent RedisLabs Raft-library fixture preserves real pre-vote and entry
+reference ownership. Its single copied-source change removes only the actual
+vote-grant guard. Native and actual NP3 full/pages pairs pass. Healthy all nodes
+commit/apply no-op1 and exact normal commands2/3; bounded suffix70visits/45unique
+from positive budget1. Mutants find the intended term1 dual leader on an actual
+denied vote and reproduce predecessor→successor3x, with exact diagnostic and
+prevote/request-term fields required. Evidence:
+build/redisraft-library-cases/run-julvrjq0/result.json. Independent review approves;
+four permanent negative acceptance tests cover unrelated failures and invalid
+roles/terms/receipts. No vendor changes. Both library pairs are implemented;
+the real Redis+RedisRaft module remains a separate unfinished target.
+
+Real module prerequisite progress: acquired official RedisRaft ade4aa8e and
+unmodified Redis7.4.2 a0a6f23d into ignored owned build trees. The existing local
+Redis is a modified static PIE and crashes natively in module pthread_create;
+that is not a DetSim failure. Separately built dynamic Redis plus module passes
+native three-node INIT/JOIN/SET and GET via legitimate redirects. Model bootstrap
+admits all three but first controlled search explicitly rejects prctl157:
+PR_CAPBSET_READ; native tracing also identifies worker PR_SET_NAME. Captured
+capability-query and per-thread name semantics are the next generic requirement,
+not a workload-specific state-extraction patch.

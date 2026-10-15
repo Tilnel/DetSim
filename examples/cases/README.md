@@ -170,3 +170,22 @@ Rust健康45状态，遗漏/重复各41；Python健康410、遗漏390、重复39
 动态扩展触发SIGBUS-backed映射拒绝，两个后端非绿色，未删除失败证据。
 驱动仅在请求矩阵完整、唯一、全部通过时报告成功；七项负向回归覆盖原生超时、
 Session创建异常和退出码，避免前几项成功掩盖后续缺行。
+
+
+### RedisLabs Raft 库：保留 pre-vote 的独立案例
+
+```sh
+# 使用NP=3 tracer；与真实RedisRaft模块明确分开
+python3 examples/cases/redisraft_run.py --tracer ./tracer --depth 4 --timeout 180
+python3 tests/redisraft_case_runner_test.py
+```
+
+保留库本身的pre-vote、candidate/term检查和引用计数entry。一次复制构建mutation
+只去掉正式vote回复的grant检查。原生对照建立A/C拒B的真实正式投票回复；
+模型DFS发现B误计拒票，与A成为term1双leader。full/pages均匹配精确诊断、角色、
+任期、prevote=0、request_term=1及拒票内容，并三次重放同一违例边。
+
+健康版三节点commit/applied=3，逐字节检查保存日志：no-op加两条不同NORMAL命令。
+两后端从预算1出发各搜索70次/45unique；mutant分别4/5次访问发现目标反例。
+这些是受控选举前缀及深度4/错误预算限制下的案例，不是完整RedisRaft或一般共识
+安全证明。搜索顺序保留现有时间种子，报告实际种子候选范围及全部命令/哈希。

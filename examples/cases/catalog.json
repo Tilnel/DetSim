@@ -67,16 +67,18 @@
       "mutation": "omit or duplicate task1",
       "scope": "native plus full/pages search and3x endpoint/counterexample replay under existing actor policy",
       "unsupported_variant": "CPython Queue/_queue remains non-green due SIGBUS-backed file mapping"
+    },
+    {
+      "id": "redisraft-library",
+      "path": "examples/cases/redisraft_fixture.c",
+      "processes": 3,
+      "command": "python3 examples/cases/redisraft_run.py --tracer ./tracer --depth 4 --timeout 180",
+      "status": "native healthy/mutant and actual full/pages search+3x replay pass",
+      "property": "exact committed command bytes and one logical leader per term",
+      "scope": "NP3 real pre-vote/election prefix, no-op plus2normalcommands, no compaction, bounded depth/errorbudget"
     }
   ],
   "next_targets": [
-    {
-      "id": "redisraft-library",
-      "path": "examples/redisraft/raft/raft",
-      "processes": 3,
-      "command": "make benchmark-redisraft CC=/usr/bin/gcc CXX=/usr/bin/g++",
-      "status": "existing bounded library-driver exploration; not a claim about full Redis plus RedisRaft module"
-    },
     {
       "id": "redisraft-full",
       "processes": 3,
