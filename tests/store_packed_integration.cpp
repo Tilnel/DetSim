@@ -90,6 +90,14 @@ int main(int argc, char **argv)
   try
   {
     s.init(c);
+    {
+      const std::vector<uint8_t> sparse(8 * 1024 * 1024, 0);
+      const auto compressed = s.compress(sparse);
+      require(compressed.capacity() == compressed.size(),
+              "compressed buffers retain raw-sized allocation beyond cache accounting");
+      require(s.decompress(compressed, sparse.size()) == sparse,
+              "tight compressed buffer preserves every decoded byte");
+    }
     std::vector<uint8_t> a(4096, 42), out;
     short_io = true;
     require(s.save(a.data(), a.size(), 101) == 101, "save raw");

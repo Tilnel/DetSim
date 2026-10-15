@@ -410,8 +410,9 @@ StateStorePacked::compress(const std::vector<uint8_t> &data)
                         data.size(), compression_level_.load());
   if (ZSTD_isError(n))
     fail("compression failed");
-  result.resize(n);
-  return result;
+  // Cache budgets count encoded bytes. resize() alone retains compressBound
+  // capacity, letting a tiny compressed frame pin an entire raw snapshot.
+  return std::vector<uint8_t>(result.begin(), result.begin() + n);
 }
 std::vector<uint8_t>
 StateStorePacked::decompress(const std::vector<uint8_t> &data, size_t size)
