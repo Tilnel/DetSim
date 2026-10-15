@@ -159,7 +159,7 @@ ExecResult ExecutionEngine::execute_step(const sys_state& state, syscall_info& i
     }
 
     // Sync thread manager from saved state
-    tm->sync_from_tracee_state(state.child[tracee_idx]);
+    tm->sync_from_tracee_state(ptmc_state.running_state.child[tracee_idx]);
 
     // Update thread blocked status from ptmc_state.thread_blocked
     for (int i = 0; i < static_cast<int>(tm->thread_count()); i++) {

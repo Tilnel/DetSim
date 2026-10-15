@@ -4,6 +4,8 @@
 
 #include "state.h"
 #include "xstate.h"
+#include "../engine/thread_control.h"
+#include <poll.h>
 #include "soft_dirty_experiment.h"
 #include "page_capture.h"
 #include "page_restore_stats.h"
@@ -146,13 +148,18 @@ sys_state::sys_state(const struct syscall_info info[][MAX_THREADS_PER_PROCESS],
   property_failed = context.property_failed;
   monitor_states = context.monitor_states;
   model_identity = context.model_identity;
+  // The product snapshot is one stopped cut: check every node before the
+  // first injected brk query or memory read in any node.
   for (int j = 0; j < NP; ++j) {
     child[j] = tracee_state(j, info[j]);
+    child[j].prepare_capture(ptmc_state.pids[j]);
+  }
+  for (int j = 0; j < NP; ++j) {
     status[j] = ptmc_state.status[j];
     const hash_type comparison_hash = !force_full && restored_source &&
         j != ptmc_state.cursor && DISALIVE(status[j]) &&
         DISALIVE(restored_source->status[j]) ? restored_source->ts_hash[j] : 0;
-    ts_hash[j] = child[j].save(ptmc_state.pids[j], comparison_hash);
+    ts_hash[j] = child[j].save_stopped(ptmc_state.pids[j], comparison_hash);
     if (!ts_hash[j]) throw std::runtime_error("Failed to capture tracee state");
   }
   ss_hash = identity_hash();
@@ -562,64 +569,156 @@ void tracee_state::recover_mem_reg_snapshot(std::vector<maps_item> &maps,
 
 /* Main entry: recover running state for a process */
 /* Helper: Restore registers for all threads during recovery */
-void tracee_state::restore_thread_registers(pid_t main_pid) const
+void tracee_state::restore_thread_registers(pid_t /*main_pid*/) const
 {
-  auto current_threads = get_thread_list(main_pid);
-
-  for (const auto& target_ts : threads) {
-    // Skip exited threads
-    if (target_ts.physical_tid == 0) {
-      continue;
-    }
-
-    // Find the current physical thread that corresponds to this saved thread
-    pid_t physical_tid = -1;
-
-    // First try to match by stored physical_tid
-    for (pid_t current_tid : current_threads) {
-      if (current_tid == target_ts.physical_tid) {
-        physical_tid = current_tid;
-        break;
-      }
-    }
-
-    if (physical_tid > 0) {
-      // Restore registers for this thread
-      if (ptrace(PTRACE_SETREGS, physical_tid, NULL, (void*)&target_ts.regs) == 0) {
-        restore_xstate(physical_tid, target_ts.xstate);
-        LOG_TRACE("Restored registers for virtual thread %d (physical %d)",
-                  target_ts.tid, physical_tid);
-      } else {
-        throw std::runtime_error("Cannot restore thread registers");
-      }
-    } else {
-      throw std::runtime_error("Cannot find physical thread for register restore");
-    }
+  // The enclosing restore has verified the entire physical set remains stopped.
+  for (const auto& thread : threads) {
+    if (!thread.alive) continue;
+    if (ptrace(PTRACE_SETREGS, thread.physical_tid, nullptr, &thread.regs) == -1)
+      throw std::runtime_error("Cannot restore thread registers");
+    restore_xstate(thread.physical_tid, thread.xstate);
   }
 }
 
-static void validate_parked_threads(const tracee_state& state, int index)
+namespace {
+struct ThreadBindingSlot {
+  pid_t tid;
+  pid_t physical_tid;
+  bool alive;
+};
+using ThreadBindingLayout = std::vector<ThreadBindingSlot>;
+struct ProcessBindingOwner {
+  int fd;
+  pid_t pid;
+  std::vector<std::weak_ptr<const ThreadBindingLayout>> layouts;
+  ~ProcessBindingOwner() { close(fd); }
+};
+struct SnapshotThreadBinding {
+  std::shared_ptr<ProcessBindingOwner> owner;
+  std::shared_ptr<const ThreadBindingLayout> threads;
+};
+std::map<std::pair<int, hash_type>, SnapshotThreadBinding> snapshot_thread_bindings;
+std::map<pid_t, std::weak_ptr<ProcessBindingOwner>> process_owners;
+
+bool same_layout(const ThreadBindingLayout& layout, const tracee_state& state)
 {
-  const auto current_threads = get_thread_list(ptmc_state.pids[index]);
-  std::set<pid_t> live(current_threads.begin(), current_threads.end());
-  std::set<pid_t> saved;
-  for (const auto& thread : state.threads)
-    if (thread.physical_tid) saved.insert(thread.physical_tid);
-  if (live.empty() || live != saved)
-    throw std::runtime_error("Unsupported snapshot restore across thread creation or exit");
-  for (pid_t tid : saved) {
-    user_regs_struct registers{};
-    if (ptrace(PTRACE_GETREGS, tid, nullptr, &registers) == -1)
-      throw std::runtime_error("Snapshot restore requires owned stopped physical threads");
+  if (layout.size() != state.threads.size()) return false;
+  for (size_t i = 0; i < layout.size(); ++i)
+    if (layout[i].tid != state.threads[i].tid ||
+        layout[i].physical_tid != state.threads[i].physical_tid ||
+        layout[i].alive != state.threads[i].alive) return false;
+  return true;
+}
+
+std::vector<pid_t> bound_threads(const tracee_state& state)
+{
+  std::vector<pid_t> tids;
+  for (size_t slot = 0; slot < state.threads.size(); ++slot) {
+    const auto& thread = state.threads[slot];
+    if (thread.tid != static_cast<pid_t>(slot + 1))
+      throw std::runtime_error("Invalid logical thread slot");
+    if (thread.alive) {
+      if (thread.physical_tid <= 0)
+        throw std::runtime_error("Logical thread has no owned physical binding");
+      tids.push_back(thread.physical_tid);
+    }
   }
+  return tids;
+}
+
+void remember_thread_bindings(pid_t pid, hash_type hash, const tracee_state& state)
+{
+  int node = -1;
+  for (int i = 0; i < NP; ++i) if (ptmc_state.pids[i] == pid) node = i;
+  // Low-level capture may produce inspectable fixtures; only registered nodes
+  // receive authority to restore into the running model.
+  if (node < 0) return;
+  auto owner = process_owners[pid].lock();
+  if (!owner) {
+    int fd = syscall(SYS_pidfd_open, pid, 0);
+    if (fd == -1) throw std::runtime_error("Cannot retain snapshot process incarnation");
+    owner = std::make_shared<ProcessBindingOwner>();
+    owner->fd = fd;
+    owner->pid = pid;
+    process_owners[pid] = owner;
+  }
+  pollfd descriptor{owner->fd, POLLIN, 0};
+  if (poll(&descriptor, 1, 0) != 0)
+    throw std::runtime_error("Snapshot capture owner has exited; reset process bindings first");
+  const auto key = std::make_pair(node, hash);
+  const auto existing = snapshot_thread_bindings.find(key);
+  if (existing != snapshot_thread_bindings.end()) {
+    if (existing->second.owner != owner)
+      throw std::runtime_error("Snapshot identity belongs to another process incarnation");
+    if (!same_layout(*existing->second.threads, state))
+      throw std::runtime_error("Snapshot identity has conflicting thread bindings");
+    return;
+  }
+  std::shared_ptr<const ThreadBindingLayout> layout;
+  for (auto it = owner->layouts.begin(); it != owner->layouts.end();) {
+    auto candidate = it->lock();
+    if (!candidate) { it = owner->layouts.erase(it); continue; }
+    if (same_layout(*candidate, state)) { layout = std::move(candidate); break; }
+    ++it;
+  }
+  if (!layout) {
+    auto created = std::make_shared<ThreadBindingLayout>();
+    created->reserve(state.threads.size());
+    for (const auto& thread : state.threads)
+      created->push_back({thread.tid, thread.physical_tid, thread.alive});
+    layout = std::move(created);
+    owner->layouts.push_back(layout);
+  }
+  snapshot_thread_bindings.emplace(key, SnapshotThreadBinding{owner, std::move(layout)});
+}
+}
+
+void clear_snapshot_thread_bindings()
+{
+  snapshot_thread_bindings.clear();
+  process_owners.clear();
+}
+
+tracee_state tracee_state::resolve_thread_bindings(int index, hash_type hash) const
+{
+  tracee_state resolved = *this;
+  resolved.bind_threads_for_restore(index, hash);
+  return resolved;
+}
+
+void tracee_state::bind_threads_for_restore(int index, hash_type hash)
+{
+  const auto found = snapshot_thread_bindings.find({index, hash});
+  if (index < 0 || index >= NP || found == snapshot_thread_bindings.end())
+    throw std::runtime_error("Snapshot has no local thread binding provenance");
+  const auto& binding = found->second;
+  pollfd descriptor{binding.owner->fd, POLLIN, 0};
+  if (binding.owner->pid != ptmc_state.pids[index] || poll(&descriptor, 1, 0) != 0)
+    throw std::runtime_error("Snapshot belongs to a different or dead process incarnation");
+  const auto& layout = *binding.threads;
+  if (threads.size() != layout.size())
+    throw std::runtime_error("Unsupported snapshot restore across thread creation or exit");
+  for (size_t i = 0; i < threads.size(); ++i) {
+    if (threads[i].tid != layout[i].tid || threads[i].alive != layout[i].alive)
+      throw std::runtime_error("Snapshot logical thread lifecycle differs from its capture");
+    threads[i].physical_tid = layout[i].physical_tid;
+  }
+  for (auto& record : thread_create_records) record.physical_tid = 0;
+  const auto expected = bound_threads(*this);
+  verify_stopped_thread_set(binding.owner->pid, expected);
+  validate_io_state();
 }
 
 void tracee_state::recover_running_state(int index, hash_type ts_hash) const
 {
-  pid_t main_pid = ptmc_state.pids[index];
-  // Logical termination does not destroy the parked physical image. Its
-  // registers, memory and modeled resources must still belong to this branch.
-  validate_parked_threads(*this, index);
+  const auto resolved = resolve_thread_bindings(index, ts_hash);
+  resolved.recover_stopped(index, ts_hash);
+  resolved.restore_runtime_state(index);
+}
+
+void tracee_state::recover_stopped(int index, hash_type ts_hash) const
+{
+  const pid_t main_pid = ptmc_state.pids[index];
   /* Restore the kernel heap extent before reconciling VMAs. */
   if (tracee_do_syscall(main_pid, SYS_brk, brk, 0, 0, 0, 0, 0) != brk)
     throw std::runtime_error("Cannot restore snapshot brk");
@@ -628,8 +727,6 @@ void tracee_state::recover_running_state(int index, hash_type ts_hash) const
   recover_mem_reg_snapshot(maps, ts_hash, main_pid);
 
   restore_thread_registers(main_pid);
-
-  restore_runtime_state(index);
 }
 
 void tracee_state::restore_runtime_state(int index) const
@@ -642,12 +739,17 @@ void tracee_state::restore_runtime_state(int index) const
   runtime.current_thread_idx = current_thread_idx;
   memmove(runtime.si, si, sizeof(si));
   runtime.futex_state = futex_state;
+  restore_resources(index);
+}
+
+void tracee_state::restore_resources(int index) const
+{
   for (int t = 0; t < MAX_THREADS_PER_PROCESS; ++t) {
     ptmc_state.thread_blocked[index][t] =
-        t < static_cast<int>(threads.size()) && threads[t].physical_tid &&
+        t < static_cast<int>(threads.size()) && threads[t].alive &&
         futex_state && futex_state->is_thread_waiting(threads[t].tid);
     ptmc_state.thread_exited[index][t] =
-        t < static_cast<int>(threads.size()) && !threads[t].physical_tid;
+        t < static_cast<int>(threads.size()) && !threads[t].alive;
   }
 
   // Restore current thread index
@@ -727,6 +829,12 @@ void sys_state::clear()
  */
 hash_type tracee_state::save_full_state_to_state_store(int pid, hash_type comparison_hash)
 {
+  prepare_capture(pid);
+  return capture_stopped(pid, comparison_hash);
+}
+
+hash_type tracee_state::capture_stopped(pid_t pid, hash_type comparison_hash)
+{
   validate_io_state();
   std::string maps_path = fmt::format("/proc/{}/maps", pid);
 
@@ -780,29 +888,9 @@ hash_type tracee_state::save_full_state_to_state_store(int pid, hash_type compar
   }
   std::vector<uint8_t> maps_data(maps_text.begin(), maps_text.end());
 
-  // Keep virtual slots stable, including exited slots: futex queues refer to them.
-  const auto thread_list = get_thread_list(pid);
-  if (thread_list.empty())
-    throw std::runtime_error("Cannot capture an empty thread register set");
-  if (threads.empty()) {
-    for (pid_t physical_tid : thread_list)
-      add_thread(physical_tid, 0, 0, 0, physical_tid == pid);
-  }
-  if (threads.size() > MAX_THREADS_PER_PROCESS)
-    throw std::runtime_error("Snapshot exceeds supported thread count");
-  std::set<pid_t> expected;
-  for (size_t i = 0; i < threads.size(); ++i) {
-    auto& thread = threads[i];
-    if (thread.tid != static_cast<pid_t>(i + 1))
-      throw std::runtime_error("Invalid virtual thread slot in snapshot");
-    if (!thread.physical_tid) continue;
-    if (!expected.insert(thread.physical_tid).second)
-      throw std::runtime_error("Duplicate physical thread in snapshot");
-  }
-  if (expected != std::set<pid_t>(thread_list.begin(), thread_list.end()))
-    throw std::runtime_error("Cannot capture untracked thread creation or exit");
+  // prepare_capture preserved and verified the complete logical slot layout.
   for (auto& thread : threads) {
-    if (!thread.physical_tid) continue;
+    if (!thread.alive) continue;
     if (ptrace(PTRACE_GETREGS, thread.physical_tid, nullptr, &thread.regs) == -1)
       throw std::runtime_error("Cannot capture thread registers");
     thread.xstate = capture_xstate(thread.physical_tid);
@@ -830,9 +918,13 @@ hash_type tracee_state::save_full_state_to_state_store(int pid, hash_type compar
   }
 
   if (page_capture_enabled())
-    return save_paged_snapshot(pid, regions, tstate_data, maps_text, regs,
+  {
+    const auto hash = save_paged_snapshot(pid, regions, tstate_data, maps_text, regs,
                               reinterpret_cast<uintptr_t>(rseq_struct[pid]), rseq_len[pid],
                               comparison_hash);
+    remember_thread_bindings(pid, hash, *this);
+    return hash;
+  }
 
   // Allocate final buffer
   size_t header_size = sizeof(StateDataHeader);
@@ -943,6 +1035,7 @@ hash_type tracee_state::save_full_state_to_state_store(int pid, hash_type compar
   LOG_DEBUG("StateStore saved hash %016lx, size=%zu, regions=%zu, tstate=%zu, "
             "maps=%zu",
             ts_hash, total_size, regions.size(), tstate_size, maps_size);
+  remember_thread_bindings(pid, ts_hash, *this);
   return ts_hash;
 }
 
@@ -983,14 +1076,31 @@ tracee_state::tracee_state(int which, const struct syscall_info info[])
 }
 
 /* Full save: capture memory, mappings, and serialize */
+void tracee_state::prepare_capture(pid_t pid)
+{
+  if (threads.empty()) {
+    for (pid_t tid : get_thread_list(pid)) add_thread(tid, 0, 0, 0, tid == pid);
+  }
+  if (threads.size() > MAX_THREADS_PER_PROCESS)
+    throw std::runtime_error("Snapshot exceeds supported thread count");
+  const auto expected = bound_threads(*this);
+  verify_stopped_thread_set(pid, expected);
+}
+
 hash_type tracee_state::save(int pid, hash_type comparison_hash)
+{
+  prepare_capture(pid);
+  return save_stopped(pid, comparison_hash);
+}
+
+hash_type tracee_state::save_stopped(pid_t pid, hash_type comparison_hash)
 {
   /* Record brk */
   brk = tracee_do_syscall(pid, SYS_brk, 0, 0, 0, 0, 0, 0);
   LOG_DEBUG("recorded brk = 0x%x", brk);
 
   /* Capture memory state (includes tstate) */
-  return save_full_state_to_state_store(pid, comparison_hash);
+  return capture_stopped(pid, comparison_hash);
 }
 
 /* Equality comparison for incremental save optimization
@@ -1025,10 +1135,16 @@ void tracee_state::add_thread(pid_t physical_tid, uint64_t clone_flags, uint64_t
 
   thread_state ts;
   ts.tid = virtual_tid;  // Use virtual TID
-  ts.physical_tid = physical_tid;  // Store physical TID
+  ts.physical_tid = physical_tid;  // Transient runtime binding
+  ts.alive = true;
   ts.clone_flags = clone_flags;
   ts.stack_addr = stack;
-  ts.ptid = ptid;
+  const auto parent = std::find_if(threads.begin(), threads.end(),
+      [ptid](const thread_state& thread) { return thread.physical_tid == ptid; });
+  if (ptid && parent == threads.end())
+    throw std::runtime_error("Thread creation parent has no owned logical binding");
+  const pid_t logical_parent = !ptid || parent == threads.end() ? 0 : parent->tid;
+  ts.ptid = logical_parent;
   ts.is_main = is_main;
 
   // Record creation info with both virtual and physical TID
@@ -1037,7 +1153,7 @@ void tracee_state::add_thread(pid_t physical_tid, uint64_t clone_flags, uint64_t
   record.physical_tid = physical_tid;
   record.clone_flags = clone_flags;
   record.stack_addr = stack;
-  record.ptid = ptid;
+  record.ptid = logical_parent;
   thread_create_records.push_back(record);
 
   threads.push_back(ts);
@@ -1052,12 +1168,13 @@ void tracee_state::add_thread(pid_t physical_tid, uint64_t clone_flags, uint64_t
 
 void tracee_state::remove_thread(pid_t tid)
 {
-  // Find and mark thread as exited by setting physical_tid to 0
+  // Retain the logical slot and record its lifecycle independently of binding.
   // We keep the entry in the vector to maintain stable virtual TID mapping
   for (auto& ts : threads) {
     if (ts.tid == tid) {
       LOG_INFO("Marked thread %d (physical=%d) as exited", tid, ts.physical_tid);
-      ts.physical_tid = 0;  // Mark as exited
+      ts.alive = false;
+      ts.physical_tid = 0;
       return;
     }
   }
@@ -1066,7 +1183,7 @@ void tracee_state::remove_thread(pid_t tid)
 thread_state* tracee_state::find_thread(pid_t tid)
 {
   for (auto& ts : threads) {
-    if (ts.tid == tid && ts.physical_tid != 0) {
+    if (ts.tid == tid && ts.alive) {
       return &ts;
     }
   }
@@ -1076,7 +1193,7 @@ thread_state* tracee_state::find_thread(pid_t tid)
 const thread_state* tracee_state::find_thread(pid_t tid) const
 {
   for (const auto& ts : threads) {
-    if (ts.tid == tid && ts.physical_tid != 0) {
+    if (ts.tid == tid && ts.alive) {
       return &ts;
     }
   }
@@ -1086,7 +1203,7 @@ const thread_state* tracee_state::find_thread(pid_t tid) const
 int tracee_state::find_thread_index(pid_t tid) const
 {
   for (size_t i = 0; i < threads.size(); i++) {
-    if (threads[i].tid == tid && threads[i].physical_tid != 0) {
+    if (threads[i].tid == tid && threads[i].alive) {
       return i;
     }
   }
@@ -1172,24 +1289,18 @@ void sys_state::recover_running_state() const
 {
   if (!ptmc_state.model_identity.empty() && model_identity != ptmc_state.model_identity)
     throw std::runtime_error("Snapshot execution model differs from the configured model");
+  // Resolve and verify every node before changing any live or modeled state.
+  sys_state resolved = *this;
+  for (int i = 0; i < NP; ++i)
+    resolved.child[i].bind_threads_for_restore(i, ts_hash[i]);
   ptmc_state.error_bound = error_bound;
-  for (int i = 0; i < NP; i++)
-  {
+  for (int i = 0; i < NP; ++i) {
     ptmc_state.status[i] = status[i];
-    if (ts_hash[i] == ptmc_state.running_state.ts_hash[i]) {
-      // The register/memory image is unchanged, but runtime runnability and
-      // selection can have changed independently of its stored hash.
-      validate_parked_threads(child[i], i);
-      child[i].restore_runtime_state(i);
-      continue;
-    }
-
-    child[i].recover_running_state(i, ts_hash[i]);
+    if (ts_hash[i] != ptmc_state.running_state.ts_hash[i])
+      resolved.child[i].recover_stopped(i, ts_hash[i]);
+    resolved.child[i].restore_resources(i);
   }
-  // Select the complete product state, including its branch-owned monitor.
-  // Restoring only process resources leaves generic captures/CLI loads attached
-  // to the previous branch's identity and property history.
-  ptmc_state.running_state = *this;
+  ptmc_state.running_state = std::move(resolved);
 }
 
 /* ======================================================================
@@ -1198,6 +1309,7 @@ void sys_state::recover_running_state() const
 
 void cleanup_all()
 {
+  clear_snapshot_thread_bindings();
   detsim::ui::ui_printf("[DEBUG] Starting global cleanup...\n");
 
   /* 0. Cleanup DWARF resources */

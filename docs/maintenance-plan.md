@@ -668,3 +668,35 @@ Verification with `CC=/usr/bin/gcc CXX=/usr/bin/g++`:
 
 Separate read-only review found no blocker. This closes the reproduced C08 parked
 terminal branch leak, not C02 lifecycle reconstruction or C03/C25 scheduling.
+
+## Logical threads and stopped-image prerequisites
+
+Invariant: host thread IDs are execution bindings, not serialized logical
+lifecycle. Archives carry explicit liveness and logical parent IDs; local runtime
+provenance resolves bindings on restore, including disk reload. Foreign execution
+images reject before any node changes. Removing host IDs from metadata does not
+normalize their occurrences in guest registers, TLS or arbitrary memory.
+
+Before capture injections/memory reads and before restore, all owned threads must
+be ptrace-stopped and the physical set must match. The first gate verifies rather
+than asynchronously interrupting arbitrary running guest code. Keep unsupported
+creation/exit rejected until carrier reconciliation is implemented and tested.
+
+Acceptance: archive binding invariance and explicit liveness, metadata-only reload
+without carriers, same-run persisted restore, foreign-source rejection without
+partial mutation, and a real pthread clone fixture with running-worker refusal
+and successful revalidation after stopping it. Run component/build and NP1/NP2
+native gates, then review before expanding lifecycle support.
+
+Thread prerequisite verification: old standalone archive regression reproduced
+physical-TID identity leakage. NP1 `check-thread-control check-thread-identity
+check-thread-carrier check-futex-snapshot check-exec check-scenarios` passes,
+including real pthread running-worker refusal, raw carrier creation and14 native
+scenarios. NP2 capture/identity/state-view/plugins/runtime-profile/syscall-policy/
+process-state/Redis gates pass with verify-pages and tiny-cache capture. `make
+check` passes. The initial duplicate-check implementation measured358states/s;
+private prevalidated helpers and shared binding layouts improve the same depth8
+Raft smoke to383states/s (2,582 visits / 1,347new), compared to prior394. These
+single samples do not establish statistical performance equivalence. Carrier
+creation is tested infrastructure; rawclone/exit dispatch remains disabled in
+this prerequisite commit. Failed internal carrier creation requires abort.

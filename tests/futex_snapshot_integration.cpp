@@ -83,15 +83,18 @@ int main(int argc, char** argv)
         ptmc_state.pids[0] = child;
         ptmc_state.fd_managers[0] = std::make_shared<FdManager>();
         live.add_thread(child, 0, 0, 0, true);
-        live.add_thread(child + 1, 0x1234, 0x5000, 1);
+        live.add_thread(child + 1, 0x1234, 0x5000, child);
         live.remove_thread(2);
         tracee_state saved(0, live.si);
         const auto hash = saved.save(child);
         require(saved.threads.size() == 2 && saved.threads[1].tid == 2 && !saved.threads[1].physical_tid &&
                 saved.thread_create_records.size() == 2, "capture renumbered or dropped exited virtual slots");
         tracee_state disk(hash);
+        require(disk.threads[0].alive && !disk.threads[0].physical_tid &&
+                !disk.threads[1].alive,"archive confused liveness with physical binding");
         // Reject lifecycle restoration before any registers/memory are modified.
         tracee_state changed = disk;
+        changed.threads[0].alive = false;
         changed.threads[0].physical_tid = 0;
         user_regs_struct before{}, after{};
         require(ptrace(PTRACE_GETREGS, child, nullptr, &before) == 0, "read preflight registers");
@@ -111,7 +114,7 @@ int main(int argc, char** argv)
             require(ptmc_state.thread_exited[0][1], "restore lost exited virtual slot");
             require(ptmc_state.thread_blocked[0][0] && !ptmc_state.thread_blocked[0][17], "restore failed to reconstruct blocked flags");
             ThreadManager manager;
-            manager.sync_from_tracee_state(disk);
+            manager.sync_from_tracee_state(live);
             const auto* info = manager.get_thread_info(0);
             require(info && info->state == ThreadState::BLOCKED && info->blocked_on == 0x1000,
                     "scheduler sync made waiting thread runnable");

@@ -59,8 +59,10 @@ static void run_case(int mode) {
     ptmc_state.cursor = 0;
     ptmc_state.pids[0] = child;
     ptmc_state.current_thread_idx[0] = 0;
-    if (mode == 5)
+    if (mode == 5) {
         ptmc_state.running_state.child[0].add_thread(0, 0, 0, 0, true);
+        ptmc_state.running_state.child[0].remove_thread(1);
+    }
     ptmc_state.running_state.child[0].add_thread(child, 0, 0, 0, mode != 5);
     thread::init_all(ptmc_state);
     ExecutionEngine engine;

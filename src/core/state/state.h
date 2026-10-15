@@ -17,18 +17,21 @@
 #include "process/process_state.h"
 
 
+// Runtime provenance is deliberately separate from persistent state identity.
+void clear_snapshot_thread_bindings();
+
 /* ======================================================================
  * State Data Format (shared with StateStore)
  * ====================================================================== */
 
-inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 11;
-inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 12;
+inline constexpr uint32_t FLAT_SNAPSHOT_VERSION = 13;
+inline constexpr uint32_t PAGE_SNAPSHOT_VERSION = 14;
 
 /* Packed to avoid alignment padding */
 struct __attribute__((packed)) StateDataHeader
 {
   uint32_t magic;         // 'DSTM' = 0x4453544D
-  uint32_t version;       // 11: flat; 12: pages (includes modeled kernel process state)
+  uint32_t version;       // 13: flat; 14: pages (logical thread lifecycle)
   uint32_t num_regions;   // number of memory regions
   uint64_t tstate_offset; // offset to serialized tracee_state
   uint64_t tstate_size;   // size of serialized tracee_state
@@ -76,13 +79,14 @@ struct syscall_info
  * saves/loads. The physical_tid is the actual kernel thread ID which may
  * change when states are restored.
  *
- * A thread is considered "exited" when physical_tid == 0. This allows us
- * to maintain stable TID mappings even after threads exit.
+ * alive is semantic lifecycle; physical_tid is a transient runtime binding.
+ * Loading an archive never grants permission to control a host task.
  */
 struct thread_state
 {
   pid_t tid;                      // Virtual TID (stable thread index + 1)
-  pid_t physical_tid;             // Physical TID (actual kernel thread ID)
+  pid_t physical_tid;             // Runtime only; omitted from archives
+  bool alive;                    // Logical lifecycle, independent of binding
   struct user_regs_struct regs{}; // General-purpose register context
   std::vector<uint8_t> xstate;     // Complete Linux NT_X86_XSTATE register set
   uint64_t clone_flags;           // Clone flags used to create this thread
@@ -90,7 +94,7 @@ struct thread_state
   pid_t ptid;                     // Parent thread TID
   bool is_main;                   // Whether this is the main thread
 
-  thread_state() : tid(0), physical_tid(0), clone_flags(0), stack_addr(0), ptid(0), is_main(false)
+  thread_state() : tid(0), physical_tid(0), alive(false), clone_flags(0), stack_addr(0), ptid(0), is_main(false)
   {
     // regs will be zero-initialized by the default member initializer
   }
@@ -98,11 +102,12 @@ struct thread_state
   template <class Archive>
   void serialize(Archive &ar)
   {
-    ar(tid, physical_tid, regs.r15, regs.r14, regs.r13, regs.r12, regs.rbp, regs.rbx,
+    ar(tid, alive, regs.r15, regs.r14, regs.r13, regs.r12, regs.rbp, regs.rbx,
        regs.r11, regs.r10, regs.r9, regs.r8, regs.rax, regs.rcx, regs.rdx,
        regs.rsi, regs.rdi, regs.orig_rax, regs.rip, regs.cs, regs.eflags,
        regs.rsp, regs.ss, regs.fs_base, regs.gs_base, regs.ds, regs.es,
        regs.fs, regs.gs, clone_flags, stack_addr, ptid, is_main, xstate);
+    if constexpr (Archive::is_loading::value) physical_tid = 0;
   }
 };
 
@@ -118,7 +123,8 @@ struct thread_create_info
   template <class Archive>
   void serialize(Archive &ar)
   {
-    ar(virtual_tid, physical_tid, clone_flags, stack_addr, ptid);
+    ar(virtual_tid, clone_flags, stack_addr, ptid);
+    if constexpr (Archive::is_loading::value) physical_tid = 0;
   }
 };
 
@@ -235,6 +241,7 @@ typedef struct tracee_state
    * --------------------------------------------------------- */
 
   /* Main recovery entry */
+  tracee_state resolve_thread_bindings(int index, hash_type ts_hash) const;
   void recover_running_state(int index, hash_type ts_hash) const;
   void restore_runtime_state(int index) const;
 
@@ -248,6 +255,14 @@ typedef struct tracee_state
    * Thread Recovery Helpers
    * --------------------------------------------------------- */
 private:
+  friend struct sys_state;
+  // Only the product operation may reuse a successful all-node stop barrier.
+  void prepare_capture(pid_t pid);
+  hash_type save_stopped(pid_t pid, hash_type comparison_hash);
+  hash_type capture_stopped(pid_t pid, hash_type comparison_hash);
+  void bind_threads_for_restore(int index, hash_type hash);
+  void recover_stopped(int index, hash_type hash) const;
+  void restore_resources(int index) const;
   void restore_thread_registers(pid_t main_pid) const;
 
 public:

@@ -306,13 +306,13 @@ pid_t PTMC_STATE::get_current_tid(int tracee_idx) const
   if (tidx >= 0 && tidx < (int)threads.size()) {
     // Use the stored physical_tid from thread_state
     pid_t physical_tid = threads[tidx].physical_tid;
-    if (physical_tid > 0) {
+    if (threads[tidx].alive && physical_tid > 0) {
       return physical_tid;
     }
   }
 
-  // Fallback to main pid if no threads recorded or index out of range
-  return pids[tracee_idx];
+  // Bootstrap has no logical slots yet; loaded/unbound slots must never fall back.
+  return threads.empty() ? pids[tracee_idx] : -1;
 }
 
 pid_t PTMC_STATE::get_thread_tid(int tracee_idx, int thread_idx) const
@@ -326,13 +326,8 @@ pid_t PTMC_STATE::get_thread_tid(int tracee_idx, int thread_idx) const
 
   // Use the stored physical_tid from thread_state
   pid_t physical_tid = threads[thread_idx].physical_tid;
-  if (physical_tid > 0) {
+  if (threads[thread_idx].alive && physical_tid > 0) {
     return physical_tid;
-  }
-
-  // Fallback: if thread index is 0, return main pid
-  if (thread_idx == 0) {
-    return pids[tracee_idx];
   }
 
   return -1;

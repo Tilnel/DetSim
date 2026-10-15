@@ -182,7 +182,7 @@ std::string StateView::inspect_json(size_t node) const {
   }
   result["epolls"]=std::move(epolls);
   result["threads"]=live_ ? Json(nullptr) : Json::array();
-  if (!live_) for (const auto& thread:state.threads) result["threads"].push_back({{"id",thread.tid},{"is_main",thread.is_main},{"registers",registers(thread.regs)}});
+  if (!live_) for (const auto& thread:state.threads) result["threads"].push_back({{"id",thread.tid},{"alive",thread.alive},{"is_main",thread.is_main},{"registers",registers(thread.regs)}});
   result["futex"]=live_ ? Json(nullptr) : Json::array();
   if (!live_ && state.futex_state) for (const auto& [address,queue]:state.futex_state->wait_queues()) {
     auto waiters=Json::array(); for (const auto& waiter:queue) waiters.push_back({{"thread",waiter.tid},{"value",waiter.val},{"bitset",waiter.bitset},{"timeout",waiter.timeout}});

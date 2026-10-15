@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
   std::ostringstream network_encoded; { cereal::BinaryOutputArchive archive(network_encoded); archive(sockets,udp,tcp,epolls); }
   std::istringstream network_input(network_encoded.str()); { cereal::BinaryInputArchive archive(network_input); archive(saved.sock_state); }
   saved.fd_manager_state=*descriptors;
-  thread_state thread; thread.tid=1; thread.physical_tid=123456; thread.is_main=true; thread.regs.rax=987; thread.regs.rip=0x1234; saved.threads.push_back(thread);
+  thread_state thread; thread.tid=1; thread.physical_tid=123456; thread.alive=true; thread.is_main=true; thread.regs.rax=987; thread.regs.rip=0x1234; saved.threads.push_back(thread);
   saved.futex_state.emplace();
   std::ostringstream encoded; { cereal::BinaryOutputArchive archive(encoded); archive(saved); }
   const auto serialized=encoded.str(); std::vector<uint8_t> metadata(serialized.begin(),serialized.end()); user_regs_struct regs{};

@@ -556,6 +556,7 @@ static void start_tracee(int id)
 
 int state_initialization()
 {
+  clear_snapshot_thread_bindings();
   /* initialization for multiple process */
   // setpgid(0, pgid);
   setbuf(stdout, NULL);

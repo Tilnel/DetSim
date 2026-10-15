@@ -80,3 +80,12 @@
 
 !syscall_policy.mk
 !syscall_policy_integration.cpp
+
+!thread_control.mk
+!thread_control_integration.cpp
+
+!thread_identity.mk
+!thread_identity_integration.cpp
+
+!thread_carrier.mk
+!thread_carrier_integration.cpp

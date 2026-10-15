@@ -3,6 +3,7 @@
  */
 
 #include "thread_manager.h"
+#include <stdexcept>
 #include "state/state.h"
 #include "monitor.h"
 #include "log_wrapper.h"
@@ -286,19 +287,21 @@ void ThreadManager::sync_from_tracee_state(const tracee_state& state)
     for (size_t i = 0; i < state.threads.size(); i++) {
         const auto& ts = state.threads[i];
 
+        if (ts.alive && ts.physical_tid <= 0)
+            throw std::runtime_error("Cannot schedule an unbound logical thread");
         ThreadSchedInfo info;
         info.thread_idx = static_cast<int>(i);
         info.virtual_tid = ts.tid;
         info.physical_tid = ts.physical_tid;
 
-        // Determine state based on physical_tid
-        if (ts.physical_tid == 0) {
+        // Logical lifecycle is independent of the runtime binding.
+        if (!ts.alive) {
             info.state = ThreadState::EXITED;
         } else {
             info.state = ThreadState::RUNNING;
         }
         info.blocked_on = 0;
-        if (ts.physical_tid && state.futex_state && state.futex_state->is_thread_waiting(ts.tid)) {
+        if (ts.alive && state.futex_state && state.futex_state->is_thread_waiting(ts.tid)) {
             info.state = ThreadState::BLOCKED;
             info.blocked_on = state.futex_state->get_wait_address(ts.tid);
         }

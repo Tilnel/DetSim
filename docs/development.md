@@ -24,6 +24,7 @@ make check
 make check-storage       # storage faults/concurrency/reopen + read-only tools; NP=1
 make check-integration   # production DWARF/ELF fixtures; default NP=1
 make check-scenarios     # build NP=1 tracer and run isolated native ptrace scenarios
+make check-thread-control check-thread-identity # NP=1 stopped-thread and archive gates
 make check-futex check-futex-snapshot # NP=1 wait/wake/requeue and branch restore
 make check-xstate check-exec check-state-io check-mappings # NP=1 state/atom gates
 make check-identity check-port # NP=2 identity and deterministic network state
@@ -128,8 +129,8 @@ enter snapshot state. Loader CPU-feature normalization still logs an unresolved
 symbol (C17). Passing counter/replay tests does not close that gap,
 nor does it prove multithread, cross-process-run or eviction correctness.
 
-Default snapshot format is version 11; older formats are rejected without migration.
-This branch additionally reads opt-in version 12 page manifests, selected with
+Default snapshot format is version 13; older formats are rejected without migration.
+This branch additionally reads opt-in version 14 page manifests, selected with
 `DETSIM_SNAPSHOT_BACKEND=pages`; `verify-pages` adds a full memory oracle.
 See [page snapshots and whole-exploration measurements](page-snapshots.md).
 Private readable mappings are captured; shared/unreadable mappings, overlaps with
@@ -219,7 +220,7 @@ successor. Pure predecessor/target comparisons need no monitor state.
 
 Plugin binaries/schema/configuration, target executable contents and semantic
 execution configuration form the model compatibility fingerprint. Executables must remain immutable during a run. Changing cache
-sizes or loading a decoder does not change it. Flat11/page12 and the versioned
+sizes or loading a decoder does not change it. Flat13/page14 and the versioned
 system metadata reject older archives without deleting or migrating stores.
 Changes to kernel-model or inspection semantics require an explicit compatibility
 version bump; fingerprints do not prove equivalence between different implementations.
@@ -287,3 +288,20 @@ this does not enumerate random outcomes. System memory reports a fixed model
 profile. Signal dispositions and filesystem umask are branch state; custom signal
 delivery and armed interval timers are unsupported. These choices improve state
 closure within an explicit environment, not compatibility with all Linux programs.
+
+## Logical thread archives
+
+Flat13/page14 archive explicit thread liveness and logical parent IDs; physical
+TIDs are transient bindings. Same-run captured hashes retain compact runtime
+provenance tied to an owned process pidfd, which is required on the host kernel.
+Disk reload may inspect any valid snapshot, but execution restore requires local
+provenance for that hash and the same live process incarnation. Bootstrap/cleanup
+clear these records; state-store cache eviction does not. Host IDs may still be
+present in guest registers/TLS/memory, and getpid/gettid remain native queries, so
+this does not establish cross-run canonical identity or complete TID virtualization.
+
+All nodes pass the owned stopped-thread barrier before capture injections or
+restore mutations. The gate checks a preexisting stop; it does not interrupt a
+running pure-user loop. Native clone-event tests prove running-worker rejection
+and successful validation after stopping it. Physical thread creation/exit
+reconstruction remains disabled until carrier reconciliation is integrated.

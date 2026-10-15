@@ -323,12 +323,38 @@ int main(int argc, char**)
         sys_state crash_predecessor(info,&source);
         require(crash_predecessor.ss_hash==source.ss_hash,"crash predecessor restore identity drift");
         if (argc > 1) require(StateStore::instance().get_stats().disk_reads > 0, "oracle did not exercise cache eviction");
-        // Even the same-hash shortcut may not declare a vanished task restored.
-        ptmc_state.running_state=resurrected;
+        // A later node's failure must be detected before any earlier image,
+        // status, budget, or store record changes.
+        require(ptrace(PTRACE_POKEDATA,children[0],&guest_value,456)==0,"edit preflight witness");
+        ptmc_state.error_bound=3;
+        sys_state before_death(info,&source);
+        ptmc_state.running_state=before_death;
         kill(children[1],SIGKILL);waitpid(children[1],nullptr,0);children[1]=0;
+        user_regs_struct before_failure{},after_failure{};
+        require(ptrace(PTRACE_GETREGS,children[0],nullptr,&before_failure)==0,"preflight registers");
         bool vanished_rejected=false;
-        try {resurrected.recover_running_state();}catch(const std::runtime_error&){vanished_rejected=true;}
-        require(vanished_rejected,"same-hash restore accepted an actually dead physical process");
+        try {source.recover_running_state();}catch(const std::runtime_error&){vanished_rejected=true;}
+        long witness=0;
+        require(vanished_rejected && ptmc_state.error_bound==3 &&
+                ptmc_state.running_state.ss_hash==before_death.ss_hash &&
+                guest_read_exact(children[0],&guest_value,&witness,sizeof(witness)) && witness==456 &&
+                ptrace(PTRACE_GETREGS,children[0],nullptr,&after_failure)==0 &&
+                !memcmp(&before_failure,&after_failure,sizeof(before_failure)),
+                "failed all-node restore preflight mutated an earlier node");
+        const auto save_calls=StateStore::instance().get_stats().save_calls;
+        bool capture_rejected=false;
+        try {sys_state refused(info,&source);}catch(const std::runtime_error&){capture_rejected=true;}
+        require(capture_rejected && StateStore::instance().get_stats().save_calls==save_calls,
+                "failed all-node capture preflight published an earlier node");
+        // Clearing runtime provenance must not grant a disk-loaded snapshot
+        // ownership of whatever physical process happens to occupy this slot.
+        clear_snapshot_thread_bindings();
+        bool foreign_rejected=false;
+        try {(void)source.child[0].resolve_thread_bindings(0,source.ts_hash[0]);}
+        catch(const std::runtime_error& error) {
+            foreign_rejected=std::string(error.what()).find("no local thread binding provenance")!=std::string::npos;
+        }
+        require(foreign_rejected,"unregistered snapshot regained host thread ownership");
         StateStore::instance().shutdown();
         SysStateStore::instance().shutdown();
         for (pid_t &child : children) if (child > 0) { kill(child, SIGKILL); waitpid(child, nullptr, 0); child = 0; }
