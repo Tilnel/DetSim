@@ -186,9 +186,9 @@ def manual_path(tracer, binary, plugin, directory, backend, bits, expected_bug, 
             row.update(status="failed", diagnostic="tracer cleanup failed")
 
 
-def search(tracer, argv, plugin, directory, backend, timeout, *, bug=False, depth=None, fsmap=(), expected_diagnostic="account overdraft"):
+def search(tracer, argv, plugin, directory, backend, timeout, *, bug=False, depth=None, fsmap=(), expected_diagnostic="account overdraft", runtime_profile=None):
     row = {"artifacts": str(directory), "startup": "not_started", "search": "not_started"}
-    session = Session(tracer, argv, plugin, directory, backend, timeout, choices=depth is None, fsmap=fsmap)
+    session = Session(tracer, argv, plugin, directory, backend, timeout, choices=depth is None, fsmap=fsmap, runtime_profile=runtime_profile)
     try:
         session.send(); row["startup"] = "admitted"
         session.send("sw 0")
@@ -317,9 +317,9 @@ def threads(args,out,cc,cxx):
     return rows
 
 
-def admission_controls(tracer, argv, plugin, directory, backend, timeout, fsmap):
+def admission_controls(tracer, argv, plugin, directory, backend, timeout, fsmap, *, runtime_profile=None):
     row = {"startup": "not_started", "controlled_steps": 0, "restore": "not_run", "artifacts": str(directory)}
-    session = Session(tracer, argv, plugin, directory, backend, timeout, fsmap=fsmap)
+    session = Session(tracer, argv, plugin, directory, backend, timeout, fsmap=fsmap, runtime_profile=runtime_profile)
     try:
         session.send();row["startup"]="admitted"
         session.send("sw 0")
@@ -457,9 +457,10 @@ def runtimes(args, out, cc, cxx):
             for backend in args.backends:
                 result = dict(row, backend=backend)
                 result["control"] = admission_controls(args.tracer, argv, plugin,
-                    out / ("control-"+language+"-"+backend),backend,args.timeout,mappings)
+                    out / ("control-"+language+"-"+backend),backend,args.timeout,mappings, runtime_profile={"startup_syscall": args.startup_syscall})
                 result["model"] = search(args.tracer, argv, plugin, out / ("admission-"+language+"-"+backend),
-                    backend, args.timeout, depth=args.depth, fsmap=mappings)
+                    backend, args.timeout, depth=args.depth, fsmap=mappings,
+                    runtime_profile={"startup_syscall": args.startup_syscall})
                 result["passed"] = result["model"]["status"] == "pass" and result["control"]["status"]=="pass"
                 rows.append(result)
                 print(json.dumps({"case": "runtime-admission", "language": result["language"], "backend": backend,
@@ -479,10 +480,13 @@ def main():
     parser.add_argument("--output", type=Path, default=ROOT / "build/cases")
     parser.add_argument("--backend", choices=("full", "pages", "both"), default="both")
     parser.add_argument("--languages", default="c,cpp,rust,go,python,java")
+    parser.add_argument("--startup-syscall", type=int, default=11, help="runtime admission: explicit loader boundary syscall number")
     parser.add_argument("--memory-mb", type=int, default=2048, help="explicit tracer/tracee address-space limit")
     parser.add_argument("--timeout", type=float, default=20)
     parser.add_argument("--depth", type=int, default=100)
     args = parser.parse_args()
+    if not 0 <= args.startup_syscall < 450:
+        parser.error("startup syscall must be in [0, 450)")
     if args.timeout <= 0 or args.depth < 1 or args.memory_mb < 1:
         parser.error("positive timeout, depth and memory limit required")
     MODEL_ADDRESS_SPACE_LIMIT = args.memory_mb * 1024**2
@@ -495,7 +499,7 @@ def main():
     report = {"git_head_at_run": command(["git","rev-parse","HEAD"],ROOT).stdout.strip(),
               "product_diff_sha256": hashlib.sha256(command(["git","diff","--","src"],ROOT).stdout.encode()).hexdigest(),
               "tracer": str(args.tracer), "tracer_sha256": digest(args.tracer), "environment": ENV,
-              "depth": args.depth, "session_timeout_s": args.timeout, "tracer_address_space_limit_bytes": MODEL_ADDRESS_SPACE_LIMIT,
+              "depth": args.depth, "runtime_startup_syscall": args.startup_syscall, "session_timeout_s": args.timeout, "tracer_address_space_limit_bytes": MODEL_ADDRESS_SPACE_LIMIT,
               "scope": "fixed NP1 profile; bounded runtime search is not a safety proof", "cases": []}
     try:
         if args.mode in ("inputs", "checks", "all"): report["cases"] += inputs(args, out, cc, cxx)

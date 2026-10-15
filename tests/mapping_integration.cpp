@@ -3,6 +3,7 @@
 #include "ncurses_ui.h"
 #include "state_store.h"
 #include "guest.h"
+#include "dispatcher.h"
 #include "page_restore_stats.h"
 #include <cstdio>
 #include <cerrno>
@@ -119,6 +120,47 @@ int main(int argc, char** argv)
                     protection(child, reinterpret_cast<uintptr_t>(page) + 4096) == PROT_READ,
                     "saved read-only permissions were not restored");
         };
+        // Physical THP eligibility is a hint, excluded from semantic identity.
+        // A subrange can split the host VMA without changing modeled mappings.
+        ptmc_state.cursor = 0;
+        SyscallDispatcher dispatcher;
+        const auto provenance = ptmc_state.fs_states[0].virtual_file_mappings;
+        auto nohugepage = [&] {
+            syscall_info advice{};
+            advice.nr = SYS_madvise;
+            advice.args[0] = reinterpret_cast<uintptr_t>(page) + 4096;
+            advice.args[1] = 1;
+            advice.args[2] = MADV_NOHUGEPAGE;
+            require(dispatcher.on_enter(child, SYS_madvise, advice), "admit anonymous nohugepage hint");
+            require(tracee_do_syscall(child, SYS_madvise, advice.args[0], advice.args[1],
+                                     advice.args[2], 0, 0, 0) == 0, "execute anonymous nohugepage hint");
+            require(protection(child, reinterpret_cast<uintptr_t>(page)) == PROT_READ &&
+                    protection(child, reinterpret_cast<uintptr_t>(page) + 4096) == PROT_READ,
+                    "nohugepage changed protections");
+            require(ptmc_state.fs_states[0].virtual_file_mappings == provenance &&
+                    saved.fs_state.virtual_file_mappings == provenance,
+                    "nohugepage changed semantic provenance");
+        };
+        nohugepage();
+        require(saved.save_full_state_to_state_store(child) == hash,
+                "nohugepage hint changed saved semantic identity");
+        mutate();
+        const auto hinted_successor = saved.save_full_state_to_state_store(child);
+        require(hinted_successor != hash, "nohugepage branch mutation missing from identity");
+        restore(); nohugepage(); mutate();
+        require(saved.save_full_state_to_state_store(child) == hinted_successor,
+                "nohugepage branch replay changed successor identity");
+        restore();
+        require(tracee_do_syscall(child, SYS_munmap, reinterpret_cast<uintptr_t>(page), 8192,
+                                 0, 0, 0, 0) == 0, "remove hinted mapping");
+        require(tracee_do_syscall(child, SYS_mmap, reinterpret_cast<uintptr_t>(page), 8192,
+                                 PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS,
+                                 -1, 0) == reinterpret_cast<uintptr_t>(page), "recreate unhinted mapping");
+        restore(); mutate();
+        require(saved.save_full_state_to_state_store(child) == hinted_successor,
+                "nohugepage recreation replay changed successor identity");
+        restore();
+        puts("PASS nohugepage: subrange identity, mutation replay, permissions and recreated mapping");
         // Two remote changes in a large region must restore only changed pages,
         // including the final byte; unchanged pages retain the exact baseline.
         unsigned char changed = 91;

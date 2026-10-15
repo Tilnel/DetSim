@@ -97,6 +97,69 @@ static std::string child_name(pid_t pid) {
     return name;
 }
 
+static void check_nohugepage(SyscallDispatcher& dispatcher, pid_t child) {
+    auto* native=static_cast<unsigned char*>(mmap(nullptr,12288,PROT_READ|PROT_WRITE,
+        MAP_PRIVATE|MAP_ANONYMOUS,-1,0));
+    if(native==MAP_FAILED) throw std::runtime_error("native nohugepage mapping");
+    const auto mapped=execute(dispatcher,child,SYS_mmap,
+        {0,12288,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,uint64_t(-1),0});
+    if(mapped.rejected || mapped.value<=0) throw std::runtime_error("virtual nohugepage mapping");
+    const auto address=uint64_t(mapped.value);
+    std::array<unsigned char,12288> expected;expected.fill(0x5a);
+    memcpy(native,expected.data(),expected.size());
+    if(!guest_write_exact(child,reinterpret_cast<void*>(address),expected.data(),expected.size()))
+        throw std::runtime_error("virtual nohugepage bytes");
+    const auto provenance=ptmc_state.fs_states[0].virtual_file_mappings;
+    auto compare=[&](uint64_t offset,uint64_t length,uint64_t advice,long expected_result) {
+        errno=0;
+        const long raw=syscall(SYS_madvise,reinterpret_cast<uint64_t>(native)+offset,length,advice);
+        const long oracle=raw<0?-errno:raw;
+        const auto actual=execute(dispatcher,child,SYS_madvise,{address+offset,length,advice,0,0,0});
+        check(oracle==expected_result,"native MADV_NOHUGEPAGE argument oracle");
+        check(!actual.rejected && actual.value==oracle,"MADV_NOHUGEPAGE retains native argument result");
+    };
+    for(uint64_t advice:{uint64_t(MADV_NOHUGEPAGE),uint64_t(0x10000000fULL),uint64_t(0xffffffff0000000fULL)})
+        compare(0,1,advice,0);
+    compare(1,1,MADV_NOHUGEPAGE,-EINVAL);
+    compare(1,0,MADV_NOHUGEPAGE,-EINVAL);
+    std::array<unsigned char,12288> actual{};
+    check(!memcmp(native,expected.data(),expected.size()) &&
+          guest_read_exact(child,reinterpret_cast<void*>(address),actual.data(),actual.size()) && actual==expected &&
+          ptmc_state.fs_states[0].virtual_file_mappings==provenance,
+          "MADV_NOHUGEPAGE preserves all bytes and virtual mapping provenance");
+    for(uint64_t advice:{uint64_t(MADV_FREE),uint64_t(MADV_HUGEPAGE),uint64_t(-1)})
+        check(execute(dispatcher,child,SYS_madvise,{address,4096,advice,0,0,0}).rejected,
+              "other advice remains explicitly rejected");
+    auto& fs=ptmc_state.fs_states[0];
+    fs.add_virtual_file_mapping(address,address+4096);
+    check(execute(dispatcher,child,SYS_madvise,{address,1,MADV_NOHUGEPAGE,0,0,0}).rejected,
+          "MADV_NOHUGEPAGE rejects virtual file provenance");
+    fs.remove_virtual_file_mapping(address,address+4096);
+    check(munmap(native+4096,4096)==0,"native nohugepage hole");
+    const auto hole=execute(dispatcher,child,SYS_munmap,{address+4096,4096,0,0,0,0});
+    check(!hole.rejected && hole.value==0,"virtual nohugepage hole");
+    compare(4096,0,MADV_NOHUGEPAGE,0);
+    compare(4096,1,MADV_NOHUGEPAGE,-ENOMEM);
+    errno=0;
+    check(syscall(SYS_madvise,UINT64_MAX-4095,8192,MADV_NOHUGEPAGE)==-1 && errno==EINVAL,
+          "native wrapped MADV_NOHUGEPAGE returns EINVAL");
+    check(execute(dispatcher,child,SYS_madvise,{UINT64_MAX-4095,8192,MADV_NOHUGEPAGE,0,0,0}).rejected,
+          "wrapped MADV_NOHUGEPAGE remains outside model range admission");
+    check(execute(dispatcher,child,SYS_madvise,{scratch_page,4096,MADV_NOHUGEPAGE,0,0,0}).rejected,
+          "MADV_NOHUGEPAGE rejects control memory");
+    check(execute(dispatcher,child,SYS_madvise,
+          {reinterpret_cast<uint64_t>(&replacement_name)&~uint64_t(4095),4096,MADV_NOHUGEPAGE,0,0,0}).rejected,
+          "MADV_NOHUGEPAGE rejects file-backed mappings");
+    const long shared=tracee_do_syscall(child,SYS_mmap,0,4096,PROT_READ|PROT_WRITE,
+                                       MAP_SHARED|MAP_ANONYMOUS,-1,0);
+    if(shared<=0) throw std::runtime_error("shared nohugepage fixture");
+    check(execute(dispatcher,child,SYS_madvise,{uint64_t(shared),4096,MADV_NOHUGEPAGE,0,0,0}).rejected,
+          "MADV_NOHUGEPAGE rejects shared mappings");
+    tracee_do_syscall(child,SYS_munmap,shared,4096,0,0,0,0);
+    execute(dispatcher,child,SYS_munmap,{address,12288,0,0,0,0});
+    munmap(native,12288);
+}
+
 int main() {
     pid_t child = -1;
     try {
@@ -281,6 +344,7 @@ int main() {
             result=execute(dispatcher,child,SYS_munmap,{guard,4096,0,0,0,0});
             check(!result.rejected && result.value==0,"guard can be unmapped");
         }
+        check_nohugepage(dispatcher,child);
         const auto discard=execute(dispatcher,child,SYS_mmap,
                        {0,8192,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,uint64_t(-1),0});
         check(!discard.rejected && discard.value>0,"allocate discard fixture");

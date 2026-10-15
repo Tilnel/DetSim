@@ -544,3 +544,19 @@ munmap startup boundary correctly rejects because it follows thread creation.
 An explicit mmap startup boundary admits control/replay, then actual exploration
 rejects MADV_NOHUGEPAGE: build/cases/run-wgjcc09h/results.json. This is not gccgo
 admission and is not yet green; no GC/preemption flags were disabled.
+
+
+### Anonymous huge-page performance hint
+
+Admit only MADV_NOHUGEPAGE alongside DONTNEED through existing native execution
+and unchanged range/backing restrictions. Physical THP policy is excluded from
+this execution profile. No new saved field or snapshot format is introduced;
+kernelv18 identifies the profile. Native/kernel errno matrix and high32 advice
+aliases pass; wrapping addresses retain explicit model rejection rather than
+claiming native EINVAL. Native-file/shared/named/virtual-file/control ranges and
+other advice still reject. Full/pages/verify-pages with ordinary/tiny caches
+restore both hinted and recreated-unhinted mappings to equivalent bytes,
+protections, provenance and successor identity. Independent review approved the
+implementation; its requested unhinted-replay test correction is now green.
+NP2 syscall-policy/IO/capture and NP1 mapping gates passed. Actual gc Go advances
+to getrlimit97; captured resource-limit query closure is the next bounded task.

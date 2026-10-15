@@ -317,8 +317,9 @@ bool SyscallDispatcher::on_enter(pid_t pid, int syscall_nr, syscall_info& info)
             if (syscall_nr == SYS_mprotect && info.args[2] == PROT_NONE)
                 validate_anonymous_mapping_range(pid, info.args[0], info.args[1]);
             if (syscall_nr == SYS_madvise) {
-                if (static_cast<int32_t>(info.args[2]) != MADV_DONTNEED)
-                    throw std::runtime_error("Only private anonymous MADV_DONTNEED is supported");
+                const int32_t advice = static_cast<int32_t>(info.args[2]);
+                if (advice != MADV_DONTNEED && advice != MADV_NOHUGEPAGE)
+                    throw std::runtime_error("Only private anonymous MADV_DONTNEED/MADV_NOHUGEPAGE are supported");
                 validate_anonymous_mapping_range(pid, info.args[0], info.args[1]);
             }
             return true;

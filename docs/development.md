@@ -739,3 +739,17 @@ replay; scalar observation and search-scope component gate; NP2 IO/getdents/VFS
 content gates; NP1 page-snapshot and state-I/O gates. Runtime recheck confirms
 Python no longer tries to regenerate valid bytecode caches; its next unsupported
 operation is FIOCLEX. This is progress, not successful Python admission.
+
+
+MADV_NOHUGEPAGE now runs natively on admitted unnamed private anonymous memory,
+using the same reserved-range/backing guards as MADV_DONTNEED. Advice uses the
+signed low32 bits. This profile excludes physical huge-page eligibility/policy,
+page size and resource-pressure timing from modeled observations; these hints
+are deliberately not snapshot state. Native validation remains, while wrapping
+ranges still reject under the existing control-page admission rule. Other advice
+and shared/named/file-backed ranges remain unsupported. Kernelv18, layouts29/30.
+Six backend/cache mapping tests verify bytes/protections/provenance and identical
+successors after hinted restore and unhinted recreation; NP2 policy/IO/capture
+also pass. Actual gc Go now reaches getrlimit97 after178states, not successful
+admission. Runtime audit `--startup-syscall` explicitly records its loader boundary;
+static gc Go uses9 instead of default11 to end the prelude before thread births.
