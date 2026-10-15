@@ -504,3 +504,21 @@ SIGBUS-backed file-mapping case. Supporting invalid-backed pages requires memory
 mapping, snapshot and guest-fault semantics, beyond a flag allowlist. Per user
 tradeoff Java remains a conditional, explicitly non-green research target; no
 claim of JVM admission or private-heap semantic extraction is made.
+
+
+### Raft workload oracle schema2
+
+The example plugin now records committed term/type/exact command bytes and a
+branch-owned term-to-leader history. Identical index/term with different commands,
+including embedded NUL bytes, violates the property; sequential different leaders
+in one term also violate it. Monitor records are bounded and strictly validated.
+Unobserved compacted prefixes remain explicitly unavailable instead of invented.
+The schema version participates in the plugin identity. This is example-side
+property extraction, not Raft knowledge in generic state storage or scheduling.
+
+Independent review approved the slice; freshly rebuilt `make NP=2
+check-raft-plugin-contract CC=/usr/bin/gcc CXX=/usr/bin/g++` passes both actual
+entry layouts. Unit and sanitizer evidence is component-level: full/pages actual
+workload exploration and replay are separate pending acceptance. Legacy willemt
+main has shallow-copied command payload lifetime errors; the owned bounded driver
+must retain payload ownership rather than weaken the stronger oracle.
