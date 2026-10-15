@@ -741,3 +741,26 @@ pthread/rseq/robust owner-death, full process teardown, automatic exhaustive act
 selection and instruction-level shared-memory boundaries remain open. A raw birth
 requires zero actual clear-tid/rseq registration; nonempty robust ownership rejects
 exit. Internal creation failures abort rather than pretending a guest errno.
+
+## TID/clear-tid verification (2026-10-15)
+
+Completed the generic clone/clone3/set_tid_address ABI slice. Native probes under
+build/tid-abi-probe established ignored bad TID copyouts,32-bit writes, atomic
+cross-page faults and clone3 size/error rules. The pre-fix component regression
+reproduced shared wake incorrectly removing a private waiter.
+
+With CC=/usr/bin/gcc and CXX=/usr/bin/g++:
+- make check:9 component cases and10 build-contract tests pass.
+- NP1 check-thread-tid:8 clone/clone3 x full/pages x cache variants pass;
+  check-thread-lifecycle, check-futex, check-futex-snapshot, check-exec and
+  check-scenarios pass (14 native scenarios).
+- NP2 verify-pages capture/identity/state-view/plugins/runtime-profile/
+  syscall-policy/process-state/io-boundary/accept/Redis gates pass.
+- Strict GCC -Wall -Wextra -Werror syntax checks pass for the new pool/TID and
+  startup tests. Independent read-only review and git diff --check pass.
+- NP3 production build and bounded depth8 Raft run per backend both produce
+  2,582 visits/1,347 new states; single-run full381/pages547 states/s. Artifacts
+  build/thread-tid-raft{,-pages}; these are smoke samples, not statistical claims.
+
+The unmodified minimal pthread probe in build/tid-pthread-probe stops explicitly
+at syscall14, rt_sigprocmask. No pthread/private-runtime state patches were added.

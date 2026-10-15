@@ -19,7 +19,7 @@ int startup_syscall_for_node(size_t node) {
 std::string runtime_profile_identity() {
   nlohmann::json identity{
     {"profile", "linux-x86_64-syscall-prelude-v1"},
-    {"kernel_model", "linux-x86_64-closed-syscalls-v4"},
+    {"kernel_model", "linux-x86_64-closed-syscalls-v5"},
     {"startup_syscall", profile.startup_syscall},
     {"startup_syscalls", profile.startup_syscalls},
     {"startup_syscall_limit", profile.startup_syscall_limit},

@@ -39,16 +39,17 @@ struct FutexWaiter
     uint64_t uaddr;                 // Futex address
     int val;                        // Expected value
     uint32_t bitset;                // For bitset operations
+    bool private_wait = false;      // Distinct Linux private/shared futex key
     bool timeout;                   // Whether waiter has timeout
 
     FutexWaiter() : tid(0), uaddr(0), val(0), bitset(~0), timeout(false) {}
-    FutexWaiter(pid_t t, uint64_t addr, int v, uint32_t bs = ~0)
-        : tid(t), uaddr(addr), val(v), bitset(bs), timeout(false) {}
+    FutexWaiter(pid_t t, uint64_t addr, int v, uint32_t bs = ~0, bool priv = false)
+        : tid(t), uaddr(addr), val(v), bitset(bs), private_wait(priv), timeout(false) {}
 
     template <class Archive>
     void serialize(Archive &ar)
     {
-        ar(tid, uaddr, val, bitset, timeout);
+        ar(tid, uaddr, val, bitset, timeout, private_wait);
     }
 };
 
@@ -85,10 +86,10 @@ public:
 
     // Wake threads waiting on an address
     // Returns: number of threads woken
-    int futex_wake(uint64_t uaddr, int nr_wake, uint32_t bitset = ~0);
+    int futex_wake(uint64_t uaddr, int nr_wake, uint32_t bitset = ~0, bool private_wait = false);
 
     // Requeue waiters from one address to another; return woken + moved.
-    int futex_requeue(uint64_t uaddr1, uint64_t uaddr2, int nr_wake, int nr_requeue);
+    int futex_requeue(uint64_t uaddr1, uint64_t uaddr2, int nr_wake, int nr_requeue, bool private_wait = false);
 
     // Wake all waiters whose address falls within [start, end) range
     // This is used when madvise(MADV_DONTNEED) discards memory pages

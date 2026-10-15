@@ -4,6 +4,7 @@
 #include "plugins.h"
 #include "common.h"
 #include "runtime_profile.h"
+#include "engine/thread_pool.h"
 #include <stdexcept>
 #include <algorithm>
 #include "emu.h"
@@ -364,25 +365,11 @@ syscall_info extract_one_syscall(pid_t pid)
   for (int i = 0; i < 6; i++)
     ret.args[i] = info.entry.args[i];
 
-  /* Handle clone: add CLONE_PTRACE flag to auto-trace child threads */
-  if (ret.nr == SYS_clone) {
-    uint64_t new_flags = ret.args[0] | 0x00002000; /* CLONE_PTRACE */
-    tracee_set_rdi(pid, new_flags);
-    LOG_INFO("Modified clone flags to add CLONE_PTRACE");
-  }
-
-  /* Handle clone3: modify clone_args.flags to add CLONE_PTRACE */
-  if (ret.nr == SYS_clone3) {
-    uint64_t args_ptr = ret.args[0];
-    if (args_ptr != 0) {
-      // Read flags from clone_args (first field)
-      uint64_t flags = ptrace(PTRACE_PEEKDATA, pid, args_ptr, NULL);
-      // Add CLONE_PTRACE flag
-      flags |= 0x00002000; /* CLONE_PTRACE */
-      ptrace(PTRACE_POKEDATA, pid, args_ptr, flags);
-      LOG_INFO("Modified clone3 args at %p, flags=0x%lx", (void*)args_ptr, flags);
-    }
-  }
+  // Thread ownership begins at exec, even in the trusted loader prelude.
+  // The prelude must end before births; children cannot run outside the model.
+  if (ret.nr == SYS_clone || ret.nr == SYS_clone3)
+    throw std::runtime_error("RuntimeProfile startup boundary must precede thread creation");
+  if (ret.nr == SYS_set_tid_address) tracee_set_rdi(pid,0);
 
   /* exit */
   resume_startup_syscall(pid);
@@ -392,13 +379,15 @@ syscall_info extract_one_syscall(pid_t pid)
     throw std::runtime_error("Unexpected syscall phase before configured RuntimeProfile startup boundary");
   ret.rval = info.exit.rval;
 
-  /* eliminate indeterministic syscall result */
-  /* set_tid_address */
-  if (ret.nr == SYS_set_tid_address)
-  {
-    ret.rval = 114514;
-    tracee_set_rax(pid, 114514);
-    LOG_INFO("Neutralize set_tid_address, return 114514");
+  if (ret.nr == SYS_set_tid_address) {
+    if (static_cast<int64_t>(ret.rval)<0)
+      throw std::runtime_error("Cannot detach startup clear_child_tid registration");
+    tracee_set_rdi(pid,ret.args[0]);
+    ret.rval=record_logical_clear_tid(ptmc_state.cursor,pid,ret.args[0]);
+    tracee_set_rax(pid,ret.rval);
+  } else if (ret.nr == SYS_getpid || ret.nr == SYS_gettid) {
+    ret.rval=logical_process_id(ptmc_state.cursor);
+    tracee_set_rax(pid,ret.rval);
   }
   /* getrandom */
   if (ret.nr == SYS_getrandom && ret.rval > 0)
@@ -431,87 +420,6 @@ syscall_info extract_one_syscall(pid_t pid)
       if (ret.args[argument] &&
           !guest_write_exact(pid, reinterpret_cast<void*>(ret.args[argument]), &zero, sizeof(zero)))
         throw std::runtime_error("Cannot normalize startup getcpu output");
-  }
-
-  /* Record new thread creation from clone/clone3 */
-  if ((ret.nr == SYS_clone || ret.nr == SYS_clone3) && ret.rval > 0)
-  {
-    pid_t new_tid = (pid_t)ret.rval;
-    LOG_INFO("New thread created: TID %d from parent %d", new_tid, pid);
-
-    // Record thread creation in tracee_state
-    int tracee_idx = ptmc_state.cursor;
-    if (tracee_idx >= 0 && tracee_idx < NP)
-    {
-      auto &child_state = ptmc_state.running_state.child[tracee_idx];
-
-      // Get clone flags from arguments
-      uint64_t clone_flags = 0;
-      uint64_t stack_addr = 0;
-      if (ret.nr == SYS_clone)
-      {
-        clone_flags = ret.args[0];
-        stack_addr = ret.args[1];
-      }
-      else if (ret.nr == SYS_clone3)
-      {
-        uint64_t args_ptr = ret.args[0];
-        if (args_ptr != 0)
-        {
-          clone_flags = ptrace(PTRACE_PEEKDATA, pid, args_ptr, NULL);
-          // stack is at offset 5*8 = 40 bytes in clone_args (after flags, pidfd, child_tid, parent_tid, exit_signal)
-          stack_addr = ptrace(PTRACE_PEEKDATA, pid, args_ptr + 40, NULL);
-        }
-      }
-
-      // Add thread to state
-      child_state.add_thread(new_tid, clone_flags, stack_addr, pid, false);
-
-      LOG_INFO("Recorded thread %d in tracee %d state (flags=0x%lx)",
-               new_tid, tracee_idx, clone_flags);
-    }
-
-    // Wait for the new thread to stop (SIGSTOP from CLONE_PTRACE)
-    // This is crucial: the new thread is created in a stopped state, and we
-    // need to wait for it and continue it so it can initialize and signal
-    // the parent thread (which may be waiting on a futex)
-    int wstatus_new;
-    int wait_retries = 0;
-    pid_t waited = 0;
-
-    // Try non-blocking wait first, then blocking wait with timeout
-    while (wait_retries < 100 && waited == 0) {
-      waited = waitpid(new_tid, &wstatus_new, WNOHANG);
-      if (waited == 0) {
-        usleep(1000);  // 1ms delay between retries
-        wait_retries++;
-      }
-    }
-
-    // If still not ready, try blocking wait as last resort
-    if (waited == 0) {
-      waited = waitpid(new_tid, &wstatus_new, WNOHANG);
-    }
-
-    if (waited == new_tid && WIFSTOPPED(wstatus_new))
-    {
-      LOG_INFO("New thread %d stopped with signal %d after %d retries, continuing",
-               new_tid, WSTOPSIG(wstatus_new), wait_retries);
-
-      // Continue the new thread to its first syscall entry
-      // This is essential: the new thread must run to initialize itself
-      // and signal any waiting threads (via futex wake)
-      ptrace_right(PTRACE_SYSCALL, new_tid, NULL, NULL);
-
-      // Note: We don't wait here because the parent thread also needs to run.
-      // The new thread will hit a syscall entry and stop, then when the user
-      // switches to it with 'thread N', it will be ready to execute.
-    }
-    else
-    {
-      LOG_WARN("New thread %d not in expected stopped state (waited=%d, retries=%d)",
-               new_tid, waited, wait_retries);
-    }
   }
 
   return ret;
@@ -559,6 +467,7 @@ static void init_tracee_state(int index)
   tracee_write_mem(pid, (void *)(scratch_page + 0xff0),
                    "\x0f\x05\x0f\x05\x0f\x05\x0f\x05", 8);
   capture_process_kernel_state(pid,index);
+  adopt_clear_child_tid(index,pid);
 }
 
 /* prepare tracee for ptrace, and execve */

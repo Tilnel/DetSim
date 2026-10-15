@@ -92,3 +92,6 @@
 
 !thread_lifecycle.mk
 !thread_lifecycle_integration.cpp
+
+!thread_tid.mk
+!thread_tid_integration.cpp

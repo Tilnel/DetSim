@@ -7,6 +7,7 @@
 #include "proc_status.h"
 #include "page_snapshot.h"
 #include "engine/exec_engine.h"
+#include "engine/thread_pool.h"
 #include "state_transition.h"
 #include <array>
 #include <cstdio>
@@ -56,6 +57,7 @@ int main(int argc, char**)
             ptmc_state.fd_managers[i] = std::make_shared<FdManager>();
             ptmc_state.fs_states[i].set_fd_manager(ptmc_state.fd_managers[i]);
             ptmc_state.sock_states[i].set_fd_manager(ptmc_state.fd_managers[i]);
+            adopt_clear_child_tid(i,children[i]);
         }
         StateStore::Config config;
         if (argc > 1) config.hot_cache_size = config.warm_cache_size = 1;

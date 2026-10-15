@@ -143,7 +143,7 @@ static void wait(FutexState &state, pid_t tid, uint64_t address,
                  int bitset = -1)
 {
   uint64_t value = 7;
-  CHECK(state.handle_futex(tid, address, FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG,
+  CHECK(state.handle_futex(tid, address, FUTEX_WAIT_BITSET,
                            7, 0, 0, bitset, &value) == 0);
   CHECK(state.is_thread_waiting(tid));
   CHECK(state.get_wait_address(tid) == address);
@@ -294,8 +294,30 @@ static void futex_requeue_validation()
   CHECK(state.handle_futex(5, 0x3001, FUTEX_WAIT, -1, 0, 0, 0, &value) == -EINVAL);
 }
 
+static void futex_private_and_shared_keys()
+{
+  FutexState state;
+  uint64_t value=7;
+  CHECK(state.handle_futex(1,0x1000,FUTEX_WAIT|FUTEX_PRIVATE_FLAG,7,0,0,0,&value)==0);
+  CHECK(state.handle_futex(2,0x1000,FUTEX_WAIT,7,0,0,0,&value)==0);
+  CHECK(state.handle_futex(3,0x1000,FUTEX_WAKE,1,0,0,0)==1);
+  CHECK(state.is_thread_waiting(1) && !state.is_thread_waiting(2));
+  CHECK(state.handle_futex(3,0x1000,FUTEX_WAKE|FUTEX_PRIVATE_FLAG,1,0,0,0)==1);
+  CHECK(!state.is_thread_waiting(1));
+  CHECK(state.handle_futex(1,0x1000,FUTEX_WAIT|FUTEX_PRIVATE_FLAG,7,0,0,0,&value)==0);
+  CHECK(state.handle_futex(2,0x1000,FUTEX_WAIT,7,0,0,0,&value)==0);
+  CHECK(state.handle_futex(3,0x1000,FUTEX_REQUEUE|FUTEX_PRIVATE_FLAG,0,1,0x2000,0)==1);
+  CHECK(state.get_wait_address(1)==0x2000 && state.get_wait_address(2)==0x1000);
+  std::stringstream data;{cereal::BinaryOutputArchive out(data);out(state);}
+  FutexState restored;{cereal::BinaryInputArchive in(data);in(restored);}
+  CHECK(restored.handle_futex(3,0x2000,FUTEX_WAKE,1,0,0,0)==0);
+  CHECK(restored.handle_futex(3,0x2000,FUTEX_WAKE|FUTEX_PRIVATE_FLAG,1,0,0,0)==1);
+  CHECK(state.is_thread_waiting(1) && restored.is_thread_waiting(2));
+}
+
 int main()
 {
+  futex_private_and_shared_keys();
   futex_requeue_validation();
   fd_snapshot_and_copy();
   fd_flags_and_stdio();
@@ -304,6 +326,6 @@ int main()
   futex_snapshot_and_copy();
   futex_requeue_and_range();
   futex_requeue_index_and_archive();
-  std::cout << "PASS: 8 state component cases (allocation, flags, copy, archive, "
+  std::cout << "PASS: 9 state component cases (allocation, flags, copy, archive, "
                "wait/wake/requeue/range)\n";
 }

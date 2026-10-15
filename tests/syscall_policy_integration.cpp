@@ -117,8 +117,7 @@ int main() {
         SyscallDispatcher dispatcher;
         check(SyscallRoute{}.action == SyscallAction::REJECT, "default route rejects unknown host effects");
         bool unknown_rejected = true;
-        for (const auto number : {-1, 1000000, SYS_prctl, SYS_kill, SYS_ptrace, SYS_reboot,
-                                  SYS_clone3})
+        for (const auto number : {-1, 1000000, SYS_prctl, SYS_kill, SYS_ptrace, SYS_reboot})
             unknown_rejected &= dispatcher.get_route(number).action == SyscallAction::REJECT;
         check(unknown_rejected, "unmodeled and out-of-range syscalls reject");
         auto result = execute(dispatcher, child, SYS_prctl,
@@ -134,7 +133,9 @@ int main() {
         const auto tid = execute(dispatcher, child, SYS_gettid);
         check(!tid.rejected && tid.value == result.value, "main gettid agrees with logical getpid");
         check(dispatcher.get_route(SYS_clone).action==SyscallAction::EMULATE &&
-              dispatcher.get_route(SYS_exit).action==SyscallAction::EMULATE,
+              dispatcher.get_route(SYS_exit).action==SyscallAction::EMULATE &&
+              dispatcher.get_route(SYS_clone3).action==SyscallAction::EMULATE &&
+              dispatcher.get_route(SYS_set_tid_address).action==SyscallAction::EMULATE,
               "thread lifecycle never executes the guest kernel syscall");
         result=execute(dispatcher,child,SYS_clone);
         check(result.rejected,"unsupported clone flags reject before kernel");

@@ -5,6 +5,10 @@ extern "C" detsim::ui::NCursesUI* get_ncurses_ui() { return nullptr; }
 #include "engine/signal_handler.h"
 #include "guest.h"
 #include "scheduler.h"
+#include "monitor.h"
+#include "engine/thread_pool.h"
+#include <sys/mman.h>
+#include <sys/prctl.h>
 #include <elf.h>
 #include <sys/wait.h>
 #include <sys/ptrace.h>
@@ -99,6 +103,47 @@ static void check_startup_exit_diagnostic() {
   } catch (...) { cleanup(); throw; }
   cleanup();
 }
+static uint32_t startup_tid_word=0xaabbccdd;
+static volatile long startup_tid_result=0;
+static void check_startup_tid_contract() {
+  const auto old_child=ptmc_state.running_state.child[0];
+  const int old_pid=ptmc_state.pids[0],old_cursor=ptmc_state.cursor;
+  pid_t pid=fork();require(pid>=0,"fork TID prelude fixture");
+  if (!pid) {
+    if (mmap(reinterpret_cast<void*>(scratch_page),4096,PROT_READ|PROT_WRITE|PROT_EXEC,
+             MAP_FIXED_NOREPLACE|MAP_PRIVATE|MAP_ANONYMOUS,-1,0)==MAP_FAILED) _exit(104);
+    auto* code=reinterpret_cast<unsigned char*>(scratch_page+0xff0);code[0]=0x0f;code[1]=0x05;
+    if (ptrace(PTRACE_TRACEME,0,nullptr,nullptr)) _exit(105);
+    asm volatile("int3");
+    startup_tid_result=syscall(SYS_set_tid_address,&startup_tid_word);
+    syscall(SYS_gettid);syscall(SYS_getpid);_exit(0);
+  }
+  auto cleanup=[&] {kill(pid,SIGKILL);waitpid(pid,nullptr,0);
+    ptmc_state.running_state.child[0]=old_child;ptmc_state.pids[0]=old_pid;ptmc_state.cursor=old_cursor;};
+  try {
+    int status=0;require(waitpid(pid,&status,0)==pid && WIFSTOPPED(status),"TID prelude stop");
+    require(ptrace(PTRACE_SETOPTIONS,pid,nullptr,PTRACE_O_TRACESYSGOOD|PTRACE_O_EXITKILL)==0,"TID prelude options");
+    ptmc_state.pids[0]=pid;ptmc_state.cursor=0;ptmc_state.running_state.child[0]=tracee_state{};
+    auto registration=extract_one_syscall(pid);
+    require(registration.nr==SYS_set_tid_address && registration.rval==uint64_t(logical_process_id(0)),
+            "prelude set_tid_address returned a fabricated or physical TID");
+    require(ptmc_state.running_state.child[0].threads[0].clear_child_tid==reinterpret_cast<uint64_t>(&startup_tid_word),
+            "prelude lost clear-child-tid registration");
+    require(extract_one_syscall(pid).rval==registration.rval && extract_one_syscall(pid).rval==registration.rval,
+            "prelude gettid/getpid disagree with registration identity");
+    long observed=0;
+    require(guest_read_exact(pid,const_cast<const long*>(&startup_tid_result),&observed,sizeof(observed)) &&
+            observed==logical_process_id(0),"prelude guest did not receive logical ID");
+    const auto address=scratch_page+0x300;
+    require(tracee_do_syscall(pid,SYS_prctl,PR_GET_TID_ADDRESS,address,0,0,0,0)==0,"query physical prelude registration");
+    uint64_t physical=1;uint32_t untouched=0;
+    require(guest_read_exact(pid,reinterpret_cast<void*>(address),&physical,sizeof(physical)) && physical==0 &&
+            guest_read_exact(pid,&startup_tid_word,&untouched,sizeof(untouched)) && untouched==0xaabbccdd,
+            "prelude leaked a physical registration or wrote set_tid_address target");
+  } catch (...) {cleanup();throw;}
+  cleanup();
+}
+
 int main(int argc, char** argv) {
   if (argc > 1) return 103; // Parent never resumes the fixture beyond exec stop.
 
@@ -147,5 +192,6 @@ int main(int argc, char** argv) {
   require(!detsim::runtime_profile().ignored_signals.count(SIGURG), "profile reset has no leftover policy");
   check_initial_auxv(argv[0]);
   check_startup_exit_diagnostic();
+  check_startup_tid_contract();
   std::puts("PASS explicit runtime startup, ELF normalization and signal policy");
 }

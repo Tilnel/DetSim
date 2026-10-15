@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <fstream>
+#include <cstdio>
 #include <linux/audit.h>
 #include <sys/wait.h>
 #include <map>
@@ -56,10 +58,8 @@ std::vector<pid_t> live_bindings(const tracee_state& state)
   return expected;
 }
 
-// No modelled call may register clear_child_tid. Inherited registrations still
-// need checking: keeping the physical thread alive would suppress kernel clear
-// and futex-wake effects when the logical thread exits.
-void require_no_clear_child_tid(pid_t tid)
+// Query without changing guest scratch contents or registers.
+uint64_t query_clear_child_tid(pid_t tid)
 {
   constexpr uintptr_t offset = 0x300;
   auto* remote = reinterpret_cast<void*>(scratch_page + offset);
@@ -74,8 +74,7 @@ void require_no_clear_child_tid(pid_t tid)
   if (result != 0)
     throw std::runtime_error("Cannot query inherited clear_child_tid: PR_GET_TID_ADDRESS requires CONFIG_CHECKPOINT_RESTORE");
   if (!copied) throw std::runtime_error("Cannot read inherited clear_child_tid address");
-  if (address)
-    throw std::runtime_error("Raw thread lifecycle does not support inherited clear_child_tid registration");
+  return address;
 }
 
 void require_no_rseq(pid_t tid)
@@ -103,6 +102,68 @@ void require_empty_robust_list(pid_t tid)
     throw std::runtime_error("Cannot read thread robust futex list before logical exit");
   if (head.list.next != reinterpret_cast<robust_list*>(remote) || head.list_op_pending)
     throw std::runtime_error("Logical exit does not support nonempty or pending robust futex ownership");
+}
+
+void validate_tid_pointer(uint64_t address)
+{
+  if (address < scratch_page + 4096 && address > scratch_page - sizeof(int32_t))
+    throw std::runtime_error("TID write overlaps reserved control memory");
+}
+
+// Kernel put_user(u32) does not leave a prefix written on an x86 page fault.
+// process_vm_writev can, so verify the whole range while every carrier is stopped.
+bool write_tid_word(pid_t pid, uint64_t address, int32_t value, bool clearing = false)
+{
+  if (!address || address > UINT64_MAX - sizeof(value)) return false;
+  std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
+  if (!maps) throw std::runtime_error("Cannot inspect TID write mappings");
+  const uint64_t end = address + sizeof(value);
+  uint64_t cursor = address;
+  std::string line;
+  while (std::getline(maps, line)) {
+    unsigned long long start = 0, stop = 0, offset = 0, inode = 0;
+    unsigned major = 0, minor = 0;
+    char permissions[5]{};
+    if (std::sscanf(line.c_str(), "%llx-%llx %4s %llx %x:%x %llu",
+                    &start, &stop, permissions, &offset, &major, &minor, &inode) != 7)
+      throw std::runtime_error("Cannot parse TID write mappings");
+    if (stop <= cursor) continue;
+    if (start > cursor) return false;
+    if (permissions[1] != 'w') {
+      // A read-only file page can still provide a shared futex key although
+      // put_user fails. That COW/backing distinction is outside this profile.
+      if (clearing && inode && (address % alignof(int32_t) == 0))
+        throw std::runtime_error("Unsupported clear_child_tid on read-only file mapping");
+      return false;
+    }
+    cursor = std::min<uint64_t>(stop, end);
+    if (cursor == end) {
+      if (!guest_write_exact(pid, reinterpret_cast<void*>(address), &value, sizeof(value)))
+        throw std::runtime_error("TID write failed after writable-range validation");
+      return true;
+    }
+  }
+  if (maps.bad()) throw std::runtime_error("Cannot read TID write mappings");
+  return false;
+}
+
+void clear_logical_tid(int node, tracee_state& state, thread_state& thread)
+{
+  const bool shared_mm = std::any_of(state.threads.begin(), state.threads.end(),
+      [&thread](const thread_state& peer) { return &peer != &thread && peer.alive; });
+  if (thread.clear_child_tid && shared_mm) {
+    const bool written = write_tid_word(thread.physical_tid, thread.clear_child_tid, 0, true);
+    if (written && thread.clear_child_tid % alignof(int32_t) == 0 && state.futex_state)
+      state.futex_state->futex_wake(thread.clear_child_tid, 1, ~0u, false);
+  }
+  thread.clear_child_tid = 0;
+  thread.child_settid_pending = false;
+  thread.pending_child_settid = 0;
+  if (state.futex_state) {
+    state.futex_state->wake_thread(thread.tid);
+    for (size_t i = 0; i < state.threads.size(); ++i)
+      ptmc_state.thread_blocked[node][i] = state.futex_state->is_thread_waiting(state.threads[i].tid);
+  }
 }
 
 void validate_bound_slots(const CarrierPool& pool, const tracee_state& state)
@@ -135,6 +196,60 @@ pid_t logical_thread_id(int node, pid_t slot)
   if (slot < 1 || slot > MAX_THREADS_PER_PROCESS)
     throw std::runtime_error("Logical thread slot out of range");
   return logical_process_id(node) + slot - 1;
+}
+
+pid_t record_logical_clear_tid(int node, pid_t physical_tid, uint64_t address)
+{
+  if (node < 0 || node >= NP) throw std::runtime_error("Thread pool node out of range");
+  validate_tid_pointer(address);
+  auto& state = ptmc_state.running_state.child[node];
+  if (state.threads.empty()) {
+    if (physical_tid != ptmc_state.pids[node])
+      throw std::runtime_error("Initial logical thread must be the owned leader");
+    state.add_thread(physical_tid, 0, 0, 0, true);
+  }
+  const auto found = std::find_if(state.threads.begin(), state.threads.end(),
+      [physical_tid](const thread_state& thread) { return thread.alive && thread.physical_tid == physical_tid; });
+  if (found == state.threads.end()) throw std::runtime_error("set_tid_address has no live owned thread");
+  found->clear_child_tid = address;
+  return logical_thread_id(node, found->tid);
+}
+
+void adopt_clear_child_tid(int node, pid_t physical_tid)
+{
+  if (node < 0 || node >= NP) throw std::runtime_error("Thread pool node out of range");
+  auto& state = ptmc_state.running_state.child[node];
+  const bool owned = state.threads.empty() ? physical_tid == ptmc_state.pids[node] :
+      std::any_of(state.threads.begin(), state.threads.end(),
+          [physical_tid](const thread_state& thread) { return thread.alive && thread.physical_tid == physical_tid; });
+  if (!owned) throw std::runtime_error("Cannot adopt unowned thread registration");
+  const uint64_t address = query_clear_child_tid(physical_tid);
+  // Bootstrap may already have recorded a logical registration and suppressed
+  // the kernel call. Preserve it when there is nothing physical to transfer.
+  if (address || state.threads.empty()) record_logical_clear_tid(node, physical_tid, address);
+  const auto result = static_cast<int64_t>(tracee_do_syscall(physical_tid,
+      SYS_set_tid_address, 0, 0, 0, 0, 0, 0));
+  if (result != physical_tid)
+    throw std::runtime_error("Cannot disable carrier clear_child_tid registration");
+}
+
+void complete_thread_start(int node, pid_t physical_tid)
+{
+  if (node < 0 || node >= NP) throw std::runtime_error("Thread pool node out of range");
+  auto& state = ptmc_state.running_state.child[node];
+  const auto found = std::find_if(state.threads.begin(), state.threads.end(),
+      [physical_tid](const thread_state& thread) { return thread.alive && thread.physical_tid == physical_tid; });
+  // Single-thread engine component callers can run before their first snapshot.
+  if (found == state.threads.end()) {
+    if (state.threads.empty() && physical_tid == ptmc_state.pids[node]) return;
+    throw std::runtime_error("Thread start has no live owned carrier");
+  }
+  if (!found->child_settid_pending) return;
+  verify_thread_pool(node);
+  const int32_t id = logical_thread_id(node, found->tid);
+  write_tid_word(physical_tid, found->pending_child_settid, id);
+  found->child_settid_pending = false;
+  found->pending_child_settid = 0;
 }
 
 void prepare_thread_pool(int node, const tracee_state& state)
@@ -223,7 +338,8 @@ void clear_thread_pools() { pools.clear(); }
 void validate_logical_clone(uint64_t flags)
 {
   constexpr uint64_t required = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
-  constexpr uint64_t allowed = required | CLONE_SYSVSEM | CLONE_SETTLS;
+  constexpr uint64_t allowed = required | CLONE_SYSVSEM | CLONE_SETTLS |
+      CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
   if ((flags & required) != required || (flags & ~allowed))
     throw std::runtime_error("Unsupported raw clone thread flags");
 }
@@ -231,7 +347,15 @@ void validate_logical_clone(uint64_t flags)
 pid_t create_logical_thread(int node, pid_t parent, uint64_t flags,
                             uint64_t stack, uint64_t tls)
 {
+  return create_logical_thread(node, parent, CloneRequest{flags, stack, tls, 0, 0});
+}
+
+pid_t create_logical_thread(int node, pid_t parent, const CloneRequest& request)
+{
+  const auto [flags, stack, tls, parent_tid, child_tid] = request;
   validate_logical_clone(flags);
+  if (flags & CLONE_PARENT_SETTID) validate_tid_pointer(parent_tid);
+  if (flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID)) validate_tid_pointer(child_tid);
   if (!stack) throw std::runtime_error("Raw clone requires a child stack");
   if ((stack >= scratch_page && stack <= scratch_page + 4096) ||
       ((flags & CLONE_SETTLS) && tls >= scratch_page && tls < scratch_page + 4096))
@@ -243,7 +367,9 @@ pid_t create_logical_thread(int node, pid_t parent, uint64_t flags,
   if (rseq_len[pool.anchor] != 0)
     throw std::runtime_error("Raw clone thread pool does not support active rseq registration");
   for (pid_t tid : pool.carriers) require_no_rseq(tid);
-  for (pid_t tid : pool.carriers) require_no_clear_child_tid(tid);
+  for (pid_t tid : pool.carriers)
+    if (query_clear_child_tid(tid))
+      throw std::runtime_error("Thread carrier has unadopted inherited clear_child_tid registration");
   if (state.threads.size() >= MAX_THREADS_PER_PROCESS)
     throw std::runtime_error("Logical thread birth limit exceeded");
   const auto source = std::find_if(state.threads.begin(), state.threads.end(),
@@ -277,6 +403,14 @@ pid_t create_logical_thread(int node, pid_t parent, uint64_t flags,
   auto& child = state.threads.back();
   child.regs = regs;
   child.xstate = xstate;
+  child.clear_child_tid = (flags & CLONE_CHILD_CLEARTID) ? child_tid : 0;
+  child.child_settid_pending = flags & CLONE_CHILD_SETTID;
+  child.pending_child_settid = child.child_settid_pending ? child_tid : 0;
+  if (flags & CLONE_PARENT_SETTID) {
+    const int32_t id = logical_thread_id(node, child.tid);
+    // Linux ignores put_user failure for clone TID writeback.
+    write_tid_word(parent, parent_tid, id);
+  }
   const auto child_slot = state.threads.size() - 1;
   state.si[child_slot] = state.si[parent_slot];
   state.si[child_slot].rval = 0;
@@ -293,7 +427,8 @@ bool exit_logical_thread(int node, pid_t physical_tid, int exit_code)
   const auto found = std::find_if(state.threads.begin(), state.threads.end(),
       [physical_tid](const thread_state& thread) { return thread.alive && thread.physical_tid == physical_tid; });
   if (found == state.threads.end()) throw std::runtime_error("Logical exit has no live owned thread");
-  require_no_clear_child_tid(physical_tid);
+  if (query_clear_child_tid(physical_tid))
+    throw std::runtime_error("Thread carrier has unadopted inherited clear_child_tid registration");
   require_empty_robust_list(physical_tid);
   if (ptrace(PTRACE_GETREGS, physical_tid, nullptr, &found->regs) == -1)
     throw std::runtime_error("Cannot capture exiting thread registers");
@@ -301,7 +436,7 @@ bool exit_logical_thread(int node, pid_t physical_tid, int exit_code)
   found->xstate = capture_xstate(physical_tid);
   found->exit_code = exit_code & 255;
   const auto slot = static_cast<size_t>(found - state.threads.begin());
-  if (state.futex_state) state.futex_state->wake_thread(found->tid);
+  clear_logical_tid(node, state, *found);
   found->alive = false;
   found->physical_tid = 0;
   ptmc_state.thread_exited[node][slot] = true;
@@ -321,17 +456,24 @@ void exit_logical_process(int node, pid_t caller, int exit_code)
       [caller](const thread_state& thread) { return thread.alive && thread.physical_tid == caller; }))
     throw std::runtime_error("Logical process exit has no live owned caller");
   // Check every owner before changing any peer's lifecycle or futex queues.
-  for (const auto& thread : state.threads)
-    if (thread.alive) require_empty_robust_list(thread.physical_tid);
+  for (const auto& thread : state.threads) {
+    if (!thread.alive) continue;
+    require_empty_robust_list(thread.physical_tid);
+    if (query_clear_child_tid(thread.physical_tid))
+      throw std::runtime_error("Thread carrier has unadopted inherited clear_child_tid registration");
+  }
   for (size_t i = 0; i < state.threads.size(); ++i) {
     auto& thread = state.threads[i];
     if (!thread.alive) continue;
+    // Linux performs the newborn's CHILD_SETTID before processing group death.
+    // Keep this paired with each slot's exit so aliased TID stores retain order.
+    complete_thread_start(node, thread.physical_tid);
     if (ptrace(PTRACE_GETREGS, thread.physical_tid, nullptr, &thread.regs) == -1)
       throw std::runtime_error("Cannot capture terminating thread registers");
     thread.xstate = capture_xstate(thread.physical_tid);
     if (thread.physical_tid == caller) thread.regs.rax = 0;
     thread.exit_code = exit_code & 255;
-    if (state.futex_state) state.futex_state->wake_thread(thread.tid);
+    clear_logical_tid(node, state, thread);
     thread.alive = false;
     thread.physical_tid = 0;
     ptmc_state.thread_blocked[node][i] = false;

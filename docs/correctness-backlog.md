@@ -9,7 +9,7 @@ relationship to the native-binary model-checking goal.
 | ID | Priority | Evidence / problem | Evidence required to close |
 | --- | --- | --- | --- |
 | C01 | Fixed (unchanged live thread set) | Futex queues are branch-owned, captured and archived; restore reconstructs blocked state, including same-hash restores. | `check-futex-snapshot` exercises capture/copy/assignment/archive, persisted reload and repeated ptrace restore/wake. Raw lifecycle/carrier restore has separate C02 tests; combined lifecycle and futex waiting still needs wider coverage. |
-| C02 | P0 / partial | Capture preserves virtual slots and creation records; raw clone/exit now restore logical contexts over retained carriers; unexpected physical death or untracked creation rejects. Physical TIDs now stay in transient bindings; explicit liveness and logical parent IDs enter archives. Guest-visible physical IDs in register/memory contents are not normalized. | Create A/B, exit A, create C, repeatedly restore with correct logical identity and TLS/stop phases. `check-thread-lifecycle` now covers that sequence, TLS, persisted replay, main-first exit and actual carrier reuse. pthread, TID writeback, robust owner-death and rseq remain unsupported. |
+| C02 | P0 / partial | Capture preserves virtual slots and creation records; raw clone/exit now restore logical contexts over retained carriers; unexpected physical death or untracked creation rejects. Physical TIDs now stay in transient bindings; explicit liveness and logical parent IDs enter archives. Guest-visible physical IDs in register/memory contents are not normalized. | Create A/B, exit A, create C, repeatedly restore with correct logical identity and TLS/stop phases. `check-thread-lifecycle` now covers that sequence, TLS, persisted replay, main-first exit and actual carrier reuse. TID writeback/clear-tid now have join and replay coverage; full pthread, robust owner-death and rseq remain unsupported. |
 | C03 | P0 | New BFS sets a selected thread before `state_transition`; recovery and `execute_step` synchronization can overwrite that selection. Two exploration implementations remain compiled; CLI uses the old one. | A two-thread finite program exposes both successor transitions from one snapshot. Trace all callers, compare BFS/DFS results, then consolidate to one path. |
 | C04 | Partial | Ordered system metadata identity includes status/budget; storage now compares duplicate bytes in cache, packed records and metadata instead of trusting hashes alone. | Identity and all storage gates cover ordering and duplicate conflicts. Logical thread identity and equivalence of differently encoded semantic states remain open. |
 | C05 | Fixed (scoped) | Removed filename heuristics; corrected libelf string-table index in Go-section detection. | Native `test_probe` starts at the same boundary as `probe`; ordinary/Go-section ELF fixtures and two existing gc Go binaries classified correctly. gccgo and actual Go runtime execution remain unverified. |
@@ -186,3 +186,14 @@ Guard mappings, per-task masks/altstack, timed waits, robust and signal delivery
 remain generic capabilities. The rseq whole-region masking/live-byte preservation
 shortcut remains unverified semantic debt, including on the single-thread path;
 raw clone currently rejects rseq rather than certifying that shortcut.
+
+## TID/clear-tid slice completed
+
+clone3 and clone now share TID birth/clear semantics, with explicit pending child
+write state and initial-thread identity handled from syscall entry. The prelude
+114514 return and uncontrolled thread creation path are removed. Shared/private
+futex waiters are distinct and persist across wake/requeue/restore. Native-oracle
+and full/pages replay tests pass; format17/18 and kernel modelv5 reject prior
+execution contexts. Parent-first syscall atoms and fixed group cleanup order
+remain scoped. The next observed blocker for unmodified pthread is rt_sigprocmask;
+guard mappings, rseq policy, robust ownership and full signal delivery remain open.

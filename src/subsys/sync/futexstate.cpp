@@ -92,13 +92,13 @@ int FutexState::handle_futex(pid_t tid, uint64_t uaddr, int futex_op, int val,
         if (is_thread_waiting(tid))
             throw std::runtime_error("thread already has a pending futex wait");
         add_waiter(FutexWaiter(tid, uaddr, val,
-                              op == FUTEX_WAIT_BITSET ? static_cast<uint32_t>(val3) : ~0u));
+                              op == FUTEX_WAIT_BITSET ? static_cast<uint32_t>(val3) : ~0u, is_private(futex_op)));
         return 0;
     case FUTEX_WAKE:
     case FUTEX_WAKE_BITSET:
         // Linux standalone WAKE wakes one matching waiter even when val <= 0.
         return futex_wake(uaddr, std::max(1, val),
-                          op == FUTEX_WAKE_BITSET ? static_cast<uint32_t>(val3) : ~0u);
+                          op == FUTEX_WAKE_BITSET ? static_cast<uint32_t>(val3) : ~0u, is_private(futex_op));
     case FUTEX_REQUEUE:
     case FUTEX_CMP_REQUEUE:
         if (uaddr2 % sizeof(uint32_t) || val < 0 || static_cast<int32_t>(timeout_addr) < 0)
@@ -109,13 +109,13 @@ int FutexState::handle_futex(pid_t tid, uint64_t uaddr, int futex_op, int val,
                 return -EAGAIN;
         }
         // The fourth syscall argument is val2, not a timeout or val3.
-        return futex_requeue(uaddr, uaddr2, val, static_cast<int32_t>(timeout_addr));
+        return futex_requeue(uaddr, uaddr2, val, static_cast<int32_t>(timeout_addr), is_private(futex_op));
     default:
         throw std::runtime_error("unreachable futex operation");
     }
 }
 
-int FutexState::futex_wake(uint64_t uaddr, int nr_wake, uint32_t bitset)
+int FutexState::futex_wake(uint64_t uaddr, int nr_wake, uint32_t bitset, bool private_wait)
 {
     auto it = waiters_.find(uaddr);
     if (it == waiters_.end() || it->second.empty()) {
@@ -127,7 +127,7 @@ int FutexState::futex_wake(uint64_t uaddr, int nr_wake, uint32_t bitset)
     std::vector<FutexWaiter> remaining;
 
     for (auto &waiter : queue) {
-        if (woken < nr_wake && (waiter.bitset & bitset)) {
+        if (waiter.private_wait == private_wait && woken < nr_wake && (waiter.bitset & bitset)) {
             // Wake this thread
             waiter_map_.erase(waiter.tid);
             woken++;
@@ -163,26 +163,27 @@ std::vector<pid_t> FutexState::get_waiters(uint64_t uaddr) const
     return result;
 }
 
-int FutexState::futex_requeue(uint64_t uaddr1, uint64_t uaddr2, int nr_wake, int nr_requeue)
+int FutexState::futex_requeue(uint64_t uaddr1, uint64_t uaddr2, int nr_wake, int nr_requeue,
+                              bool private_wait)
 {
     if (uaddr1 % sizeof(uint32_t) || uaddr2 % sizeof(uint32_t) || nr_wake < 0 || nr_requeue < 0)
         return -EINVAL;
-    const int woken = futex_wake(uaddr1, nr_wake);
+    const int woken = futex_wake(uaddr1, nr_wake, ~0u, private_wait);
     auto source = waiters_.find(uaddr1);
     if (source == waiters_.end()) return woken;
-    const int moved = std::min<size_t>(nr_requeue, source->second.size());
-    // Linux permits non-PI same-key requeue: count the selected waiters,
-    // retaining their queue and arrival order without appending into itself.
+    auto& queue = source->second;
+    const int eligible = std::count_if(queue.begin(),queue.end(),
+        [private_wait](const auto& waiter){return waiter.private_wait == private_wait;});
+    const int moved = std::min(nr_requeue,eligible);
     if (uaddr1 == uaddr2) return woken + moved;
-    auto &queue = source->second;
-    auto &target = waiters_[uaddr2];
-    for (int i = 0; i < moved; ++i) {
-        auto waiter = queue[i];
-        waiter.uaddr = uaddr2;
-        target.push_back(waiter);
-        waiter_map_[waiter.tid] = uaddr2;
+    auto& target = waiters_[uaddr2];
+    int remaining = moved;
+    for (auto it=queue.begin(); it!=queue.end() && remaining;) {
+        if (it->private_wait != private_wait) {++it;continue;}
+        auto waiter=*it;waiter.uaddr=uaddr2;
+        target.push_back(waiter);waiter_map_[waiter.tid]=uaddr2;
+        it=queue.erase(it);--remaining;
     }
-    queue.erase(queue.begin(), queue.begin() + moved);
     if (queue.empty()) waiters_.erase(source);
     if (target.empty()) waiters_.erase(uaddr2);
     return woken + moved;

@@ -4,6 +4,7 @@
 
 #include "exec_engine.h"
 #include "thread_manager.h"
+#include "thread_pool.h"
 #include "signal_handler.h"
 #include "syscall/dispatcher.h"
 #include "guest.h"
@@ -64,6 +65,7 @@ int ExecutionEngine::do_single_syscall(pid_t pid, syscall_info& info)
     // old snapshot image before the first resume, not after handler success.
     if (ptmc_state.cursor >= 0 && ptmc_state.cursor < NP)
         ptmc_state.tracee_image_dirty[ptmc_state.cursor] = true;
+    complete_thread_start(ptmc_state.cursor, pid);
     // Entry
     ptrace_right(PTRACE_SYSCALL, pid, NULL, NULL);
     waitpid(pid, &wstatus, 0);

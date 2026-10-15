@@ -16,6 +16,10 @@
 #include "net/sockstate.h"
 #include "net/emu.h"
 #include <sys/syscall.h>
+#include <linux/sched.h>
+#include <algorithm>
+#include <array>
+#include <limits>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <sys/ptrace.h>
@@ -368,14 +372,17 @@ int handle(pid_t pid, syscall_info &info) {
         case SYS_clone:      return handle_clone(pid, info);
         case SYS_clone3:     return handle_clone3(pid, info);
         case SYS_gettid:     return handle_gettid(pid, info);
+        case SYS_set_tid_address:
+            info.rval=record_logical_clear_tid(ptmc_state.cursor,pid,info.args[0]);
+            tracee_set_rax(pid,info.rval);return CKPT_YES;
         case SYS_exit:       return handle_exit(pid, info);
         case SYS_exit_group: return handle_exit_group(pid, info);
         default:             return CKPT_NO;
     }
 }
 
-int handle_clone(pid_t pid, syscall_info &info) {
-    const pid_t slot=create_logical_thread(ptmc_state.cursor,pid,info.args[0],info.args[1],info.args[4]);
+static int finish_clone(pid_t pid, syscall_info& info, const CloneRequest& request) {
+    const pid_t slot=create_logical_thread(ptmc_state.cursor,pid,request);
     auto& child_info=ptmc_state.running_state.child[ptmc_state.cursor].si[slot-1];
     child_info=info;child_info.rval=0;
     info.rval=logical_thread_id(ptmc_state.cursor,slot);
@@ -383,8 +390,44 @@ int handle_clone(pid_t pid, syscall_info &info) {
     return CKPT_YES;
 }
 
-int handle_clone3(pid_t, syscall_info &) {
-    throw std::runtime_error("clone3 is outside the supported raw-thread profile");
+int handle_clone(pid_t pid, syscall_info &info) {
+    return finish_clone(pid,info,{info.args[0],info.args[1],info.args[4],info.args[2],info.args[3]});
+}
+
+int handle_clone3(pid_t pid, syscall_info &info) {
+    auto error=[&](long value) {info.rval=value;tracee_set_rax(pid,value);return CKPT_YES;};
+    const auto size=info.args[1];
+    if (size<CLONE_ARGS_SIZE_VER0) return error(-EINVAL);
+    if (size>4096) return error(-E2BIG);
+    clone_args args{};
+    if (size>sizeof(args)) {
+        std::array<unsigned char,4096-sizeof(args)> tail{};
+        if (info.args[0]>UINT64_MAX-size || !guest_read_exact(pid,
+            reinterpret_cast<const void*>(info.args[0]+sizeof(args)),tail.data(),size-sizeof(args)))
+            return error(-EFAULT);
+        if (std::any_of(tail.begin(),tail.begin()+size-sizeof(args),[](auto byte){return byte!=0;}))
+            return error(-E2BIG);
+    }
+    // Linux checks an oversized ABI tail before copying the known header.
+    if (!guest_read_exact(pid,reinterpret_cast<const void*>(info.args[0]),&args,
+                          std::min<uint64_t>(size,sizeof(args)))) return error(-EFAULT);
+    // Only shared-address-space threads are implemented. Ignored ABI fields
+    // (e.g. pidfd without CLONE_PIDFD) are not treated as active requests.
+    if (args.exit_signal>64 || args.set_tid_size>32 ||
+        bool(args.set_tid)!=bool(args.set_tid_size)) return error(-EINVAL);
+    validate_logical_clone(args.flags);
+    if (args.exit_signal) return error(-EINVAL);
+    if (args.set_tid_size) throw std::runtime_error("clone3 explicit TID selection is unsupported");
+    if ((!args.stack)!=(!args.stack_size) || args.stack>UINT64_MAX-args.stack_size)
+        return error(-EINVAL);
+    if (args.stack >= (uint64_t{1}<<63) || args.stack_size >= (uint64_t{1}<<63))
+        return error(-EINVAL);
+    // The ordinary lower canonical range is common to four- and five-level
+    // x86-64 kernels. Do not guess access_ok for extended address layouts.
+    constexpr uint64_t ordinary_limit=(uint64_t{1}<<47)-4096;
+    if (args.stack>=ordinary_limit || args.stack_size>ordinary_limit-args.stack)
+        throw std::runtime_error("clone3 extended virtual-address stack ranges are unsupported");
+    return finish_clone(pid,info,{args.flags,args.stack+args.stack_size,args.tls,args.parent_tid,args.child_tid});
 }
 
 int handle_gettid(pid_t pid, syscall_info &info) {

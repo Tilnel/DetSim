@@ -25,6 +25,7 @@ make check-storage       # storage faults/concurrency/reopen + read-only tools; 
 make check-integration   # production DWARF/ELF fixtures; default NP=1
 make check-scenarios     # build NP=1 tracer and run isolated native ptrace scenarios
 make check-thread-control check-thread-identity check-thread-carrier # NP=1 thread gates
+make check-thread-tid # NP=1 clone/clone3 TID, clear-tid/join and restore
 make check-thread-lifecycle # NP=1 raw clone/exit, TLS, full/pages + cache pressure
 make check-futex check-futex-snapshot # NP=1 wait/wake/requeue and branch restore
 make check-xstate check-exec check-state-io check-mappings # NP=1 state/atom gates
@@ -130,8 +131,8 @@ enter snapshot state. Loader CPU-feature normalization still logs an unresolved
 symbol (C17). Passing counter/replay tests does not close that gap,
 nor does it prove multithread, cross-process-run or eviction correctness.
 
-Default snapshot format is version 15; older formats are rejected without migration.
-This branch additionally reads opt-in version 16 page manifests, selected with
+Default snapshot format is version 17; older formats are rejected without migration.
+This branch additionally reads opt-in version 18 page manifests, selected with
 `DETSIM_SNAPSHOT_BACKEND=pages`; `verify-pages` adds a full memory oracle.
 See [page snapshots and whole-exploration measurements](page-snapshots.md).
 Private readable mappings are captured; shared/unreadable mappings, overlaps with
@@ -221,7 +222,7 @@ successor. Pure predecessor/target comparisons need no monitor state.
 
 Plugin binaries/schema/configuration, target executable contents and semantic
 execution configuration form the model compatibility fingerprint. Executables must remain immutable during a run. Changing cache
-sizes or loading a decoder does not change it. Flat15/page16 and the versioned
+sizes or loading a decoder does not change it. Flat17/page18 and the versioned
 system metadata reject older archives without deleting or migrating stores.
 Changes to kernel-model or inspection semantics require an explicit compatibility
 version bump; fingerprints do not prove equivalence between different implementations.
@@ -280,7 +281,7 @@ architecture summary or an unverified “completed” report.
 
 Exploration rejects unregistered system calls before kernel execution. The native
 allowlist is limited to credential queries, query-only
-resource limits and supported private memory operations. Raw thread clone/exit use the carrier model below; `clone3`, fork and unsupported
+resource limits and supported private memory operations. Thread clone/clone3/exit use the carrier model below; fork and unsupported
 thread flags reject. `exit_group` retains virtual process termination.
 The trusted ELF prelude and internal restore injections are separate boundaries.
 
@@ -292,7 +293,7 @@ closure within an explicit environment, not compatibility with all Linux program
 
 ## Logical thread archives
 
-Flat15/page16 archive explicit thread liveness and logical parent IDs; physical
+Flat17/page18 archive explicit thread liveness and logical parent IDs; physical
 TIDs are transient bindings. Same-run captured hashes retain compact runtime
 provenance tied to an owned process pidfd, which is required on the host kernel.
 Disk reload may inspect any valid snapshot, but execution restore requires local
@@ -308,12 +309,12 @@ and successful validation after stopping it. Raw carrier reconciliation now cove
 
 ## Raw thread lifecycle profile
 
-`clone` requires VM/FS/FILES/SIGHAND/THREAD sharing, with optional SYSVSEM and
-SETTLS. Other flags, clone3, TID writeback and clear-child-tid registration are
-unsupported. An inherited nonzero clear-child-tid pointer or active kernel rseq
-registration rejects birth. Nonempty/pending robust futex ownership rejects exit;
-raw thread exit also requires a zero clear-child-tid registration. The tests clear
-these registrations explicitly; ordinary glibc/pthread startup is not certified.
+`clone` and `clone3` require VM/FS/FILES/SIGHAND/THREAD sharing, with optional
+SYSVSEM, SETTLS, PARENT_SETTID, CHILD_SETTID and CHILD_CLEARTID. Other flags reject.
+Initial clear-tid registration transfers into the logical task; carrier kernel
+registrations stay zero. Active kernel rseq registration still rejects birth. Nonempty/pending robust futex ownership rejects exit;
+raw thread exit performs modeled clear-tid notification. The rseq/robust limits
+still apply; ordinary glibc/pthread startup is not certified.
 Host support for PR_GET_TID_ADDRESS and PTRACE_GET_RSEQ_CONFIGURATION is required.
 
 The creator suppresses the guest clone, creates a kernel carrier only when the
@@ -396,10 +397,9 @@ The next platform slices should be tested across runtimes:
    interruption/restart. pthread cancellation and Go asynchronous preemption
    exercise that shared machinery; suppressing their signals changes behavior.
 
-Two existing prelude shortcuts need independent repair: set_tid_address returns
-114514 after executing the real registration, and capture masks the whole recorded
-rseq region while restore preserves its live bytes. These are not a foundation for
-full runtime support. ABI handlers should apply consistently from the exec stop,
+The audit found two prelude shortcuts: a fabricated set_tid_address return and
+whole-region rseq masking/live-byte preservation. The TID slice below removes the
+former; the rseq behavior still needs independent repair. ABI handlers should apply consistently from the exec stop,
 even where the loader prelude otherwise remains a declared trusted environment.
 
 OS-thread fidelity and schedule coverage remain separate acceptance levels.
@@ -417,3 +417,37 @@ raw ABI + glibc/musl create/join/TLS and restore; then mutex/condition/timeouts;
 then robust, signals/cancellation, gc Go scheduling/netpoll/GC, and mixed cgo.
 A runtime starting or one pthread example passing does not establish exhaustive
 model checking for that runtime.
+
+## TID birth and join contract
+
+Flat17/page18 records clear_child_tid and pending CHILD_SETTID state. Parent TID
+copyout writes32 bits before the modeled clone completes; child copyout occurs
+once, before its first guest instruction. set_tid_address changes only the logical
+registration and returns its logical TID. The loader prelude redirects physical
+registration to NULL, records the original pointer and returns the same logical
+identity as exploration; the114514 shortcut and uncontrolled prelude clone path
+are removed. Startup must end before thread birth.
+
+Exit clears32 bits and performs a shared futex wake when another logical task
+still uses the address space. The last logical task does not clear; retained host
+carriers do not affect this decision. Private/shared waiters are distinct, including
+wake/requeue and archives. Failed TID put_user operations do not fail clone; the
+whole4-byte writable range is checked first to avoid non-native partial stores.
+Read-only file-backed clear-tid wake semantics remain explicitly unsupported.
+
+clone3 validates sizes, extensions and stack arithmetic before birth. Explicit
+TID selection, unsupported flags and extended stack address ranges outside the
+ordinary lower x86-64 range reject. The completed-syscall model remains
+parent-return-first; it does not enumerate child execution before parent return.
+exit_group uses fixed slot cleanup order, performing each pending child write
+before that slot exits. General backing-based/cross-process shared futex keys and
+full termination cleanup are not certified.
+
+`check-thread-tid` runs clone/clone3 x full/pages x normal/tiny-cache oracles,
+including persisted pending/registered states as transition sources, shared join,
+private-wait isolation, registration replacement/cancellation, last-task behavior,
+invalid and cross-page addresses, group termination before child user code, and
+clone3 error precedence. `check-runtime-profile` verifies initial-thread logical
+identity and disabled physical clear-tid registration. A minimal unmodified glibc
+pthread probe still stops at rt_sigprocmask (syscall14); this slice is ABI progress,
+not complete pthread support. Its local transcript is in build/tid-pthread-probe/.
