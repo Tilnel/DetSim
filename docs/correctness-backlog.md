@@ -38,8 +38,8 @@ relationship to the native-binary model-checking goal.
 
 ## Next development slice
 
-Page snapshot branch (2026-10-15): opt-in page manifests (now v8) and page objects use the
-existing barrier; flat snapshots (now v7) stay default. Exact decoded flat/page ptrace oracles, cold/tiny
+Page snapshot branch (2026-10-15): opt-in page manifests (now v10) and page objects use the
+existing barrier; flat snapshots (now v9) stay default. Exact decoded flat/page ptrace oracles, cold/tiny
 reads, fresh-process inspection, missing/corrupt pages and warmed-cache poisoning
 have regressions. Both formats compare live bytes and restore only differing pages.
 This strengthens C08 evidence without closing general canonicalization, complete
