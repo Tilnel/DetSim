@@ -781,3 +781,19 @@ unlink and recreate. Format37/38 and kernel22 reject incompatible stores.
 Evidence: /tmp/detsim-iteration12-{wire,io,np1-wire,scenarios,check}.log and
 build/cases/run-davl3_p9/results.json. Real module business/search acceptance
 remains a separate unfinished goal.
+
+Actual NP4 module run-po77i4vf now reaches all three ready messages, then its
+client assertion reveals Redis protected-mode refusal on the modeled non-loopback
+network. The isolated native/model case now explicitly shares protected-mode=no;
+no target or framework failure is ignored. run-hoqxo7xz completes real INIT,
+ftruncate and closed metadata rename, but its main-thread-only pump then stalls
+with pending epoll waits. It remains failed, with clean process cleanup.
+
+The case controller now enumerates logical thread slots every round and gives
+each an explicit manual step, including real fsync workers. Blocked attempts
+record no successor and must preserve the predecessor hash; completed edges
+record process/slot/outcome and both hashes. Client assertions are classified at
+their origin rather than reported as a later unsupported abort syscall. Seven
+controller and three native-acceptance tests pass with independent review.
+Fresh native healthy/mutant passes: build/redisraft-full-cases/run-9dhfb55s.
+No claim of full-module search/replay or automatic timeout support follows.

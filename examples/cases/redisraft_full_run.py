@@ -64,7 +64,7 @@ def build(work,variant):
 
 
 def server_argv(module,node,address,port,log):
-    return [str(SERVER),"--port",str(port),"--bind",address,"--daemonize","no","--save","","--appendonly","no",
+    return [str(SERVER),"--port",str(port),"--bind",address,"--protected-mode","no","--daemonize","no","--save","","--appendonly","no",
         "--disable-thp","no","--loadmodule",str(module),"--raft.id",str(node),"--raft.addr",f"{address}:{port}",
         "--raft.log-filename",str(log),"--raft.log-max-file-size","0","--raft.snapshot-disable","yes"]
 
@@ -184,6 +184,59 @@ class FullSession(common.Session):
         return initial[1]
 
 
+class ClientAssertion(common.CaseFailure):
+    """A workload assertion is a failed case, before abort's later syscalls."""
+
+
+def control_step(session,node,slot,events,last,observed):
+    session.send("sw "+str(node))
+    if slot is not None:
+        selected=session.send("thread "+str(slot))
+        common.require("Switched to thread "+str(slot)+" " in selected,"logical thread selection failed: "+selected)
+    item={"node":node,"thread":0 if slot is None else slot,"choice":0,"predecessor":session.current_hash(),
+          "executed":False,"status":"attempted"}
+    events.append(item)
+    try:reply=session.send("si 0")
+    except Exception as error:
+        item["reply"]=str(error);item["status"]="error";last[node]=str(error)
+        if node==3 and re.search(r"\bAssertion\b|assertion failed",str(error),re.IGNORECASE):
+            raise ClientAssertion("client assertion during controlled execution: "+str(error)) from error
+        raise
+    item["reply"]=reply;last[node]=reply
+    if "DetSim state/execution error:" in reply or "Fatal signal" in reply:
+        item["status"]="error"
+        raise common.CaseFailure(reply)
+    after=session.current_hash()
+    if re.search(r"Thread \d+ is blocked \(pending syscall\)\. Cannot step\.",reply):
+        item.update(status="blocked",observed_hash=after)
+        common.require(after==item["predecessor"],"blocked attempt changed state hash: "+reply)
+        return reply
+    item.update(status="completed",executed=True,successor=after)
+    if node==3 and re.search(r"\bAssertion\b|assertion failed",reply,re.IGNORECASE):
+        raise ClientAssertion("client assertion during controlled execution: "+reply)
+    common.require("property violation:" not in reply,"unexpected initialization property violation: "+reply)
+    if node==3:
+        for match in re.finditer(r'write\(1, [^"\n]+"(\{"v":1,[^\n]*\})\\010", \d+\) = \d+',reply):
+            observed.append(json.loads(match[1]))
+    return reply
+
+
+def actor_round(session,events,last,observed):
+    """Step each current logical slot once; refresh births on the next round."""
+    for node in range(4):
+        session.send("sw "+str(node))
+        reply=session.send("thread")
+        common.require(re.search(r"Threads in process "+str(node)+r" \(pid=\d+\):",reply),"thread listing unavailable: "+reply)
+        slots=[int(slot) for slot in re.findall(r"^\s*\*?\s*\[(\d+)\] TID \d+[^\n]*$",reply,re.MULTILINE)]
+        if not slots and "(single-threaded, main thread only)" in reply:
+            slots=[None] # The empty-table main actor has no selectable thread slot.
+        else:
+            common.require(slots and slots==list(range(len(slots))),"invalid logical thread slots: "+reply)
+        for slot in slots:
+            control_step(session,node,slot,events,last,observed)
+            if observed and observed[-1].get("event")=="before_set":return
+
+
 def model_control(work,tracer,module,client,checker,variant,backend,timeout,max_steps):
     """Reach the pre-SET/fault prefix by real requests; never search startup."""
     directory=work/(variant+"-"+backend)
@@ -196,22 +249,6 @@ def model_control(work,tracer,module,client,checker,variant,backend,timeout,max_
          "tracer_sha256":common.digest(tracer),"module_sha256":common.digest(module),
          "client_sha256":common.digest(client),"checker_sha256":common.digest(checker),"server_sha256":common.digest(SERVER)}
     session=None;events=[];observed=[];phase="startup";last=[""]*4
-    def step(node):
-        session.send("sw "+str(node));before=session.current_hash()
-        item={"node":node,"choice":0,"predecessor":before}
-        events.append(item)
-        try:reply=session.send("si 0")
-        except Exception as error:
-            item["reply"]=str(error);last[node]=str(error)
-            raise
-        item["reply"]=reply;last[node]=reply
-        common.require("DetSim state/execution error:" not in reply and "Fatal signal" not in reply,reply)
-        item["successor"]=session.current_hash()
-        common.require("property violation:" not in reply,"unexpected initialization property violation: "+reply)
-        if node==3:
-            for match in re.finditer(r'write\(1, [^"\n]+"(\{"v":1,[^\n]*\})\\010", \d+\) = \d+',reply):
-                observed.append(json.loads(match[1]))
-        return reply
     try:
         session=FullSession(tracer,tracees,checker,logs,directory,backend,timeout)
         session.send()
@@ -222,15 +259,13 @@ def model_control(work,tracer,module,client,checker,variant,backend,timeout,max_
         for node in range(3):
             phase="initialize_server_"+str(node+1)
             for _ in range(max_steps):
-                if "Ready to accept connections" in step(node):break
+                if "Ready to accept connections" in control_step(session,node,None,events,last,observed):break
             else: raise common.CaseFailure("server initialization step bound before ready: "+str(node+1))
         phase="client_INIT_JOIN_membership"
         stable=0
         for _ in range(max_steps):
             before=session.current_hash()
-            for node in range(4):
-                step(node)
-                if observed and observed[-1].get("event")=="before_set":break
+            actor_round(session,events,last,observed)
             if observed and observed[-1].get("event")=="before_set":
                 common.require(observed[-1].get("key")=="alpha","first fault prefix is not alpha SET")
                 row["prefix"]=session.current_hash();row["observations"]=observed
@@ -241,7 +276,8 @@ def model_control(work,tracer,module,client,checker,variant,backend,timeout,max_
             if stable>=16:raise common.CaseFailure("real request pump made no successor progress; pending timers are not auto-expired")
         else:raise common.CaseFailure("membership/fault-prefix control step bound exceeded")
     except Exception as error:
-        row.update(common.classify_error(error,session.log if session else None))
+        row.update({"status":"failed","diagnostic":str(error)} if isinstance(error,ClientAssertion)
+                   else common.classify_error(error,session.log if session else None))
         row["failure_phase"]=phase
         row["last_successful_hash"]=events[-1].get("predecessor") if events else None
         row["last_replies"]=last

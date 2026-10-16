@@ -73,12 +73,22 @@ python3 examples/cases/redisraft_full_run.py \
 
 `--reuse-modules` is optional and checks immutable module hashes against their
 original build manifests. Without it, the runner builds new source copies. The
-controller steps each real server to its ready message and then round-robins the
-real client/server requests towards the pre-SET prefix. It does not search the
-startup sequence or synthesize timer expiry. The current model run rejects
-`unlink` (syscall 87) during server 1 initialization and remains non-green.
-`control-events.json` retains the failing attempted edge before a tracer-side
-exception; results retain the phase, exact predecessor hash, last replies,
+controller steps each real server main actor to its ready message. Each membership
+pump round reads each process's public CLI `thread` listing and explicitly selects
+every logical thread slot with `thread N` before `si 0`. The `0` is a syscall
+choice, not a thread selector; RedisRaft background fsync workers therefore receive
+explicit steps. Newly listed slots participate on the next round. Actor identity
+is process index plus logical slot, never host TID. This fixed fair pump does not
+search the startup sequence, exhaust schedules or synthesize timer expiry. Client
+assertion diagnostics immediately fail the case before following the abort path.
+The original iteration-11 run rejected `unlink` (syscall 87) during server 1
+initialization; current run artifacts determine the current blocker.
+`control-events.json` records node, logical thread slot and syscall choice for each
+attempt. Completed syscall steps have `executed=true`, `status=completed` and
+predecessor/successor hashes. A CLI "Thread N is blocked (pending syscall). Cannot
+step." reply instead records `executed=false`, `status=blocked` and an
+`observed_hash` that must equal the predecessor; it has no successor edge. Errors
+retain the attempted actor with `executed=false`, `status=error` and the reply; results retain the phase, exact predecessor hash, last replies,
 configuration/hash and the inventory of owned processes after cleanup. A reached
 pre-SET prefix also remains explicitly incomplete until bounded fault-event
 search and replay are implemented and pass. Blocked states, timer deadlines and
