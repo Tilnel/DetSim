@@ -398,3 +398,68 @@ python3 tests/page_snapshot_benchmark.py --repeats 3 --depth 8 --output build/ge
 另一次verify-pages对19257次捕获进行独立全读对照，oracle读取23.9GB，通过；其
 20.27s包括额外oracle，不纳入普通后端性能比较。产物为
 `build/generic-framework-deep-{before,after}/`和`build/generic-framework-verify/`。
+
+
+## 真实 RedisRaft 模块的搜索吞吐与边界（2026-10-16）
+
+这里是三台 Redis7.4.2 加载 RedisRaft 模块、另一个真实 RESP 客户端的 NP4
+实验，与上文独立 Raft 库驱动不同。Redis 提交为 `a0a6f23d`，模块源码为
+`ade4aa8e6aa5c3b21678a1998309825f06567d4f`；使用 owned 构建副本，未修改 vendor。
+客户端只提交 `SET alpha 17` 和 `SET beta 29`，另有集群 INIT/JOIN、GET/INFO
+推进与检查请求。关闭 Redis RDB/AOF、Raft compaction/snapshot，保留实际后台线程和
+Raft 日志/fsync。不是数据量或请求吞吐压力测试。
+
+pages 两轮已经触及墙钟截止，均为 **timeout，未通过**：
+
+| 指标 | healthy/pages | mutant/pages |
+| --- | ---: | ---: |
+| 作业开始至搜索根，秒 | 2873.0 | 2872.1 |
+| 搜索阶段，秒 | 4378.121 | 4378.264 |
+| 已完整展开层数 | 904 | 894 |
+| 记录的候选边数 | 5490 | 5433 |
+| 明确完成的候选边数 | 5489 | 5432 |
+| 不同后继哈希数 | 3778 | 3737 |
+| 完整层内重复后继边 | 1711 | 1695 |
+| 候选边/秒 | 1.254 | 1.241 |
+| 不同后继哈希/秒 | 0.863 | 0.854 |
+| 完整层平均秒数 | 4.843 | 4.897 |
+
+首行包含构建、native 前置验证及受控启动/成员加入，不能全归为搜索或进程启动。
+两轮均有未完成的最后一层，末条记录为 `executed=false,status=error`。
+候选边是 runner 的 `attempted_edges`；明确完成边要求 `executed=true,status=completed`。
+表内吞吐按全部记录的候选边计算，两种计数相差1，不将截止时的尝试声称为完成转移。
+不同后继哈希是该次搜索的去重计数，不是整个模型可达状态总量。
+搜索采用 case-side beam1：每层执行所有合法候选，从中只保留一个后继继续展开；
+分别记录2874/2840个被剪枝后继，不能称为穷尽所有交织。两轮皆未收齐首个写入的
+ACK/commit 检查点，没有 healthy 业务成功或预期 mutant 反例，也没有终点3x重放。
+ACK 标记在 SET 返回后还要查询 INFO，因此缺少标记不单独证明服务端没有提交。
+退出记录 `tracer_exit=0`、`remaining_owned_pids=[]` 仅证明清理，不使 timeout 变绿。
+
+原始产物：`build/redisraft-full-cases/run-yvzv8vwh/healthy-pages/search.json`、
+`build/redisraft-full-cases/run-khxtj82_/mutant-pages/search.json` 及各自顶层 `result.json`。
+执行器为不可变 `build/case-tools/tracer-iteration17b-np4`，kernel model24；
+runner 执行版本的 SHA256 为
+`3cfe9fed3160b513102e4739bab26191d2f8d445c870a0c16c2a2898dbeda921`。
+full 两轮使用 iteration19 压缩缓冲优化后的 NP4 二进制，截至本次记录已进入搜索，
+尚无通过结果。它们与 pages 的不同执行窗口、二进制及后台负载不构成受控后端对照。
+
+### 内存范围为什么大
+
+当前 full 运行的单台服务器有10线程，RSS 约10--11MiB，可读私有映射约83MiB，
+匿名不可访问保留区约192MiB，总映射范围约275MiB。三台加客户端一次捕获的
+内存范围约828MiB。大块8MiB映射与线程栈相符；三块各63.9MiB的匿名保留区布局
+符合分配器 arena 预留，但尚未追踪每次分配来确定来源。`smaps` 确认这些大块
+`PROT_NONE` 区域的 RSS 为0，因此不是275MiB真实业务内存。
+
+`sys_state` 捕获仍读取全部四个进程；pages 通过字节比较复用页面，未省去全量读取。
+恢复仅处理映像改变的进程；可读区域全读比较后写差异页，不可比较的保护区写回
+保存内容。不能因为当前保护为 PROT_NONE 就假设历史内容为零或将其排除。
+实际 pages 搜索10秒 CPU 采样968个、丢失0个，tracer占95.87%，Python驱动3.34%，
+目标Redis0.62%。内核复制、跨进程地址访问、memcmp分别出现30.06%、17.77%、
+17.46%的样本；这些是 CPU 样本份额，不是恢复/捕获各阶段的墙钟归因。
+采样产物为 `build/case-jobs/iteration18-module-healthy-pages/search-profile-summary.json`。
+
+用户已明确希望优先直接验证 Raft 协议。现有 `redisraft_run.py` 与 `raft_run.py`
+保留为库级案例；其正常版的搜索在提交之后，不能冒充从未提交状态搜索获得提交。
+后续协议案例应从业务提交前开始，检查复制/多数派/选举性质并重放实际反例。
+完整 RedisRaft 仍是单独的集成目标，当前失败证据保留，不以库案例替代其验收。

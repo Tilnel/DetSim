@@ -88,9 +88,10 @@
       "servers": 3,
       "build": "make NP=4 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4",
       "command": "python3 examples/cases/redisraft_full_run.py --tracer ./tracer --timeout 2400 --max-control-steps 6000 --search-depth 2000 --search-seconds 1800",
-      "status": "native pair and finite actor oracle pass; actual full/pages module matrix remains pending",
+      "status": "native pair and finite actor oracle pass; actual pages healthy/mutant timed out before ACK checkpoints; full pair still running; model matrix non-green",
       "scope": "three real loaded modules plus RESP client; public saved protocol/log oracle; case-side guided beam1 with explicit pruning and timeout actions",
-      "documentation": "examples/cases/redisraft_full/README.md"
+      "documentation": "examples/cases/redisraft_full/README.md",
+      "evidence": "docs/redisraft-benchmark.md#真实-redisraft-模块的搜索吞吐与边界2026-10-16"
     },
     {
       "id": "runtime-concurrency",
