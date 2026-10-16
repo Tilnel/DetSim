@@ -79,6 +79,19 @@
       "status": "native healthy/mutant and actual full/pages search+3x replay pass",
       "property": "exact committed command bytes and one logical leader per term",
       "scope": "NP3 real pre-vote/election prefix, no-op plus2normalcommands, no compaction, bounded depth/errorbudget"
+    },
+    {
+      "id": "redisraft-replication-quorum",
+      "path": "examples/cases/redisraft_fixture.c",
+      "processes": 3,
+      "threads_per_process": 1,
+      "build": "make NP=3 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4",
+      "command": "python3 examples/cases/redisraft_quorum_run.py --tracer ./tracer --depth 72 --timeout 600",
+      "property": "a committed NORMAL entry has identical term/type/binary command bytes at the same index on at least two of three fixed replicas",
+      "mutation": "in owned library copy, select largest match index instead of majority match index",
+      "status": "native healthy/mutant and full/pages pre-NORMAL sibling search with3x exact terminal replay pass",
+      "scope": "real election and callbacks; root before any NORMAL append; beam1, six actor/preset candidates per source; first NORMAL committed/applied on leader, fixed voters, no restart/reconfiguration/compaction; UDP queue capacity3",
+      "documentation": "docs/redisraft-benchmark.md"
     }
   ],
   "next_targets": [

@@ -19,9 +19,13 @@ $(BUILD_DIR)/tests/plugin_bad_abi.so: tests/plugin_fixture.cpp src/api/plugin.h 
 -include $(BUILD_DIR)/tests/state_view_integration.d $(BUILD_DIR)/tests/plugin_integration.d
 
 .PHONY: check-raft-plugin-contract
-check-raft-plugin-contract: $(BUILD_DIR)/tests/raft_checker_unit $(BUILD_DIR)/tests/redisraft_checker_unit
+check-raft-plugin-contract: $(BUILD_DIR)/tests/raft_checker_unit $(BUILD_DIR)/tests/redisraft_checker_unit $(BUILD_DIR)/tests/redisraft_quorum_checker_unit
 	$(BUILD_DIR)/tests/raft_checker_unit
 	$(BUILD_DIR)/tests/redisraft_checker_unit
+	$(BUILD_DIR)/tests/redisraft_quorum_checker_unit
+	python3 tests/raft_case_runner_test.py
+	python3 tests/redisraft_case_runner_test.py
+	python3 tests/redisraft_quorum_runner_test.py
 check-plugins: check-raft-plugin-contract
 $(BUILD_DIR)/tests/raft_checker_unit: tests/raft_checker_unit.cpp examples/raft/plugins/check_common.hpp src/api/plugin.h $(BUILD_DIR)/.config
 	@mkdir -p $(dir $@)
@@ -37,3 +41,7 @@ $(BUILD_DIR)/tests/plugin_decoder.so: tests/plugin_fixture.cpp src/api/plugin.h 
 $(BUILD_DIR)/tests/state_view_layout: tests/state_view_layout.c $(BUILD_DIR)/.config
 	@mkdir -p $(dir $@)
 	$(CC) -O0 -g -fno-pie -no-pie $< -o $@
+
+$(BUILD_DIR)/tests/redisraft_quorum_checker_unit: tests/redisraft_quorum_checker_unit.cpp examples/redisraft/plugins/quorum.cpp examples/raft/plugins/check_common.hpp src/api/plugin.h $(BUILD_DIR)/.config
+	@mkdir -p $(dir $@)
+	$(CXX) -std=c++20 -Wall -Wextra -Werror -Isrc $< -o $@

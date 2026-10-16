@@ -124,6 +124,20 @@ Projection project(const detsim_host_v2 *host, View view) {
   return nodes;
 }
 void state_properties(const Projection &nodes) {
+#ifdef RAFT_REQUIRE_REPLICA_QUORUM
+  if (nodes.size() != 3) throw Unavailable("replication quorum requires three fixed members");
+  for (const auto &n : nodes) if (n.initialized) {
+    if (n.snap_idx || n.base) throw Unavailable("replication quorum requires uncompacted logs");
+    for (const auto &[idx, entry] : n.logs) if (idx <= n.commit && entry.type == 0) {
+      size_t copies = 0;
+      for (const auto &peer : nodes) {
+        auto found = peer.logs.find(idx);
+        if (peer.initialized && found != peer.logs.end() && found->second == entry) ++copies;
+      }
+      if (copies < 2) throw Violation("committed NORMAL entry " + std::to_string(idx) + " lacks replica quorum");
+    }
+  }
+#endif
   std::map<int64_t, unsigned> leaders;
   std::map<int64_t, Entry> committed;
   for (unsigned i = 0; i < nodes.size(); ++i) {

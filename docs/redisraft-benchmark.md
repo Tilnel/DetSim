@@ -463,3 +463,81 @@ full 两轮使用 iteration19 压缩缓冲优化后的 NP4 二进制，截至本
 保留为库级案例；其正常版的搜索在提交之后，不能冒充从未提交状态搜索获得提交。
 后续协议案例应从业务提交前开始，检查复制/多数派/选举性质并重放实际反例。
 完整 RedisRaft 仍是单独的集成目标，当前失败证据保留，不以库案例替代其验收。
+
+
+## 独立 Raft 协议：提交前的复制多数派案例（2026-10-16）
+
+新增 `examples/cases/redisraft_quorum_run.py` 直接运行真实 RedisLabs/raft 库的
+三个单线程进程，复用现有选举和消息回调适配器，不启动 Redis。初始前缀通过实际
+pre-vote、投票和 AppendEntries 建立 term1 leader。搜索根上三个副本都只持有
+index1 no-op，commit/applied均为0；leader 的 match indexes 为 `[1,0,0]`，
+真实复制回复已发送但尚未被leader处理，没有任何 NORMAL 业务日志。
+当前模型的 UDP 队列容量为3，前缀先消费 B 的旧选举回复，避免初始化复制包因
+队列已满而丢失；没有更改网络模型或直接修改 Raft 内部状态。
+
+新 profile 仅在初始 no-op 提交后提交业务命令。每个搜索源都恢复后执行三个
+actor各两个preset，共六条候选；正反两个构建使用相同轮转策略，leader需要心跳时
+选择时间推进。每层检查所有候选，只保留一个后继。当前候选选择覆盖该配置的
+时间/UDP预设，不能据此宣称任意真实网络顺序或共享内存交织均已覆盖。
+手动 `si` 不套用内置DFS的 error-budget 截止；实际source budget均为2，候选
+后继为1或2，未观察到耗尽。depth/wall截止仍明确失败，插件的预算检查不被绕过。
+
+case-owned public ABI 插件使用已有快照投影，要求已提交 NORMAL 日志在同一index
+的term/type/完整二进制command与至少两个实际日志副本一致。不能用leader的
+match估计或follower的commit index代替日志内容；该性质限固定三投票节点，无
+crash/restart/成员变更/compaction。既有leader和committed-history性质继续检查。
+
+注错只改 owned library 副本一行：将降序match indexes中的
+`indexes[num_voters / 2]` 改为 `indexes[0]`。独立native oracle直接调用库API并
+调度真实消息回调：正常版先有一个日志副本但commit仍1，再有两个副本但尚无ACK时
+commit仍1，收到实际ACK才commit/apply到2；注错版提交业务日志时即commit2，
+实际日志副本只有1。它没有复用插件的DWARF投影来产生参考结果。
+
+验证结果：
+
+| 版本/后端 | 候选转移 | 完整展开层 | 层内去重后继之和 | 重复候选 | 剪枝的不同子节点之和 | 终点重放 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| healthy/full | 174 | 29 | 136 | 38 | 107 | 3 |
+| healthy/pages | 174 | 29 | 136 | 38 | 107 | 3 |
+| mutant/full | 48 | 8 | 41 | 7 | 33 | 3 |
+| mutant/pages | 48 | 8 | 41 | 7 | 33 | 3 |
+
+后继和剪枝计数按每个展开源分别去重再求和，不是全局不同状态数；所有444条候选
+都实际完成，同一版本两个后端的语义观测序列相同。正常终点leader已提交并应用
+index2的 `set alpha 17`，三个副本均持有这些精确字节；两个follower的commit/applied
+仍1，leader还持有未提交的beta，因此只主张第一条业务命令的leader提交与应用。
+注错终点leader commit2、applied1、alpha只有一个副本，准确报告
+`committed NORMAL entry 2 lacks replica quorum`，没有将其他异常当作反例。
+
+每条边保留已验证的load源、actor切换、实际syscall回复与目标hash；规范历史只保留
+目标的第一条入边，不能反推本次路径。每行终点恢复前驱3次，动作、目标hash、
+verdict、diagnostic和语义观测一致。独立审查核对444条原始命令及12次终点重放、
+构建和配置hash、每次tracer+3tracee共4个PID全部消失、tracer exit0。
+实际depth1负例只完成6条候选后截止，结果failed且passed=false，清理通过。
+
+原始四项：`build/redisraft-quorum-cases/run-9z7kq5c0/result.json`；独立审计：
+`build/redisraft-quorum-audit/final-four.json` 与 `verify_final.py`；截止负例：
+`build/redisraft-quorum-cutoff/run-gmoqet3n/result.json`。运行中只收紧了离线
+`accepted_rows` 验收函数；保存的执行源码为 `build/redisraft-quorum-frozen-0f76b684.py`。
+healthy manifest记录其hash，mutant manifest记录读取文件时的收紧版本hash；
+`build/quorum-validator-equivalence.json` 验证验收函数之外字节完全一致。
+当前更严格验收器独立复核原始四项通过，没有改写原报告来掩盖版本差异。
+
+相关自动检查：17个多数派性质测试（包括NUL之后的字节、错误term/type/index、
+未提交单副本、任意两副本及模型外拒绝），以及13个旧runner测试和3个新runner
+测试方法（包含缺行、错误诊断、源/动作/重放脱离、部分层、截止和清理负例）。
+去掉新多数派检查的基线在单副本已提交用例失败，当前检查通过。`make check`
+和 `make NP=2 check-plugins` 通过；fixture/plugin/性质测试的Clang静态分析无诊断。
+原有两个库的8行模型回归及24次实际终点重放另行通过：
+`build/redisraft-election-regression/run-nuu0xhq7/result.json`、
+`build/willemt-quorum-regression/run-c5vdnl0x/result.json`。
+
+```sh
+make NP=3 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4
+python3 examples/cases/redisraft_quorum_run.py --tracer ./tracer --depth 72 --timeout 600
+make NP=2 check-plugins CC=/usr/bin/gcc CXX=/usr/bin/g++
+```
+
+这些是有剪枝的协议级有限案例，不等于协议完备证明，也不替代仍未通过的完整
+RedisRaft模块矩阵。后续协议目标包括网络分区、重新选主与冲突日志修复；C03/C25
+的一般调度/原子边界缺口仍然存在。

@@ -118,6 +118,10 @@ static void receive(struct context *c, const struct packet *wire) {
     assert(!raft_apply_all(c->server));
 }
 static void generate(struct context *c) {
+#ifdef RAFT_QUORUM_CASE
+    /* Bootstrap must replicate the no-op before submitting application input. */
+    if (raft_get_commit_idx(c->server)<1) return;
+#endif
     raft_index_t index=raft_get_current_idx(c->server);
     if(!raft_is_leader(c->server) || index<1 || index>=3) return;
     c->generated=(int)index-1;
@@ -129,6 +133,23 @@ static void generate(struct context *c) {
     assert(!raft_recv_entry(c->server,e,&response)); raft_entry_release(e); c->generated++;
 }
 #ifdef RAFT_NATIVE_REFERENCE
+#ifdef RAFT_QUORUM_CASE
+static int normal_copies(raft_server_t *leader) {
+    raft_entry_t *entry=raft_get_entry_from_idx(leader,2); assert(entry);
+    assert(entry->type==RAFT_LOGTYPE_NORMAL && entry->data_len==strlen(commands[0])+1);
+    assert(!memcmp(entry->data,commands[0],entry->data_len));
+    int count=0;
+    for(int i=0;i<3;i++) {
+        raft_entry_t *other=raft_get_entry_from_idx(cluster[i].server,2);
+        if(other) {
+            count += other->term==entry->term && other->type==entry->type &&
+                other->data_len==entry->data_len && !memcmp(other->data,entry->data,entry->data_len);
+            raft_entry_release(other);
+        }
+    }
+    raft_entry_release(entry); return count;
+}
+#endif
 static struct packet deliver(int from,int to,int kind) {
     for(int i=0;i<queued;i++) if(queue[i].from==from && queue[i].to==to && queue[i].kind==kind) {
         struct packet p=queue[i]; memmove(queue+i,queue+i+1,(queued-i-1)*sizeof(*queue)); queued--;
@@ -151,6 +172,34 @@ int main(int argc,char **argv) {
     struct packet yes=deliver(2,0,VOTE_REPLY);
     assert(!yes.reply.prevote && yes.reply.request_term==1 && yes.reply.vote_granted==1);
     assert(raft_is_leader(cluster[0].server));
+#ifdef RAFT_QUORUM_CASE
+    deliver(0,1,APPEND); deliver(0,2,APPEND);
+    for(int i=0;i<3;i++) {
+        assert(raft_get_current_idx(cluster[i].server)==1);
+        assert(raft_get_commit_idx(cluster[i].server)==0);
+    }
+    deliver(1,0,APPEND_REPLY);
+    assert(raft_get_commit_idx(cluster[0].server)==1);
+    generate(&cluster[0]);
+    int copies=normal_copies(cluster[0].server);
+    assert(copies==1);
+    printf("NATIVE_SUBMIT {\"copies\":1,\"commit\":%ld}\n",(long)raft_get_commit_idx(cluster[0].server));
+    assert((raft_get_commit_idx(cluster[0].server)==2)==mutant);
+    if(!mutant) {
+        assert(raft_get_commit_idx(cluster[0].server)==1);
+        deliver(0,1,APPEND);
+        assert(normal_copies(cluster[0].server)==2);
+        assert(raft_get_commit_idx(cluster[0].server)==1);
+        puts("NATIVE_BEFORE_ACK {\"copies\":2,\"commit\":1}");
+        deliver(1,0,APPEND_REPLY);
+        assert(raft_get_commit_idx(cluster[0].server)==2);
+        assert(!raft_apply_all(cluster[0].server));
+        assert(raft_get_last_applied_idx(cluster[0].server)==2);
+        copies=normal_copies(cluster[0].server); assert(copies>=2);
+    }
+    printf("NATIVE_QUORUM {\"index\":2,\"copies\":%d,\"command\":\"set alpha 17\",\"commit\":%ld}\n",copies,(long)raft_get_commit_idx(cluster[0].server));
+    puts(mutant?"NATIVE_EXPECTED_VIOLATION":"NATIVE_OK"); return 0;
+#endif
     deliver(0,1,VOTE_REPLY); /* Stale prevote, ignored. */
     int c_denied=0;
     for(int i=0;i<queued;i++) if(queue[i].kind==VOTE_REPLY && queue[i].from==2 && queue[i].to==1) {

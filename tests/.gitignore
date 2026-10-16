@@ -142,3 +142,6 @@
 !writev_integration.cpp
 !writev.mk
 !case_session_test.py
+
+!redisraft_quorum_checker_unit.cpp
+!redisraft_quorum_runner_test.py

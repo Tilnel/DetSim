@@ -20,7 +20,7 @@ SOURCES = ("raft_server.c", "raft_server_properties.c", "raft_node.c", "raft_log
 MUTATION = ("if (resp->vote_granted) {\n        if (node) {", "if (1) {\n        if (node) {")
 
 
-def build_variant(output, variant, cc):
+def build_variant(output, variant, cc, *, quorum=False):
     """Copy only library inputs, never vendor objects/Makefiles/git metadata."""
     owned = output / variant
     owned.mkdir(parents=True, exist_ok=True)
@@ -37,13 +37,14 @@ def build_variant(output, variant, cc):
             inputs[str(path.relative_to(LIBRARY))] = common.digest(path)
     server = sources / "src/raft_server.c"
     original = server.read_text()
-    common.require(original.count(MUTATION[0]) == 1, "mutation match must occur exactly once")
+    mutation = ("raft_index_t commit = indexes[num_voters / 2];", "raft_index_t commit = indexes[0];") if quorum else MUTATION
+    common.require(original.count(mutation[0]) == 1, "mutation match must occur exactly once")
     if variant == "mutant":
-        server.write_text(original.replace(*MUTATION))
+        server.write_text(original.replace(*mutation))
     manifest = {"library": "RedisLabs/raft", "variant": variant,
         "source_root": str(LIBRARY), "inputs_sha256": inputs,
-        "mutation": {"file": "src/raft_server.c", "before": MUTATION[0],
-                     "after": MUTATION[1], "count": 1} if variant == "mutant" else None,
+        "mutation": {"file": "src/raft_server.c", "before": mutation[0],
+                     "after": mutation[1], "count": 1} if variant == "mutant" else None,
         "mutated_source_sha256": common.digest(server),
         "driver_sha256": common.digest(HERE / "redisraft_fixture.c"),
         "toolchain": common.command(cc + ["--version"], ROOT).stdout,
@@ -52,6 +53,9 @@ def build_variant(output, variant, cc):
                     "raft_compaction": False, "snapshot_backends": ["full", "pages"]}}
     flags = ["-std=gnu11", "-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie",
              "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter", "-I" + str(sources / "include")]
+    if quorum:
+        flags.append("-DRAFT_QUORUM_CASE")
+    manifest["scenario"] = "replication-quorum" if quorum else "election"
     paths = [str(HERE / "redisraft_fixture.c")] + [str(sources / "src" / name) for name in SOURCES]
     manifest["build_commands"] = []
     for name, defines in (("native-reference", ["-DRAFT_NATIVE_REFERENCE"]), ("raft-case", [])):
@@ -125,7 +129,7 @@ def expected_mutant_violation(reply, nodes, receipt):
                 ("reply.prevote", 0), ("reply.request_term", 1))))
 
 
-def model_case(tracer, binary, checker, choose, directory, backend, variant, timeout, depth):
+def model_case(tracer, binary, checker, choose, directory, backend, variant, timeout, depth, *, prefix_hook=None, prepare_leader=None):
     row = {"target": "redisraft-library", "variant": variant, "backend": backend, "NP": 3,
            "artifacts": str(directory), "scope": "controlled real pre-vote/election prefix and bounded suffix",
            "expected_denials": {"0": "A voted for itself", "2": "C already voted for A"}}
@@ -201,12 +205,20 @@ def model_case(tracer, binary, checker, choose, directory, backend, variant, tim
                            "C did not receive expected actual vote request")
         common.require(value(2,"((raft_server*)r)->voted_for") == 0,"C changed its vote")
         row["C_requests"]=requests
+        if prepare_leader is not None:
+            prepare_leader(step)
         until(0, lambda: value(0, "((raft_server*)r)->state") == 4)
         grant=received(0)
         common.require(grant["kind"]==2 and grant["from"]==2 and grant["reply.vote_granted"]==1
                        and grant["reply.prevote"]==0 and grant["reply.request_term"]==1,
                        "A did not become leader from C actual grant")
         row["A_grant"] = grant
+        if prefix_hook is not None:
+            row.update(binary_sha256=common.digest(binary), checker_sha256=common.digest(checker),
+                       choose_sha256=common.digest(choose), tracer_sha256=common.digest(tracer),
+                       bounds={"depth":depth,"wall_seconds":timeout,"address_space_bytes":2*1024**3})
+            prefix_hook(session, row, step, until, value, received, events)
+            return row
         # Consume only B's stale prevote reply; leave A's real denied reply for search.
         until(1, lambda: value(1, "received_events") >= 3)
         stale=received(1)
@@ -323,6 +335,7 @@ def model_case(tracer, binary, checker, choose, directory, backend, variant, tim
         row.update(common.classify_error(error,session.log))
     finally:
         (directory / "events.json").write_text(json.dumps(events,indent=2))
+        row["steps"]=steps
         row["tracer_exit"]=session.close(timeout=30)
         if row["tracer_exit"] != 0 and row.get("status") in ("pass","violation"):
             row.update(status="failed",diagnostic="tracer cleanup failed")

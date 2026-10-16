@@ -980,3 +980,13 @@ Existing expensive jobs retain their actual older runner fingerprint; final
 audit applies the corrected validator and records its hash separately. A live
 driver's earlier passed label alone is insufficient. This changes evidence
 acceptance, not kernel semantics or any current model trajectory.
+
+
+Protocol-case evidence (2026-10-16): the opt-in workload-owned RedisLabs Raft
+quorum checker detects a committed NORMAL entry present on only one of three
+fixed replicas. Native API oracle and full/pages healthy/alternate-library rows
+start before NORMAL submission, enumerate six actor/preset siblings per source,
+and reproduce the terminal edge three times. This is a pruned beam1 case, not
+closure of C03/C25 or general snapshot-state completeness. The full RedisRaft
+module pages pair timed out without business acceptance; full pair remains
+non-green pending actual results. See [protocol and module evidence](redisraft-benchmark.md).
