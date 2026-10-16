@@ -262,6 +262,114 @@ int main(void) {
                     tracee_args=(), extra_env={"DETSIM_SNAPSHOT_BACKEND": backend})
                 self.assertEqual(code, 0, output)
 
+    def test_nonmain_timeout_preserves_actor_and_blocked_main_on_replay(self):
+        source = self.root / "nonmain_timeout.c"
+        source.write_text(r"""
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+_Alignas(16) static unsigned char worker_stack[65536];
+volatile int marker, word;
+struct timespec request = {0, 1000};
+extern long spawn(void *);
+/* The raw worker uses no libc or TLS; only the parent executes C code. */
+asm(".text\n.globl spawn\n.type spawn,@function\nspawn:\n"
+    "mov %rdi,%rsi\nmov $0x50f00,%edi\nxor %edx,%edx\nxor %r10d,%r10d\nxor %r8d,%r8d\n"
+    "mov $56,%eax\nsyscall\ntest %rax,%rax\njz 1f\nret\n"
+    "1: mov $35,%eax\nlea request(%rip),%rdi\nxor %esi,%esi\nsyscall\n"
+    "movl $1,marker(%rip)\n"
+    "mov $1,%eax\nmov $1,%edi\nlea letter(%rip),%rsi\nmov $12,%edx\nsyscall\n"
+    "movl $1,word(%rip)\nlea word(%rip),%rdi\nmov $129,%esi\nmov $1,%edx\n"
+    "xor %r10d,%r10d\nxor %r8d,%r8d\nxor %r9d,%r9d\nmov $202,%eax\nsyscall\n"
+    "mov $60,%eax\nxor %edi,%edi\nsyscall\nud2\n.size spawn,.-spawn\n"
+    ".section .rodata\nletter: .ascii \"WORKER_DONE\\n\"\n.text\n");
+int main(void) {
+    if (spawn(worker_stack + sizeof worker_stack) < 0) return 71;
+    while (!word) syscall(SYS_futex, &word, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0, 0, 0, 0);
+    return marker != 1;
+}
+""")
+        subprocess.run(shlex.split(os.environ.get("CC", "/usr/bin/gcc")) +
+            ["-std=gnu11", "-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie",
+             "-Wall", "-Wextra", "-Werror", str(source), "-o", str(self.root / "probe")],
+            check=True)
+        native = subprocess.run([str(self.root / "probe")], check=True,
+                                stdout=subprocess.PIPE, timeout=5)
+        self.assertEqual(native.stdout, b"WORKER_DONE\n")
+
+        def scenario(send):
+            def current_hash():
+                edges = re.findall(r"([0-9a-f]{16}) => ([0-9a-f]{16})", send("info current"))
+                self.assertEqual(len(edges), 1)
+                return edges[0][1]
+
+            def main_waiting():
+                listing = send("thread")
+                self.assertRegex(listing, r"\[0\] TID 1 state=waiting \(main\)")
+                main = next(line for line in listing.splitlines() if "[0] TID 1" in line)
+                self.assertNotIn("deadline=", main, "untimed main futex acquired worker deadline")
+                return listing
+
+            send("sw 0")
+            for _ in range(120):
+                send("thread 0")
+                reply = send("si")
+                self.assertNotIn("DetSim state/execution error:", reply)
+                if "[1] TID 2" in send("thread"):
+                    break
+            else:
+                self.fail("raw clone did not publish the worker actor")
+            self.assertIn("<pending:waiting>", send("si"))
+            main_waiting()
+            send("thread 1")
+            waiting = send("si")
+            self.assertIn("[TID:2] nanosleep(", waiting)
+            self.assertIn("<pending:waiting>", waiting)
+            self.assertRegex(main_waiting(), r"\[1\] TID 2 state=waiting.*deadline=")
+            self.assertIn("marker = 0", send("p marker"))
+            source_hash = current_hash()
+            completed_hash = None
+            output_hash = None
+            for replay in range(4):
+                if replay:
+                    self.assertIn("Loaded state", send("load " + source_hash))
+                # UI selection is deliberately changed before explicitly selecting
+                # the saved worker, guarding against a hardcoded main actor.
+                send("thread 0")
+                main_waiting()
+                send("thread 1")
+                completed = send("si timeout")
+                self.assertIn("Timeout completed.", completed)
+                self.assertNotIn("WORKER_DONE", completed)
+                self.assertIn("marker = 0", send("p marker"))
+                listing = main_waiting()
+                self.assertRegex(listing, r"\[1\] TID 2 state=runnable")
+                # Changing selection must not change the actor recorded in TSS.
+                send("thread 0")
+                history = send("info current")
+                self.assertIn("(timeout)", history)
+                self.assertIn("[TID:2] nanosleep(", history)
+                actual = current_hash()
+                if completed_hash is None:
+                    completed_hash = actual
+                self.assertEqual(actual, completed_hash, "nonmain timeout replay changed identity")
+                send("thread 1")
+                resumed = send("si")
+                self.assertIn("WORKER_DONE", resumed)
+                self.assertIn("marker = 1", send("p marker"))
+                main_waiting()
+                actual = current_hash()
+                if output_hash is None:
+                    output_hash = actual
+                self.assertEqual(actual, output_hash, "worker output replay changed identity")
+
+        for backend in ("full", "pages"):
+            with self.subTest(backend=backend):
+                code, output = self.run_tracer(scenario, name="nonmain_timeout_" + backend,
+                    tracee_args=(), extra_env={"DETSIM_SNAPSHOT_BACKEND": backend})
+                self.assertEqual(code, 0, output)
+
     def test_leaf_namespace_search_and_replay(self):
         source = self.root / "leaf.c"
         source.write_text(r"""

@@ -840,6 +840,10 @@ analysis of pending,transition and IO paths is clean. Logs:
 /tmp/detsim-timeout-*-green.log and /tmp/detsim-iteration14-*.log.
 
 This is explicit manual completion, not automatic timer/actor enumeration.
-Builtin BFS/DFS/RAND still omit timeout actions (C03), and independent non-main
-thread timeout execution is not established by the node0/slot0 integration gate.
+Builtin BFS/DFS/RAND still omit timeout actions (C03). A subsequent raw-clone
+regression now verifies worker slot1 timeout in full/pages while main slot0
+retains an untimed futex wait: no worker code resumes until ordinary si, and
+three restored repetitions preserve both timeout/output hashes and TSS actor2.
+Native worker output/exit0 and all28scenarios pass; evidence:
+/tmp/detsim-nonmain-timeout.log and /tmp/detsim-iteration14b-scenarios.log.
 Full module business/search/replay remains separately unfinished.
