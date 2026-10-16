@@ -47,6 +47,7 @@ make check-syscall-policy check-process-state # NP=2 closed syscall/model gates
 make check-state-view check-plugins check-runtime-profile # NP=2 generic framework gates
 make check-getdents      # NP=2 directory stream ABI, inode identity and partial faults
 make check-io-boundary   # NP=2 mixed descriptors, guest-copy faults and native dispatch
+make check-writev        # NP=2 vector import, single-commit writes and archive isolation
 make check-accept        # NP=2 cross-process accept address/length regressions
 make check-redis         # NP=2 fixed-schedule SET/GET with existing Redis debug binary
 make benchmark-redisraft # NP=3 bounded Raft-library replication and DFS benchmark
@@ -142,8 +143,8 @@ enter snapshot state. Loader CPU-feature normalization still logs an unresolved
 symbol (C17). Passing counter/replay tests does not close that gap,
 nor does it prove multithread, cross-process-run or eviction correctness.
 
-Default snapshot format is version 27; older formats are rejected without migration.
-This branch additionally reads opt-in version 28 page manifests, selected with
+Default snapshot format is version 37; older formats are rejected without migration.
+This branch additionally reads opt-in version 38 page manifests, selected with
 `DETSIM_SNAPSHOT_BACKEND=pages`; `verify-pages` adds a full memory oracle.
 See [page snapshots and whole-exploration measurements](page-snapshots.md).
 Private readable mappings and unnamed anonymous PROT_NONE guards are captured;
@@ -182,6 +183,16 @@ explicit support limits in [the Raft benchmark](redisraft-benchmark.md).
 Before finishing a change, run `git diff --check`, the relevant tests, and a fresh
 build if production/build files changed. Use compiler warnings/static analysis on
 the touched components; do not bury a focused change in whole-project formatting.
+
+`writev` supports fully readable regular files, captured standard output/error
+and connected IPv4 TCP endpoints in the existing unbounded queue model. It
+imports all iovec metadata before payload validation and commits one flattened
+write/chunk. Linux fd/count arguments use their low32 bits. Calls above the
+64MiB staging bound, ambiguous high user addresses, payload faults, pipe/UDP
+writes and non-routable sockets explicitly reject. This does not implement TCP
+backpressure, partial-fault writes or blocked vector calls; retries would need
+saved imported vectors rather than rereading guest memory. `readv` remains
+unsupported. The kernel-model fingerprint is v24; no archive field was added.
 
 ## Framework and plugin boundary
 
@@ -275,7 +286,7 @@ execution, faithful restore and exhaustive exploration are separate support leve
 | Scheduling/atoms (P0) | Runnable thread/outcome enumeration, all-thread stop barrier, bounded pure computation and shared-memory access boundaries | Syscall stepping does not cover all concurrent behavior; weak-memory semantics also require an explicit model |
 | Lifecycle/restore (P0) | Full pthread/kernel thread-state reconstruction and process trees/fork/exec | Raw births/exits rebind retained carriers; untracked physical changes reject; parked terminal images restore across branches (C02/C08) |
 | Blocking/event loop (P1) | Automatic time advancement, timeout outcome selection, pinned descriptors and signal interruption | Supported waits now retain pending calls; broader blocking syscall coverage remains scoped |
-| Files/IPC/network (P1) | Reusable rootfs and external inputs, shared filesystem/open-file descriptions, dup/vector/positioned I/O, directory mutations, Unix/IPv6 sockets, eventfd/timerfd/io_uring | Many common runtime interfaces explicitly reject; fsync does not model crash durability |
+| Files/IPC/network (P1) | Reusable rootfs and external inputs, shared filesystem/open-file descriptions, dup/readv/positioned I/O, broader writev, directory mutations, Unix/IPv6 sockets, eventfd/timerfd/io_uring | Many common runtime interfaces explicitly reject; fsync does not model crash durability |
 | Mappings (P1) | Shared mappings, unreadable file-backed mappings and mutable file-backed coherence | Common allocators/JITs/shared-memory applications can hit explicit unsupported cases |
 | Startup/inspection (P1) | Portable initial boundary, per-node PIE/shared-image relocation and symbol contexts | PIE execution is possible; symbolic property inspection is more restricted than execution. Debug symbols are optional for raw/resource inspection |
 | Scale/search (P2) | Runtime process count, state equivalence/canonicalization, partial-order reduction and liveness/fairness algorithms | Fixed NP and bounded safety searches are not arbitrary process-graph or liveness support |

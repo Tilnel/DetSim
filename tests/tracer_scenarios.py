@@ -137,8 +137,14 @@ finally:
                         self.fail("Tracer prompt timed out:\n" + transcript[-4000:])
 
                     prompt()
+                    if verify_failure_cleanup:
+                        children = Path(f"/proc/{proc.pid}/task/{proc.pid}/children").read_text().split()
+                        self.assertTrue(children, "No tracees to verify cleanup")
                     commands(prompt)
                     proc.communicate(b"q\n", timeout=20)
+                    if verify_failure_cleanup:
+                        self.assertFalse(any(Path("/proc", child).exists() for child in children),
+                                         "Tracee survived interactive scenario cleanup")
                 else:
                     children = []
                     if verify_failure_cleanup:
@@ -1006,6 +1012,58 @@ int main(void) {
 
         code, output = self.run_tracer(scenario)
         self.assertEqual(code, 0, output)
+
+    def test_writev_completion_restores_saved_vectors_and_output(self):
+        source = self.root / "vector_probe.c"
+        source.write_text(r"""
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <unistd.h>
+volatile long vector_result = -99;
+volatile int vector_done = 0;
+static char first[] = "abc", second[] = "def";
+static struct iovec pieces[] = {{first,3},{(void*)1,0},{second,3}};
+int main(void) {
+    syscall(SYS_getpid);
+    vector_result = syscall(SYS_writev,0x100000001UL,pieces,0x100000003UL);
+    vector_done = 1;
+    syscall(SYS_getpid);
+    return vector_result != 6;
+}
+""")
+        subprocess.run(shlex.split(os.environ.get("CC", "/usr/bin/gcc")) +
+                       ["-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie",
+                        str(source), "-o", str(self.root / "probe")], check=True)
+
+        def scenario(send):
+            send("sw 0")
+            self.assertIn("getpid(", send("si"))
+            saved = re.findall(r"=> ([0-9a-f]{16})", send("info current"))[-1]
+            reply = send("si")
+            self.assertIn("writev(", reply)
+            self.assertRegex(reply, r"= 6\b")
+            target = re.findall(r"=> ([0-9a-f]{16})", send("info current"))[-1]
+            self.assertIn("vector_done = 0", send("p vector_done"))
+            for _ in range(3):
+                self.assertIn("Loaded state", send("load " + saved))
+                self.assertIn("vector_result = -99", send("p vector_result"))
+                self.assertRegex(send("si"), r"= 6\b")
+                self.assertEqual(re.findall(r"=> ([0-9a-f]{16})", send("info current"))[-1], target)
+            self.assertIn("getpid(", send("si"))
+            self.assertIn("vector_result = 6", send("p vector_result"))
+            self.assertIn("vector_done = 1", send("p vector_done"))
+            for _ in range(8):
+                if "exit_group(0)" in send("si"):
+                    return
+            self.fail("vector fixture did not exit normally")
+
+        for backend in ("full", "pages"):
+            with self.subTest(backend=backend):
+                code, output = self.run_tracer(
+                    scenario, name="vector-" + backend,
+                    extra_env={"DETSIM_SNAPSHOT_BACKEND": backend},
+                    verify_failure_cleanup=True)
+                self.assertEqual(code, 0, output)
 
     def test_native_plugin_history_restore_and_violation_identity(self):
         plugin = self.root / "counter.so"

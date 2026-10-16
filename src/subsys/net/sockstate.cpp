@@ -500,6 +500,15 @@ ssize_t SockState::do_send(int fd, const void *buf, size_t len, int flags)
   if (!guest_read_exact(ptmc_state.pids[ptmc_state.cursor], buf, data.data(), len))
     return -EFAULT;
 
+  return do_send_buffer(fd, data);
+}
+
+ssize_t SockState::do_send_buffer(int fd, const std::string &data)
+{
+  const Socket *sock = get_socket(fd);
+  if (!sock) throw std::runtime_error("TCP payload route has no validated socket");
+  const size_t len = data.size();
+
   // Compute our address key to look up in peer's established_connections
   uint64_t our_key = ((uint64_t)sock->local_addr.sin_addr.s_addr << 32) |
                      sock->local_addr.sin_port;
@@ -536,7 +545,7 @@ ssize_t SockState::do_send(int fd, const void *buf, size_t len, int flags)
         auto conn_it = remote_state.tcp_connections_.find(kv.first);
         if (conn_it != remote_state.tcp_connections_.end())
         {
-          conn_it->second.recv_buffer.push_back(data);
+          if (!data.empty()) conn_it->second.recv_buffer.push_back(data);
           LOG_TRACE("send(fd=%d, len=%zu) -> peer fd=%d in process %d", fd, len,
                     kv.first, pid);
           return len;
@@ -558,7 +567,7 @@ ssize_t SockState::do_send(int fd, const void *buf, size_t len, int flags)
           established_it->second.peer_addr.sin_addr.s_addr == sock->peer_addr.sin_addr.s_addr &&
           established_it->second.peer_addr.sin_port == sock->peer_addr.sin_port)
       {
-        established_it->second.recv_buffer.push_back(data);
+        if (!data.empty()) established_it->second.recv_buffer.push_back(data);
         LOG_TRACE(
             "send(fd=%d, len=%zu) -> pending connection on listener fd=%d "
             "in process %d",

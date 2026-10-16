@@ -24,6 +24,15 @@ void require_file(int fd) {
   if (!files().open_files.contains(fd))
     throw std::runtime_error("Descriptor registry has no corresponding file payload");
 }
+bool writev_range_ok(uintptr_t address,size_t length) {
+  if (address>uintptr_t(INTPTR_MAX) || length>uintptr_t(INTPTR_MAX)-address) return false;
+  // L4/L5/LAM limits are not captured. Admit only the common low domain,
+  // excluding its final guard page, even for a zero-length payload base.
+  constexpr uintptr_t low_user_limit=(uintptr_t(1)<<47)-4096;
+  if (address>=low_user_limit || length>low_user_limit-address)
+    throw std::runtime_error("Unsupported writev high user address range");
+  return true;
+}
 }
 
 long emu_read(int fd, void* destination, size_t count) {
@@ -83,6 +92,79 @@ long emu_write(int fd, const void* source, size_t count) {
     }
     default: throw std::runtime_error("Unsupported virtual descriptor kind");
   }
+}
+
+long emu_writev(int fd, const iovec* guest, size_t raw_count) {
+  auto& manager=descriptors();
+  if (!manager.is_allocated(fd)) return -EBADF;
+  const auto type=manager.get_fd_type(fd);
+  if (type==FdType::EPOLL) return -EINVAL;
+  if (type==FdType::FILE || type==FdType::STDIO) require_file(fd);
+  // Accepted sockets have their own access contract, rather than file flags.
+  if ((type==FdType::FILE || type==FdType::STDIO || type==FdType::PIPE) &&
+      (manager.get_status_flags(fd)&O_ACCMODE)==O_RDONLY) return -EBADF;
+
+  const uint32_t count=static_cast<uint32_t>(raw_count);
+  if (count>1024) return -EINVAL;
+  const auto metadata=reinterpret_cast<uintptr_t>(guest);
+  // The kernel preflights the complete metadata span before importing item 0.
+  // A zero count must not inspect the metadata pointer at all.
+  if (count && !writev_range_ok(metadata,count*sizeof(iovec))) return -EFAULT;
+  const pid_t pid=ptmc_state.pids[ptmc_state.cursor];
+  std::vector<iovec> entries(count);
+  // Linux imports all metadata before checking any payload address. Within
+  // each item it reads len then base before rejecting a negative length,
+  // without consulting the next item after that rejection.
+  for (size_t i=0;i<count;++i) {
+    const auto item=metadata+i*sizeof(iovec);
+    if (!guest_read_exact(pid,reinterpret_cast<const void*>(item+offsetof(iovec,iov_len)),
+                          &entries[i].iov_len,sizeof(entries[i].iov_len))) return -EFAULT;
+    if (!guest_read_exact(pid,reinterpret_cast<const void*>(item+offsetof(iovec,iov_base)),
+                          &entries[i].iov_base,sizeof(entries[i].iov_base))) return -EFAULT;
+    if (entries[i].iov_len>size_t(SSIZE_MAX)) return -EINVAL;
+  }
+  constexpr size_t max_rw_count=0x7ffff000;
+  // Single-iov import_ubuf clips before access_ok; multi-iov import validates
+  // every raw payload range before clipping. Both follow metadata validation.
+  if (count==1) entries[0].iov_len=std::min(entries[0].iov_len,max_rw_count);
+  for (const auto& entry:entries)
+    if (!writev_range_ok(reinterpret_cast<uintptr_t>(entry.iov_base),entry.iov_len)) return -EFAULT;
+  size_t total=0;
+  for (auto& entry:entries) {
+    entry.iov_len=std::min(entry.iov_len,max_rw_count-total);
+    total+=entry.iov_len;
+  }
+  if (total>64*1024*1024)
+    throw std::runtime_error("writev staging exceeds 64MiB model limit");
+  if (type==FdType::SOCKET) {
+    const auto* socket=network().get_socket(fd);
+    if (!socket) throw std::runtime_error("Socket descriptor has no payload");
+    if (socket->domain!=AF_INET || socket->type!=SOCK_STREAM || !socket->connected)
+      throw std::runtime_error("Unsupported writev socket; requires connected modeled TCP");
+  } else if (type==FdType::FILE || type==FdType::STDIO) {
+    if (total) files().require_unmapped_file(files().open_files.at(fd).path);
+  } else {
+    throw std::runtime_error("Unsupported writev descriptor kind");
+  }
+
+  // Host-only staging may fail, but no file offset, timestamp or queue changes
+  // until every effective byte is available. Linux's partial-fault effects are
+  // deliberately unsupported, rather than manufactured EFAULT/partial writes.
+  std::string payload(total,'\0');
+  size_t offset=0;
+  for (const auto& entry:entries) {
+    if (entry.iov_len && !guest_read_exact(pid,entry.iov_base,payload.data()+offset,entry.iov_len))
+      throw std::runtime_error("Unsupported writev payload fault before resource commit");
+    offset+=entry.iov_len;
+  }
+  if (type==FdType::SOCKET) {
+    // The existing TCP model has an unbounded queue: commit one entire chunk.
+    // A zero-byte route probe publishes no EOF marker or empty chunk.
+    const long result=network().do_send_buffer(fd,payload);
+    if (result<0) throw std::runtime_error("Unsupported writev non-routable TCP endpoint");
+    return result;
+  }
+  return files().do_write(fd,payload.data(),payload.size());
 }
 
 long emu_close(int fd) {

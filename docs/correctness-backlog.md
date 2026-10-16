@@ -867,3 +867,34 @@ root plus one successor here, so C03 remains open; this case search is neither
 builtin DFS nor an exhaustive general scheduler. Actual module matrix is still
 pending. Current experiments exposed busy GET/INFO polling with frozen clocks;
 explicit time input during runnable work is the next case-environment requirement.
+
+### Clock choices and bounded vector writes
+
+The module case now uses an explicit public time-choice plugin: hold or advance
+10ms on gettimeofday, startup hold, normal business advance. Search executes both
+presets and timeout siblings; its retained path favors normal actors in round
+robin order. Duplicate non-time successors do not count as branching.38case
+component tests and the full/pages finite actor oracle pass. This environment
+policy does not close automatic scheduling C03/C25. Actual module run-xed724we
+progressed through INIT/JOIN2, then rejected syscall20; it remains non-green.
+
+Kernel-model24 admits bounded writev on fully readable FILE/STDIO and existing
+unbounded TCP queues, with one resource commit and no pending vector state.
+Low32 count, descriptor/import error priorities and sequential len/base checks
+match the native oracle. Independent review found the same-item inaccessible
+base/readable negative-length priority bug; a native counterexample and model
+RED now protect the corrected EFAULT. Additional native/model RED tests protect
+the metadata span/guard preflight and single-iovec clipping before range checks;
+multi-iovec raw ranges are checked before clipping. Payload faults, PIPE/UDP, unknown high
+addresses, non-routable sockets and >64MiB staging explicitly reject without
+resource mutation. Native partial writes/backpressure remain unsupported.
+
+Evidence: tests/writev_native_oracle.cpp strictGCC+UBSan each305cases (610children
+reaped, no FD leaks), build/writev-native-oracle/verification.json; check-writev
+locks scalar ordering, flattened FILE/STDIO/TCP resource equivalence and3x archive
+replay/branch isolation.29native scenarios include writev full/pages3x exact
+successor replay and normal exit (/tmp/detsim-writev-final-scenarios.log). NP2IO,
+pendingIO/persisted full/pages, policy/profile/capture and NP1page/stateIO gates
+pass. Targeted Clang analysis of IO/socket sources reports no diagnostics. These
+component and ptrace results do not establish full RedisRaft business/search
+completion; the fresh NP4 module run is separate evidence.

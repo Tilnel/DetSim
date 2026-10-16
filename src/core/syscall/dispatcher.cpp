@@ -138,6 +138,7 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         case SYS_openat:
         case SYS_read:
         case SYS_write:
+        case SYS_writev:
         case SYS_close:
         case SYS_lseek:
         case SYS_stat:
@@ -166,7 +167,7 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
 
         // These operations must not escape into the host descriptor namespace.
         case SYS_dup: case SYS_dup2: case SYS_dup3:
-        case SYS_readv: case SYS_writev: case SYS_pread64: case SYS_pwrite64:
+        case SYS_readv: case SYS_pread64: case SYS_pwrite64:
         case SYS_preadv: case SYS_pwritev: case SYS_preadv2: case SYS_pwritev2:
         case SYS_sendmsg: case SYS_recvmsg: case SYS_sendmmsg: case SYS_recvmmsg:
         case SYS_socketpair: case SYS_shutdown:
@@ -375,6 +376,7 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
         case SYS_openat:
         case SYS_read:
         case SYS_write:
+        case SYS_writev:
         case SYS_close:
         case SYS_lseek:
         case SYS_stat:

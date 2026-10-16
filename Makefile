@@ -9,7 +9,7 @@ ifneq ($(filter benchmark-redisraft,$(MAKECMDGOALS)),)
 NP ?= 3
 endif
 
-ifneq ($(filter check-accept check-redis check-port check-identity check-capture check-io-boundary check-state-view check-plugins check-runtime-profile check-syscall-policy check-process-state check-pending-io check-pending-io-snapshot check-getdents,$(MAKECMDGOALS)),)
+ifneq ($(filter check-accept check-redis check-port check-identity check-capture check-io-boundary check-writev check-state-view check-plugins check-runtime-profile check-syscall-policy check-process-state check-pending-io check-pending-io-snapshot check-getdents,$(MAKECMDGOALS)),)
 NP ?= 2
 endif
 
@@ -117,6 +117,7 @@ check: test check-build-contracts
 
 # Optional fragments are absent in the disposable build-contract fixtures.
 -include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk tests/futex_snapshot.mk tests/futex.mk tests/storage.mk tests/store_cache.mk tests/store_packed.mk tests/redisraft.mk tests/capture.mk tests/soft_dirty.mk tests/page_snapshot.mk tests/io_boundary.mk tests/framework.mk tests/runtime_profile.mk tests/syscall_policy.mk tests/process_state.mk tests/thread_control.mk tests/thread_identity.mk tests/thread_carrier.mk tests/thread_lifecycle.mk tests/thread_tid.mk tests/thread_signal_mask.mk tests/thread_robust.mk tests/pending_syscall.mk tests/pending_timeout.mk tests/pending_io.mk tests/pending_io_snapshot.mk tests/vfs_content.mk tests/thread_altstack.mk tests/getdents.mk tests/history_presentation.mk
+-include tests/writev.mk
 check-integration: check-dwarf check-elf
 
 .PHONY: check-dfs-residency

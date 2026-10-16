@@ -215,6 +215,7 @@ int handle(pid_t pid, syscall_info &info) {
         case SYS_openat:    return handle_openat(pid, info);
         case SYS_read:      return handle_read(pid, info);
         case SYS_write:     return handle_write(pid, info);
+        case SYS_writev:    return handle_writev(pid, info);
         case SYS_close:     return handle_close(pid, info);
         case SYS_lseek:     return handle_lseek(pid, info);
         case SYS_stat:      return handle_stat(pid, info);
@@ -279,6 +280,15 @@ int handle_read(pid_t pid, syscall_info &info) {
 int handle_write(pid_t pid, syscall_info &info) {
     long ret = emu_write(info.args[0], (const void *)info.args[1], info.args[2]);
     return finish_io_call(pid,info,ret);
+}
+
+int handle_writev(pid_t pid, syscall_info &info) {
+    const long result=emu_writev(static_cast<int>(info.args[0]),
+        reinterpret_cast<const iovec*>(info.args[1]),info.args[2]);
+    // This bounded operation never creates an unfinished I/O call.
+    tracee_set_rax(pid,result);
+    info.rval=result;
+    return CKPT_YES;
 }
 
 int handle_close(pid_t pid, syscall_info &info) {

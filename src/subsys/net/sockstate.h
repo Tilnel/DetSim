@@ -189,6 +189,10 @@ class SockState
   /* send(fd, buf, len, flags) -> bytes_sent or -errno (TCP only) */
   ssize_t do_send(int fd, const void *buf, size_t len, int flags);
 
+  // Route one host-owned payload after the caller validates the connected
+  // socket and imports guest bytes. Empty payloads never publish an EOF chunk.
+  ssize_t do_send_buffer(int fd, const std::string &data);
+
   /* recv(fd, buf, len, flags) -> bytes_recv or -errno (TCP only) */
   ssize_t do_recv(int fd, void *buf, size_t len, int flags);
 

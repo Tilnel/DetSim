@@ -138,3 +138,6 @@
 !pending_timeout_integration.cpp
 !pending_timeout.mk
 !guided_search_integration.py
+!writev_native_oracle.cpp
+!writev_integration.cpp
+!writev.mk
