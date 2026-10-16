@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Actual Redis 7.4.2 + RedisRaft module cases, distinct from the Raft library."""
 import argparse
+import copy
+from contextlib import contextmanager
+import math
 import json
 import os
 import re
@@ -188,15 +191,16 @@ class ClientAssertion(common.CaseFailure):
     """A workload assertion is a failed case, before abort's later syscalls."""
 
 
-def control_step(session,node,slot,events,last,observed):
+def control_step(session,node,slot,events,last,observed,choice=0,allow_violation=False):
+    common.require(choice in (0,-2),"unknown controller action")
     session.send("sw "+str(node))
     if slot is not None:
         selected=session.send("thread "+str(slot))
         common.require("Switched to thread "+str(slot)+" " in selected,"logical thread selection failed: "+selected)
-    item={"node":node,"thread":0 if slot is None else slot,"choice":0,"predecessor":session.current_hash(),
+    item={"node":node,"thread":0 if slot is None else slot,"choice":choice,"predecessor":session.current_hash(),
           "executed":False,"status":"attempted"}
     events.append(item)
-    try:reply=session.send("si 0")
+    try:reply=session.send("si timeout" if choice==-2 else "si 0")
     except Exception as error:
         item["reply"]=str(error);item["status"]="error";last[node]=str(error)
         if node==3 and re.search(r"\bAssertion\b|assertion failed",str(error),re.IGNORECASE):
@@ -207,6 +211,10 @@ def control_step(session,node,slot,events,last,observed):
         item["status"]="error"
         raise common.CaseFailure(reply)
     after=session.current_hash()
+    if choice==-2:
+        item.update(status="error",observed_hash=after)
+        common.require("Timeout completed." in reply and after!=item["predecessor"],
+                       "timeout action rejected or unconfirmed: "+reply)
     if re.search(r"Thread \d+ is blocked \(pending syscall\)\. Cannot step\.",reply):
         item.update(status="blocked",observed_hash=after)
         common.require(after==item["predecessor"],"blocked attempt changed state hash: "+reply)
@@ -214,47 +222,354 @@ def control_step(session,node,slot,events,last,observed):
     item.update(status="completed",executed=True,successor=after)
     if node==3 and re.search(r"\bAssertion\b|assertion failed",reply,re.IGNORECASE):
         raise ClientAssertion("client assertion during controlled execution: "+reply)
-    common.require("property violation:" not in reply,"unexpected initialization property violation: "+reply)
+    violations=re.findall(r"([^\n]*): property violation: ([^\n]+)",reply)
+    item["verdict"]="violation" if violations else "pass"
+    item["diagnostic"]=violations[-1][1] if violations else ""
+    common.require("Reach illegal state" not in reply or violations,"illegal state lacks product diagnostic: "+reply)
+    common.require(not violations or allow_violation,"unexpected initialization property violation: "+reply)
+    if violations:
+        common.require(len(violations)==1 and violations[0][0].strip().endswith("cases.redisraft-full"),
+                       "unexpected product property: "+reply)
     if node==3:
         for match in re.finditer(r'write\(1, [^"\n]+"(\{"v":1,[^\n]*\})\\010", \d+\) = \d+',reply):
             observed.append(json.loads(match[1]))
     return reply
 
 
+def thread_actors(session,node):
+    """Read the current saved slots, states and optional absolute deadlines."""
+    session.send("sw "+str(node))
+    reply=session.send("thread")
+    common.require(re.search(r"Threads in process "+str(node)+r" \(pid=\d+\):",reply),"thread listing unavailable: "+reply)
+    rows=[line for line in reply.splitlines() if re.match(r"\s*\*?\s*\[",line)]
+    actors=[]
+    for line in rows:
+        match=re.fullmatch(r"\s*\*?\s*\[(\d+)\] TID \d+ state=(runnable|waiting|exited)"
+                           r"(?: \(main\))?(?:\s+deadline=([^\s]+))?\s*",line)
+        common.require(match,"missing/unknown thread state or deadline; matching tracer required: "+line)
+        deadline=None
+        if match[3] is not None:
+            parsed=re.fullmatch(r"(0|[1-9][0-9]{0,9})\.([0-9]{9})",match[3])
+            common.require(parsed and match[2]=="waiting","invalid saved deadline: "+line)
+            deadline=(int(parsed[1]),int(parsed[2]))
+            common.require(deadline[0]*1000000000+deadline[1]<=2**63-1,"saved deadline exceeds ktime range: "+line)
+        actors.append((int(match[1]),match[2],deadline))
+    single=[line for line in reply.splitlines() if "(single-threaded, main thread only)" in line]
+    if not actors and single:
+        common.require(len(single)==1 and re.fullmatch(r"\s*\(single-threaded, main thread only\) state=runnable\s*",single[0]),
+                       "invalid empty-table thread state or deadline: "+reply)
+        return [(None,"runnable",None)] # Empty-table main actor has no selectable slot.
+    common.require(actors and [slot for slot,_,_ in actors]==list(range(len(actors))),
+                   "invalid logical thread slots/state; matching tracer required: "+reply)
+    return actors
+
+
 def actor_round(session,events,last,observed):
-    """Refresh saved eligibility each round; step only current runnable slots."""
+    """Run fresh eligible slots; expire one finite wait only without progress."""
+    start=len(events)
     for node in range(4):
-        session.send("sw "+str(node))
-        reply=session.send("thread")
-        common.require(re.search(r"Threads in process "+str(node)+r" \(pid=\d+\):",reply),"thread listing unavailable: "+reply)
-        rows=[line for line in reply.splitlines() if re.match(r"\s*\*?\s*\[",line)]
-        actors=[]
-        for line in rows:
-            match=re.fullmatch(r"\s*\*?\s*\[(\d+)\] TID \d+ state=(runnable|waiting|exited)(?: \(main\))?\s*",line)
-            common.require(match,"missing/unknown thread state; matching tracer required: "+line)
-            actors.append((int(match[1]),match[2]))
-        if not actors and "(single-threaded, main thread only) state=runnable" in reply:
-            actors=[(None,"runnable")] # The empty-table main actor has no selectable slot.
-        else:
-            common.require(actors and [slot for slot,_ in actors]==list(range(len(actors))),
-                           "invalid logical thread slots/state; matching tracer required: "+reply)
-        for slot,state in actors:
+        for slot,state,_ in thread_actors(session,node):
             if state!="runnable":continue
             control_step(session,node,slot,events,last,observed)
             if observed and observed[-1].get("event")=="before_set":return
+    if any(item["executed"] for item in events[start:]):return
+    # Re-read after the attempted round: stepping peers may have changed eligibility.
+    current=[(node,slot,state,deadline) for node in range(4)
+             for slot,state,deadline in thread_actors(session,node)]
+    if any(state=="runnable" for _,_,state,_ in current):return
+    candidates=[(deadline,node,slot) for node,slot,state,deadline in current
+                if state=="waiting" and deadline is not None]
+    common.require(candidates,"no runnable actor or finite saved deadline; real request pump cannot progress")
+    deadline,node,slot=min(candidates)
+    control_step(session,node,slot,events,last,observed,choice=-2)
+    events[-1]["deadline"]="%d.%09d"%deadline
 
 
-def model_control(work,tracer,module,client,checker,variant,backend,timeout,max_steps):
+def check_search_deadline(deadline):
+    if time.monotonic()>=deadline:raise TimeoutError("guided search wall budget")
+
+
+@contextmanager
+def bounded_search_commands(session,deadline):
+    """Bound this case's CLI waits and check completion time after every command."""
+    original={name:(name in vars(session),getattr(session,name)) for name in ("send","current_hash")}
+    original_timeout=getattr(session,"timeout",None)
+    def bounded(call):
+        def invoke(*args,**kwargs):
+            check_search_deadline(deadline)
+            reply=call(*args,**kwargs)
+            check_search_deadline(deadline)
+            return reply
+        return invoke
+    try:
+        for name,(_,call) in original.items():setattr(session,name,bounded(call))
+        if original_timeout is not None and hasattr(session,"started"):
+            session.timeout=min(original_timeout,max(0,deadline-session.started))
+        yield
+    finally:
+        for name,(owned,value) in original.items():
+            if owned:setattr(session,name,value)
+            else:delattr(session,name)
+        if original_timeout is not None:session.timeout=original_timeout
+
+
+def restore_source(session,source):
+    reply=session.send("load "+source)
+    common.require("Loaded state" in reply and session.current_hash()==source,"search source restore failed: "+reply)
+
+
+def search_actions(session,process_count=4):
+    actions=[]
+    for node in range(process_count):
+        for slot,state,deadline in thread_actors(session,node):
+            if state=="runnable":actions.append((node,slot,0))
+            elif state=="waiting" and deadline is not None:actions.append((node,slot,-2))
+    return sorted(actions)
+
+
+def search_layer(session,source,driver,events,process_count=4,deadline=float("inf")):
+    check_search_deadline(deadline)
+    restore_source(session,source)
+    check_search_deadline(deadline)
+    actions=search_actions(session,process_count)
+    check_search_deadline(deadline)
+    candidates=[]
+    for node,slot,choice in actions:
+        check_search_deadline(deadline)
+        restore_source(session,source)
+        branch=copy.deepcopy(driver);count=len(branch["observations"])
+        control_step(session,node,slot,events,[""]*max(4,process_count),branch["observations"],choice,allow_violation=True)
+        check_search_deadline(deadline)
+        edge=events[-1]
+        common.require(edge["executed"] and edge["predecessor"]==source,"enumerated actor did not execute from source")
+        edge["observations"]=copy.deepcopy(branch["observations"][count:])
+        if node==3 and choice==0:
+            exited=re.search(r"\bexit_group\((\d+)\)",edge["reply"])
+            if exited:branch["client_exit"]=int(exited[1])
+        edge["client_exit"]=branch["client_exit"]
+        candidates.append({"action":(node,slot,choice),"edge":edge,"driver":branch})
+    check_search_deadline(deadline)
+    return candidates
+
+
+def model_outcome(driver,variant,verdict,diagnostic):
+    common.require(verdict in ("pass","violation"),"unknown product verdict")
+    records=driver["observations"]
+    if verdict=="violation":
+        common.require(variant=="mutant" and diagnostic=="acknowledged local value missing at node 3 key alpha",
+                       "unexpected property violation: "+diagnostic)
+        acks=[x for x in records if x["event"]=="ack"]
+        common.require([(x["key"],x["value"]) for x in acks]==[("alpha","17"),("beta","29")] and
+                       0<acks[0]["index"]<acks[1]["index"],"model violation lacks exact ACKs")
+        progress={x["node"]:x for x in records if x["event"]=="progress"}
+        common.require(set(progress)=={1,2,3} and all(x["commit"]>=acks[1]["index"] and
+                       x["applied"]>=acks[1]["index"] for x in progress.values()),"model violation lacks applied checkpoints")
+        local=[x for x in records if x["event"]=="local"]
+        expected={(node,key) for node in (1,2) for key in ("alpha","beta")}|{(3,"alpha")}
+        common.require(len(local)==5 and {(x["node"],x["key"]) for x in local}==expected,
+                       "model terminal violation lacks exact local observation prefix")
+        common.require(all(type(x["present"]) is bool and type(x["matches"]) is bool and
+                       x["present"]==((x["node"],x["key"])!=(3,"alpha")) and x["matches"]==x["present"]
+                       for x in local),"model terminal violation has another local failure")
+        return "violation"
+    if driver["client_exit"] is not None:
+        common.require(variant=="healthy" and driver["client_exit"]==0,"client exited without matching product violation")
+        native_result(records,0,"healthy")
+        return "pass"
+    return None
+
+
+def replay_candidate(session,source,driver,candidate,variant,results=None,deadline=float("inf")):
+    if results is None:results=[]
+    for _ in range(3):
+        check_search_deadline(deadline)
+        restore_source(session,source)
+        replay_driver=copy.deepcopy(driver);events=[]
+        node,slot,choice=candidate["action"]
+        control_step(session,node,slot,events,[""]*4,replay_driver["observations"],choice,allow_violation=True)
+        check_search_deadline(deadline)
+        event=events[-1]
+        if node==3 and choice==0:
+            exited=re.search(r"\bexit_group\((\d+)\)",event["reply"])
+            if exited:replay_driver["client_exit"]=int(exited[1])
+        expected=candidate["edge"]
+        common.require(event["executed"] and event.get("successor")==expected["successor"] and
+                       event["verdict"]==expected["verdict"] and event["diagnostic"]==expected["diagnostic"] and
+                       replay_driver==candidate["driver"],"terminal edge replay changed hash/property/observations/exit")
+        outcome=model_outcome(replay_driver,variant,event["verdict"],event["diagnostic"])
+        common.require(outcome in ("pass","violation"),"terminal replay lacks matching outcome")
+        results.append({"source":source,"action":list(candidate["action"]),"target":event["successor"],
+                        "verdict":event["verdict"],"diagnostic":event["diagnostic"],
+                        "observations":replay_driver["observations"],"client_exit":replay_driver["client_exit"]})
+    check_search_deadline(deadline)
+    return results
+
+
+def guided_search(session,root,driver,variant,max_depth,wall_seconds):
+    common.require(max_depth>0 and math.isfinite(wall_seconds) and wall_seconds>0,"positive finite guided search bounds required")
+    started=time.monotonic()
+    result={"status":"incomplete","termination":"depth_cutoff","root":root,"root_observations":copy.deepcopy(driver["observations"]),"beam_width":1,"seed":0,
+            "wall_cutoff":False,
+            "bounds":{"depth":max_depth,"wall_seconds":wall_seconds},"expanded_layers":0,"attempted_edges":0,
+            "unique_successors":0,"pruned_successors":0,"partial_last_layer":False,"branching_observed":False,
+            "selection":"lexicographic(node,slot,choice), first after cursor with wrap; independent of property/variant",
+            "cursor":None,"edges":[],"path":[],"replays":[],"replay_verified":False}
+    source=root;source_driver=copy.deepcopy(driver);cursor=None;visited={root}
+    deadline=min(started+wall_seconds,getattr(session,"started",float("inf"))+getattr(session,"timeout",0))
+    result["bounds"]["effective_wall_seconds"]=max(0,deadline-started)
+    try:
+        with bounded_search_commands(session,deadline):
+            for layer in range(max_depth):
+                start=len(result["edges"]);result["partial_last_layer"]=True
+                candidates=search_layer(session,source,source_driver,result["edges"],deadline=deadline)
+                result["partial_last_layer"]=False;result["expanded_layers"]+=1
+                if not candidates:
+                    result["termination"]="no_legal_actions";break
+                successors={x["edge"]["successor"] for x in candidates}
+                result["branching_observed"]|=len(successors)>=2
+                terminal=[]
+                for candidate in candidates:
+                    outcome=model_outcome(candidate["driver"],variant,candidate["edge"]["verdict"],candidate["edge"]["diagnostic"])
+                    candidate["edge"]["layer"]=layer
+                    candidate["edge"]["outcome"]=outcome
+                    if outcome:terminal.append((candidate,outcome))
+                if terminal:
+                    candidate,outcome=terminal[0]
+                    result["witness"]={"source":source,"action":list(candidate["action"]),"target":candidate["edge"]["successor"],
+                                       "diagnostic":candidate["edge"]["diagnostic"],"driver":candidate["driver"]}
+                    candidate["edge"]["selected"]=True
+                    result["path"].append({"source":source,"action":list(candidate["action"]),"target":candidate["edge"]["successor"],
+                                           "edge_index":start+candidates.index(candidate)})
+                    result["pruned_successors"]+=len(successors-{candidate["edge"]["successor"]})
+                    if not result["branching_observed"]:
+                        result["termination"]="degenerate_single_path";break
+                    replay_candidate(session,source,source_driver,candidate,variant,result["replays"],deadline)
+                    check_search_deadline(deadline)
+                    result.update(status=outcome,termination="healthy_completion" if outcome=="pass" else "exact_violation",replay_verified=True)
+                    break
+                candidate=next((x for x in candidates if cursor is None or x["action"]>cursor),candidates[0])
+                result["pruned_successors"]+=len(successors-{candidate["edge"]["successor"]})
+                cursor=candidate["action"];result["cursor"]=list(cursor)
+                candidate["edge"]["selected"]=True
+                result["path"].append({"source":source,"action":list(cursor),"target":candidate["edge"]["successor"],"edge_index":start+candidates.index(candidate)})
+                source=candidate["edge"]["successor"];source_driver=candidate["driver"]
+                if source in visited:
+                    result["termination"]="retained_path_cycle";break
+                visited.add(source)
+    except (TimeoutError,subprocess.TimeoutExpired) as error:
+        result.update(status="timeout",termination="wall_cutoff",wall_cutoff=True,replay_verified=False,diagnostic=str(error))
+    except Exception as error:
+        result.update(status="failed",termination="error",diagnostic=str(error))
+    result["attempted_edges"]=len(result["edges"])
+    result["unique_successors"]=len({edge["successor"] for edge in result["edges"] if "successor" in edge})
+    result["elapsed_seconds"]=max(0,time.monotonic()-started)
+    if result["elapsed_seconds"]>=result["bounds"]["effective_wall_seconds"]:
+        result.update(status="timeout",termination="wall_cutoff",wall_cutoff=True,replay_verified=False,
+                      diagnostic="guided search wall budget exhausted before final acceptance")
+    return result
+
+
+def matrix_acceptance(rows,variants,backends,native_only=False):
+    expected={(variant,"native") for variant in variants}
+    if not native_only:expected|={(variant,backend) for variant in variants for backend in backends}
+    keys=[(row["variant"],row["backend"]) for row in rows];errors=[]
+    if len(keys)!=len(set(keys)) or set(keys)!=expected:errors.append("missing, duplicate or unexpected matrix rows")
+    for row in rows:
+        try:
+            variant=row["variant"];expected_status="pass" if variant=="healthy" else "violation"
+            common.require(row.get("status")==expected_status and row.get("cleanup")=="pass" and row.get("NP")==4,
+                           "row lacks expected outcome/NP4/cleanup")
+            if row["backend"]=="native":
+                native_result(row["observations"],row["client_exit"],variant)
+                common.require(row.get("checker_exit")== (0 if variant=="healthy" else 1) and
+                               row.get("server_exits")==[0,0,0],"native saved checker verdict/cleanup missing")
+                expected_check="NATIVE_CHECK verdict=0 diagnostic=" if variant=="healthy" else \
+                    "NATIVE_CHECK verdict=1 diagnostic=acknowledged local value missing at node 3 key alpha"
+                common.require(row.get("checker_output","").strip()==expected_check,"native checker diagnostic differs")
+                continue
+            prerequisite=next(x for x in rows if x["variant"]==variant and x["backend"]=="native")
+            for name in ("module_sha256","client_sha256","checker_sha256","server_sha256","runner_sha256","sources"):
+                common.require(name in row and row[name]==prerequisite.get(name),"model/native inputs differ: "+name)
+            for name in ("config_sha256","tracer_sha256"):
+                common.require(re.fullmatch(r"[0-9a-f]{64}",row.get(name,"")),"model hash missing: "+name)
+            search=row["search"];witness=search["witness"];edges=search["edges"]
+            common.require(row.get("tracer_exit")==0 and search["status"]==expected_status and
+                           search.get("branching_observed") is True and search.get("replay_verified") is True and
+                           search.get("beam_width")==1 and search.get("partial_last_layer") is False and
+                           search.get("expanded_layers",0)>0 and search.get("attempted_edges")==len(edges),"search evidence incomplete")
+            common.require(search.get("termination")==("healthy_completion" if variant=="healthy" else "exact_violation"),
+                           "search did not reach exact business outcome")
+            prefix=row["observations"];root=search["root"];path=search["path"]
+            common.require(re.fullmatch(r"[0-9a-f]{16}",root) and root==row.get("prefix"),"search root differs from saved prefix")
+            common.require(prefix and prefix[-1].get("event")=="before_set" and prefix[-1].get("key")=="alpha" and
+                           not any(item.get("event")=="ack" for item in prefix) and search["root_observations"]==prefix,
+                           "search root lacks pre-SET alpha observations without ACKs")
+            elapsed=search["elapsed_seconds"];effective=search["bounds"]["effective_wall_seconds"]
+            requested=search["bounds"]["wall_seconds"]
+            common.require(all(type(value) in (int,float) and math.isfinite(value) for value in (elapsed,effective,requested)) and
+                           0<=elapsed<effective<=requested and search.get("wall_cutoff") is False,"search exceeded or lacks wall evidence")
+            common.require(isinstance(path,list) and path and len(path)==search["expanded_layers"] and
+                           type(search["bounds"]["depth"]) is int and 0<len(path)<=search["bounds"]["depth"],
+                           "search path is empty/incomplete or exceeds depth")
+            source=root;selected=set();observations=copy.deepcopy(prefix);previous=-1
+            for layer,step in enumerate(path):
+                common.require(step["source"]==source and re.fullmatch(r"[0-9a-f]{16}",step["target"]),"search path is not contiguous")
+                index=step["edge_index"]
+                common.require(type(index) is int and previous<index<len(edges),"invalid path edge index")
+                edge=edges[index];action=step["action"]
+                common.require(isinstance(action,list) and len(action)==3 and all(type(value) is int for value in action) and
+                               0<=action[0]<4 and action[1]>=0 and action[2] in (0,-2),"invalid path actor/action")
+                common.require(edge.get("selected") is True and edge.get("executed") is True and edge.get("status")=="completed" and
+                               type(edge["layer"]) is int and edge["layer"]==layer and edge["predecessor"]==source and
+                               edge["successor"]==step["target"] and [edge["node"],edge["thread"],edge["choice"]]==action,
+                               "path does not reference its actual selected candidate")
+                observations.extend(edge["observations"])
+                source=step["target"];previous=index;selected.add(index)
+            common.require({index for index,edge in enumerate(edges) if edge.get("selected")}==selected,
+                           "selected candidate is detached from retained path")
+            last=path[-1]
+            common.require(all(last[name]==witness[name] for name in ("source","action","target")) and
+                           observations==witness["driver"]["observations"] and
+                           edges[last["edge_index"]]["client_exit"]==witness["driver"]["client_exit"],
+                           "witness does not end the rooted path with its actual observations/exit")
+            groups={}
+            for edge in edges:
+                layer=edge["layer"]
+                common.require(type(layer) is int and 0<=layer<len(path) and
+                               edge["predecessor"]==path[layer]["source"] and re.fullmatch(r"[0-9a-f]{16}",edge["successor"]),
+                               "candidate is detached from its expanded path source")
+                if edge.get("executed"):groups.setdefault(layer,set()).add(edge["successor"])
+            common.require(any(len(targets)>=2 for targets in groups.values()),"no expanded source has two distinct successors")
+            verdict="violation" if variant=="mutant" else "pass"
+            common.require(model_outcome(witness["driver"],variant,verdict,witness["diagnostic"])==expected_status,
+                           "witness business evidence differs")
+            replays=search["replays"]
+            common.require(len(replays)==3 and all(replay["source"]==witness["source"] and replay["target"]==witness["target"] and
+                           replay["action"]==witness["action"] and replay["verdict"]==verdict and
+                           replay["diagnostic"]==witness["diagnostic"] and
+                           replay["observations"]==witness["driver"]["observations"] and
+                           replay["client_exit"]==witness["driver"]["client_exit"] for replay in replays),"three exact replays missing")
+        except Exception as error:errors.append(str((row.get("variant"),row.get("backend")))+": "+str(error))
+    valid=not errors
+    full=valid and not native_only and expected=={(v,b) for v in ("healthy","mutant") for b in ("native","full","pages")}
+    return {"requested_matrix":[list(key) for key in sorted(expected)],"requested_matrix_complete":valid,
+            "model_matrix_complete":bool(full),"passed":valid,"matrix_errors":errors}
+
+
+def model_control(work,tracer,module,client,checker,variant,backend,timeout,max_steps,search_depth=2000,search_seconds=180):
     """Reach the pre-SET/fault prefix by real requests; never search startup."""
     directory=work/(variant+"-"+backend)
     logs=["/node"+str(node)+"-raftlog.db" for node in range(1,4)]
     tracees=[server_argv(module,node,"192.168.0."+str(node),6379,logs[node-1]) for node in range(1,4)]
     tracees.append([str(client)]+[part for node in range(1,4) for part in ("192.168.0."+str(node),"6379")])
     row={"target":"redisraft-full","variant":variant,"backend":backend,"NP":4,
-         "status":"incomplete","artifacts":str(directory),"scope":"hand-controlled initialization to pre-SET fault prefix",
-         "bounds":{"control_steps":max_steps,"wall_seconds":timeout,"address_space_bytes":common.MODEL_ADDRESS_SPACE_LIMIT},
+         "status":"incomplete","artifacts":str(directory),"scope":"hand-controlled initialization to pre-SET, then bounded case-side beam1 search",
+         "bounds":{"control_steps":max_steps,"wall_seconds":timeout,"search_depth":search_depth,"search_seconds":search_seconds,
+                   "address_space_bytes":common.MODEL_ADDRESS_SPACE_LIMIT},
          "tracer_sha256":common.digest(tracer),"module_sha256":common.digest(module),
-         "client_sha256":common.digest(client),"checker_sha256":common.digest(checker),"server_sha256":common.digest(SERVER)}
+         "client_sha256":common.digest(client),"checker_sha256":common.digest(checker),"server_sha256":common.digest(SERVER),
+         "runner_sha256":common.digest(Path(__file__)),
+         "sources":{name:common.digest(HERE/name) for name in ("client.c","checker.cpp","checker_test.cpp")}}
     session=None;events=[];observed=[];phase="startup";last=[""]*4
     try:
         session=FullSession(tracer,tracees,checker,logs,directory,backend,timeout)
@@ -277,10 +592,14 @@ def model_control(work,tracer,module,client,checker,variant,backend,timeout,max_
                 common.require(observed[-1].get("key")=="alpha","first fault prefix is not alpha SET")
                 row["prefix"]=session.current_hash();row["observations"]=observed
                 (directory/"prefix-history.log").write_text(session.send("info"))
-                row["diagnostic"]="pre-SET fault prefix reached; bounded fault-event search/replay remains required"
+                common.require(not any(item.get("event")=="ack" for item in observed),"search root follows a SET acknowledgement")
+                phase="guided_search"
+                row["search"]=guided_search(session,row["prefix"],{"observations":observed,"client_exit":None},
+                                             variant,search_depth,search_seconds)
+                row.update(status=row["search"]["status"],diagnostic=row["search"].get("diagnostic",row["search"]["termination"]))
                 break
             stable=stable+1 if session.current_hash()==before else 0
-            if stable>=16:raise common.CaseFailure("real request pump made no successor progress; pending timers are not auto-expired")
+            if stable>=16:raise common.CaseFailure("real request pump made no successor progress under explicit finite-timeout policy")
         else:raise common.CaseFailure("membership/fault-prefix control step bound exceeded")
     except Exception as error:
         row.update({"status":"failed","diagnostic":str(error)} if isinstance(error,ClientAssertion)
@@ -290,6 +609,7 @@ def model_control(work,tracer,module,client,checker,variant,backend,timeout,max_
         row["last_replies"]=last
     finally:
         if session:
+            if "search" in row:(directory/"search.json").write_text(json.dumps(row["search"],indent=2)+"\n")
             (directory/"control-events.json").write_text(json.dumps(events,indent=2)+"\n")
             (directory/"observations.json").write_text(json.dumps(observed,indent=2)+"\n")
             row["config_sha256"]=common.digest(directory/"config.json")
@@ -298,7 +618,7 @@ def model_control(work,tracer,module,client,checker,variant,backend,timeout,max_
             row["remaining_owned_pids"]=remaining
             row["cleanup"]="failed" if remaining else "pass"
             if remaining:row.update(status="failed",cleanup_diagnostic="owned tracees remain after cleanup: "+str(remaining))
-            if row["tracer_exit"]!=0 and row["status"]=="pass":row.update(status="failed",diagnostic="tracer exited nonzero")
+            if row["tracer_exit"]!=0 and row["status"] in ("pass","violation"):row.update(status="failed",diagnostic="tracer exited nonzero")
     return row
 
 
@@ -311,14 +631,19 @@ def main():
     parser.add_argument("--timeout",type=float,default=180)
     parser.add_argument("--backend",choices=("full","pages","all"),default="all")
     parser.add_argument("--max-control-steps",type=int,default=1500)
+    parser.add_argument("--search-depth",type=int,default=2000)
+    parser.add_argument("--search-seconds",type=float,default=180)
     parser.add_argument("--reuse-modules",type=Path)
     parser.add_argument("--address-space-mb",type=int,default=4096)
     args=parser.parse_args()
     args.output.mkdir(parents=True,exist_ok=True)
     work=Path(tempfile.mkdtemp(prefix="run-",dir=args.output.resolve()))
+    variants=("healthy","mutant") if args.variant=="all" else (args.variant,)
+    backends=("full","pages") if args.backend=="all" else (args.backend,)
+    common.require(args.search_depth>0 and args.search_seconds>0,"positive search bounds required")
     rows=[]
     report={"workdir":str(work),"passed":False,"rows":rows,"model_matrix_complete":False,
-        "scope":"native-only actual Redis+loaded module" if args.native_only else "native plus hand-controlled NP4 prefix; full model matrix incomplete"}
+        "scope":"native-only actual Redis+loaded module" if args.native_only else "native prerequisites plus bounded case-side beam1 search; unretained frontiers remain uncovered"}
     try:
         client=work/"client"
         checker_test=work/"checker-test"
@@ -327,7 +652,7 @@ def main():
         command([checker_test],ROOT,work/"checker-test.log")
         command(["/usr/bin/g++","-std=c++20","-O2","-g","-Wall","-Wextra","-Werror","-fPIC","-shared","-I"+str(ROOT/"src"),"-I"+str(ROOT/"third_party"),HERE/"checker.cpp","-o",checker],ROOT,work/"checker-build.log")
         command(["/usr/bin/gcc","-std=gnu11","-O0","-g","-gdwarf-4","-fno-pie","-no-pie","-Wall","-Wextra","-Werror",HERE/"client.c","-o",client],ROOT,work/"client-build.log")
-        for variant in (("healthy","mutant") if args.variant=="all" else (args.variant,)):
+        for variant in variants:
             if args.reuse_modules:
                 manifest=args.reuse_modules.resolve()/variant/"manifest.json"
                 module=manifest.parent/"source/redisraft.so"
@@ -342,10 +667,11 @@ def main():
                 common.require(args.tracer and args.tracer.exists(),"matching immutable NP4 --tracer required")
                 common.require(row["status"] in ("pass","violation"),"native prerequisite failed")
                 common.MODEL_ADDRESS_SPACE_LIMIT=args.address_space_mb*1024**2
-                for backend in (("full","pages") if args.backend=="all" else (args.backend,)):
-                    rows.append(model_control(work,args.tracer.resolve(),module,client,checker,variant,backend,args.timeout,args.max_control_steps))
-        report["passed"]=bool(rows) and all(row["status"] in ("pass","violation") for row in rows)
+                for backend in backends:
+                    rows.append(model_control(work,args.tracer.resolve(),module,client,checker,variant,backend,args.timeout,args.max_control_steps,
+                                              args.search_depth,args.search_seconds))
     except Exception as error: report["diagnostic"]=str(error)
+    report.update(matrix_acceptance(rows,variants,backends,args.native_only))
     (work/"result.json").write_text(json.dumps(report,indent=2)+"\n")
     print(json.dumps(report,indent=2))
     return 0 if report["passed"] else 1

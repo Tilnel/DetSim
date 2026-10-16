@@ -84,8 +84,13 @@
   "next_targets": [
     {
       "id": "redisraft-full",
-      "processes": 3,
-      "status": "planned real Redis+module target; do not conflate library smoke with this target"
+      "processes": 4,
+      "servers": 3,
+      "build": "make NP=4 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4",
+      "command": "python3 examples/cases/redisraft_full_run.py --tracer ./tracer --timeout 2400 --max-control-steps 6000 --search-depth 2000 --search-seconds 1800",
+      "status": "native pair and finite actor oracle pass; actual full/pages module matrix remains pending",
+      "scope": "three real loaded modules plus RESP client; public saved protocol/log oracle; case-side guided beam1 with explicit pruning and timeout actions",
+      "documentation": "examples/cases/redisraft_full/README.md"
     },
     {
       "id": "runtime-concurrency",

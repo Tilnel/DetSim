@@ -54,50 +54,107 @@ covers per-node CRC chains, binary command conflicts, saved-data failures,
 partial tails, malformed monitors, ACK/commit rollback and repeated monitor
 roundtrips. It also verifies the actual native output and persisted log files.
 
-Model completion is a separate stage. It must first reach a recorded business
-prefix by controlled execution, then run a genuinely nonempty bounded search and
-replay the saved violation edge three times. A search from the final local-read
-observation predecessor only reproduces observation of an earlier fault; it must
-not be described as discovering the earlier skipped apply itself. Initializing
-servers or passing the native/checker tests does not complete the NP4 full/pages
-matrix. The completed native matrix requires explicit `--native-only`. To reproduce the
-first controlled model blocker with the currently supplied NP4 tracer:
+Model mode first controls real startup and membership requests up to the saved
+`before_set(alpha)` observation, before the first SET is sent. It then starts a
+bounded, case-side beam-1 search from that prefix. It never controls the skipped
+apply manually and searches only its later observation.
+
+Each expanded source is restored before every candidate. Fresh public CLI thread
+listings enumerate every runnable `(process, logical slot, normal choice 0)` and
+every finite waiting `(process, logical slot, timeout choice -2)`. This explicit
+TCP profile has no extra ChoosePoint outcomes. Dead and untimed waiting actors
+have no transition candidate. Each candidate gets a private copy of the source's
+Python observations; the restored product monitor remains the property oracle.
+All candidates are checked, including siblings that will be pruned. Exactly one
+continuation is selected by a deterministic round-robin cursor over sorted actor
+and action tuples, independently of variant, fault or property. The selected path
+and every candidate's actual source/action/target are recorded independently of
+TSS history, which retains only the first incoming edge for a target.
+
+This is a bounded search with discarded frontiers, not exhaustive DFS or a
+fairness/liveness proof. `search.json` records depth/wall bounds, expanded layers,
+attempted edges, distinct successors, pruned successors, partial-layer status,
+selection cursor, chosen path and termination reason. The search wall budget
+constrains CLI waits as well as action/replay work: every command is checked before
+and after return, and the original session wait budget is restored afterward.
+`elapsed_seconds`, the effective remaining wall allowance and `wall_cutoff` are
+recorded; even a third replay returning after the deadline cannot pass.
+A successful row requires
+at least two distinct successors from one expanded source. Depth/wall cutoffs,
+cycles, no legal actions, unknown outcomes and unavailable inspection stay
+non-green. No manual-fault fallback exists.
+
+Healthy completion requires both exact SET ACKs, all three commit/applied
+checkpoints, six unique correct node-local values, `done` and virtual client exit
+0. A mutant witness requires the exact product diagnostic for node 3 missing
+alpha, both ACKs, all three checkpoints, the four correct node 1/2 cells and the
+unique missing node-3-alpha cell. The product monitor stops on that first bad
+observation, so the model witness has not read node 3 beta. The native prerequisite
+independently checks all six cells, including correct node 3 beta. Any other
+violation is a failure. The actual terminal or completion edge is replayed three
+times from its recorded source, requiring equal target hash, verdict, diagnostic,
+observations and virtual client exit.
+
+To run the requested pages subset with a matching immutable NP4 tracer:
 
 ```sh
 python3 examples/cases/redisraft_full_run.py \
-  --variant healthy --backend pages \
-  --tracer build/case-tools/tracer-iteration11-np4 \
+  --backend pages --tracer build/case-tools/tracer-iteration14-np4 \
   --reuse-modules build/redisraft-full-cases/run-o6dwejfc \
-  --timeout 180 --max-control-steps 1500
+  --timeout 1800 --max-control-steps 6000 \
+  --search-depth 2000 --search-seconds 1200
 ```
 
-`--reuse-modules` is optional and checks immutable module hashes against their
-original build manifests. Without it, the runner builds new source copies. The
-controller steps each real server main actor to its ready message. Each membership
-pump round reads each process's public CLI `thread` listing and explicitly selects
-every runnable logical thread slot with `thread N` before `si 0`. The `0` is a syscall
-choice, not a thread selector; RedisRaft background fsync workers therefore receive
-explicit steps. The CLI labels saved actors `state=runnable`, `state=waiting` or
-`state=exited`: dead actors are exited, live actors with pending phase Waiting
-are waiting, and live actors with no pending call or phase Retry/Ready are runnable.
-This display derives from saved semantic state, never physical host task status.
-The controller requires this updated tracer format and rejects unknown/missing
-states. It skips waiting/exited slots and re-reads every process listing each
-round, so newly born or newly runnable actors participate without stale caching.
-A slot awakened after its process was listed participates on the next round.
-Actor identity
-is process index plus logical slot, never host TID. This fixed fair pump does not
-search the startup sequence, exhaust schedules or synthesize timer expiry. Client
-assertion diagnostics immediately fail the case before following the abort path.
-The original iteration-11 run rejected `unlink` (syscall 87) during server 1
-initialization; current run artifacts determine the current blocker.
-`control-events.json` records node, logical thread slot and syscall choice for each
-attempt. Completed syscall steps have `executed=true`, `status=completed` and
-predecessor/successor hashes. A CLI "Thread N is blocked (pending syscall). Cannot
-step." reply instead records `executed=false`, `status=blocked` and an
-`observed_hash` that must equal the predecessor; it has no successor edge. Errors
-retain the attempted actor with `executed=false`, `status=error` and the reply; results retain the phase, exact predecessor hash, last replies,
-configuration/hash and the inventory of owned processes after cleanup. A reached
-pre-SET prefix also remains explicitly incomplete until bounded fault-event
-search and replay are implemented and pass. Blocked states, timer deadlines and
-unsupported operations remain failures for the generic controller to address.
+`--reuse-modules` verifies module hashes against their original manifests and
+avoids rebuilding the external module. `--native-only` runs only the native
+prerequisites. `passed` and `requested_matrix_complete` refer to the exact unique
+requested rows; requesting one backend or variant cannot set
+`model_matrix_complete`. That flag requires healthy and mutant in full and pages,
+plus both native prerequisites, all with validated business/replay/cleanup
+evidence. Acceptance binds `search.root` to the row's canonical 16-hex pre-SET
+prefix with no ACK yet. A nonempty continuous path must reference actual selected
+candidate edges by index, source/action/target and layer, and terminate at the
+witness. Accumulated path observations and virtual exit must equal its business
+evidence. Detached witnesses, broken paths and missing/late wall evidence fail.
+Missing, duplicate, unexpected or incomplete rows fail acceptance.
+The full RedisRaft model matrix remains unverified until those actual runs pass.
+
+The prefix pump reads each process's public CLI `thread` listing afresh every
+round and selects each runnable logical slot with `thread N; si 0`. RedisRaft
+fsync workers therefore receive explicit steps. The CLI derives
+`state=runnable|waiting|exited` from saved alive/pending state: Waiting is waiting;
+Retry, Ready and no pending call are runnable; dead actors are exited. Waiting
+with a finite saved absolute deadline additionally shows
+`deadline=SECONDS.NNNNNNNNN`. Missing/unknown state or malformed/noncanonical
+fields fail parsing rather than silently dropping actors.
+
+When a prefix round completes no action, the controller refreshes all lists. If
+there is no runnable actor, it chooses one finite wait by `(saved deadline,
+process index, logical slot)` and issues `si timeout`. Deadlines belong to
+per-process model clocks; numerical ordering is a fixed control policy, not a
+claim of shared global time. Untimed waits are never assigned a deadline. No
+runnable actor and no finite wait fails explicitly. The search instead enumerates
+all admitted normal and timeout candidates at every expanded source.
+
+`control-events.json` and search edges distinguish attempts from completed actions.
+Completed actions have `executed=true`, `status=completed` and predecessor/
+successor hashes. A blocked CLI reply records `executed=false`, `status=blocked`,
+no successor and an `observed_hash` that must equal the source. Errors retain the
+attempted actor, reply and `status=error`. A timeout requires the current reply
+`Timeout completed.` and a changed hash; history's `(timeout)` marker never proves
+which action this attempt completed. Client assertion diagnostics fail immediately.
+All model runs retain config/source/binary hashes and process cleanup inventory.
+
+Local verification commands:
+
+```sh
+python3 examples/cases/redisraft_full/control_test.py
+python3 examples/cases/redisraft_full/native_result_test.py
+python3 examples/cases/redisraft_full/search_test.py
+python3 tests/guided_search_integration.py --tracer build/case-tools/tracer-iteration13-np1
+```
+
+The finite integration fixture compares two real runnable logical actors against
+manual CLI successor sets in full and pages, repeating after alternate-branch
+restores. Its builtin DFS observation is reported separately; C03 actor coverage
+is not closed by the case enumerator.

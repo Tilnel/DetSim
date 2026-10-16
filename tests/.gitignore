@@ -137,3 +137,4 @@
 !file_eof_native_oracle.cpp
 !pending_timeout_integration.cpp
 !pending_timeout.mk
+!guided_search_integration.py

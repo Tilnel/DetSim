@@ -15,19 +15,25 @@ import redisraft_full_run as runner
 class Session:
     def __init__(self):
         self.node=0;self.slot=0;self.commands=[];self.edges=0;self.reply="stepped"
-        self.slots={0:[0,1,2],1:[0,1],2:[0],3:[0]};self.states={}
+        self.slots={0:[0,1,2],1:[0,1],2:[0],3:[0]};self.states={};self.deadlines={}
 
     def send(self,command):
         self.commands.append(command)
         if command.startswith("sw "): self.node=int(command.split()[1])
         elif command=="thread":
             return "Threads in process %d (pid=98765):\n"%self.node+"".join(
-                "%s [%d] TID %d %s %s\n"%("*" if slot==self.slot else " ",slot,100+slot,
+                "%s [%d] TID %d %s %s%s\n"%("*" if slot==self.slot else " ",slot,100+slot,
                     "state="+self.states.get((self.node,slot),"runnable") if self.states.get((self.node,slot),"runnable") else "",
-                    "(main)" if slot==0 else "")
+                    "(main)" if slot==0 else "",
+                    " deadline="+self.deadlines[(self.node,slot)] if (self.node,slot) in self.deadlines else "")
                 for slot in self.slots[self.node])
         elif command.startswith("thread "):
             self.slot=int(command.split()[1]);return "Switched to thread %d (TID=99999)"%self.slot
+        elif command=="info current":return "Current action (timeout)"
+        elif command=="si timeout":
+            self.edges+=1;self.states[(self.node,self.slot)]="runnable"
+            self.deadlines.pop((self.node,self.slot),None)
+            return "Timeout completed."
         elif command=="si 0":
             if "is blocked (pending syscall). Cannot step." not in self.reply:self.edges+=1
             return self.reply
@@ -74,6 +80,76 @@ class ControllerTest(unittest.TestCase):
             with self.subTest(status=status):
                 with self.assertRaisesRegex(RuntimeError,"thread.*state"):
                     runner.actor_round(session,[],[""]*4,[])
+
+    def waiting_session(self):
+        session=Session()
+        session.states={(node,slot):"waiting" for node,slots in session.slots.items() for slot in slots}
+        return session
+
+    def test_quiescent_finite_wait_uses_one_timeout_then_resumes_normally(self):
+        session=self.waiting_session()
+        session.deadlines={(0,1):"1.000000010",(1,1):"1.000000009",(2,0):"1.000000009"}
+        events=[]
+        runner.actor_round(session,events,[""]*4,[])
+        self.assertEqual([(e["node"],e["thread"],e["choice"]) for e in events],[(1,1,-2)])
+        self.assertEqual(session.commands.count("si timeout"),1)
+        self.assertNotIn("si 0",session.commands)
+        self.assertTrue(events[0]["executed"])
+        self.assertNotEqual(events[0]["predecessor"],events[0]["successor"])
+        runner.actor_round(session,events,[""]*4,[])
+        self.assertEqual(events[-1]["choice"],0)
+        self.assertEqual(session.commands.count("si timeout"),1)
+
+    def test_runnable_progress_does_not_expire_wait(self):
+        session=Session();session.states[(0,1)]="waiting";session.deadlines[(0,1)]="0.000000000"
+        events=[]
+        runner.actor_round(session,events,[""]*4,[])
+        self.assertNotIn("si timeout",session.commands)
+        self.assertTrue(all(e["choice"]==0 for e in events))
+
+    def test_unbounded_wait_fails_without_timeout(self):
+        session=self.waiting_session()
+        with self.assertRaisesRegex(RuntimeError,"no runnable actor or finite saved deadline"):
+            runner.actor_round(session,[],[""]*4,[])
+        self.assertNotIn("si timeout",session.commands)
+
+    def test_malformed_or_misplaced_deadline_rejects(self):
+        for state,deadline in (("waiting","01.000000000"),("waiting","-1.000000000"),
+                               ("waiting","1.00000000"),("waiting","1.1000000000"),
+                               ("waiting","9223372036.854775808"),("waiting","x"),
+                               ("runnable","1.000000000"),("exited","1.000000000")):
+            session=self.waiting_session();session.states[(0,1)]=state;session.deadlines[(0,1)]=deadline
+            with self.subTest(state=state,deadline=deadline):
+                with self.assertRaisesRegex(RuntimeError,"deadline|thread.*state"):
+                    runner.actor_round(session,[],[""]*4,[])
+
+    def test_timeout_proof_uses_command_reply_not_stored_incoming_action(self):
+        class OtherIncomingEdgeSession(Session):
+            def send(self,command):
+                if command=="info current":raise AssertionError("must not infer current action from stored incoming edge")
+                return super().send(command)
+        session=OtherIncomingEdgeSession();events=[]
+        runner.control_step(session,0,1,events,[""]*4,[],choice=-2)
+        self.assertTrue(events[-1]["executed"])
+        self.assertEqual(events[-1]["choice"],-2)
+
+    def test_timeout_rejection_or_missing_completion_proof_is_not_an_edge(self):
+        for mode in ("rejected","unchanged","old_cli"):
+            class UnconfirmedSession(Session):
+                def send(self,command):
+                    if command=="si timeout" and mode=="rejected":
+                        self.commands.append(command);return "Timeout action rejected: no finite deadline"
+                    if command=="si timeout" and mode=="unchanged":
+                        self.commands.append(command);return "Timeout completed."
+                    reply=super().send(command)
+                    return "Syscall completed" if command=="si timeout" and mode=="old_cli" else reply
+            session=UnconfirmedSession();events=[]
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(RuntimeError,"timeout action rejected or unconfirmed"):
+                    runner.control_step(session,0,1,events,[""]*4,[],choice=-2)
+                self.assertFalse(events[-1]["executed"])
+                self.assertEqual(events[-1]["status"],"error")
+                self.assertNotIn("successor",events[-1])
 
     def test_blocked_attempt_is_not_completed_edge(self):
         session=Session();session.reply="Thread 1 is blocked (pending syscall). Cannot step."

@@ -847,3 +847,23 @@ three restored repetitions preserve both timeout/output hashes and TSS actor2.
 Native worker output/exit0 and all28scenarios pass; evidence:
 /tmp/detsim-nonmain-timeout.log and /tmp/detsim-iteration14b-scenarios.log.
 Full module business/search/replay remains separately unfinished.
+
+### Case-side bounded branch search
+
+The actual-module runner now implements explicit beam-width1 exploration rooted
+before the first SET. Every sibling action restores the same source and owns a
+private observation copy; deterministic variant-independent guidance retains one
+continuation and records pruned frontiers. Its edge/path table is independent of
+TSS's first-parent history. Acceptance checks the pre-SET root, connected actual
+selected edges, exact business/violation evidence,3x witness replays, unique
+requested matrix and per-command/final wall cutoffs. Independent review exposed
+and then verified fixes for detached witness paths and late final replays.
+
+16search,15controller and3native acceptance regressions pass. A real two-runnable
+actor fixture yields two distinct manual successors in both backends, matching
+case enumeration after four alternate restores. Evidence:
+build/guided-search-integration/run-_3c1y0k8/result.json. Builtin DFS1 reports only
+root plus one successor here, so C03 remains open; this case search is neither
+builtin DFS nor an exhaustive general scheduler. Actual module matrix is still
+pending. Current experiments exposed busy GET/INFO polling with frozen clocks;
+explicit time input during runnable work is the next case-environment requirement.
