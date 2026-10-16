@@ -146,6 +146,7 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         case SYS_pipe:
         case SYS_pipe2:
         case SYS_fcntl:
+        case SYS_unlink: case SYS_unlinkat: case SYS_rename: case SYS_renameat: case SYS_renameat2:
         case SYS_ftruncate:
         case SYS_fsync:
         case SYS_fdatasync:
@@ -181,7 +182,6 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         case SYS_close_range:
         case SYS_memfd_create:
         case SYS_creat: case SYS_openat2: case SYS_truncate:
-        case SYS_unlink: case SYS_unlinkat: case SYS_rename: case SYS_renameat: case SYS_renameat2:
         case SYS_mkdir: case SYS_mkdirat: case SYS_rmdir:
         case SYS_link: case SYS_linkat: case SYS_symlink: case SYS_symlinkat:
         case SYS_mknod: case SYS_mknodat:
@@ -398,6 +398,19 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
         case SYS_faccessat:
         case SYS_faccessat2:
             return handle_fs_exit(pid, info);
+
+        case SYS_unlink: case SYS_unlinkat:
+            info.rval=emu_vfs_unlinkat(info.nr==SYS_unlink?AT_FDCWD:static_cast<int>(info.args[0]),
+                reinterpret_cast<const char*>(info.args[info.nr==SYS_unlink?0:1]),
+                info.nr==SYS_unlink?0:static_cast<unsigned>(info.args[2]));
+            tracee_set_rax(pid,info.rval);return CKPT_YES;
+        case SYS_rename: case SYS_renameat: case SYS_renameat2:
+            info.rval=emu_vfs_renameat2(info.nr==SYS_rename?AT_FDCWD:static_cast<int>(info.args[0]),
+                reinterpret_cast<const char*>(info.args[info.nr==SYS_rename?0:1]),
+                info.nr==SYS_rename?AT_FDCWD:static_cast<int>(info.args[2]),
+                reinterpret_cast<const char*>(info.args[info.nr==SYS_rename?1:3]),
+                info.nr==SYS_renameat2?static_cast<unsigned>(info.args[4]):0);
+            tracee_set_rax(pid,info.rval);return CKPT_YES;
 
         case SYS_ftruncate:
             info.rval=emu_ftruncate(static_cast<int>(info.args[0]),static_cast<int64_t>(info.args[1]));

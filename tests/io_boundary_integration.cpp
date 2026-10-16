@@ -13,6 +13,8 @@
 #include <arpa/inet.h>
 #include <cstring>
 #include <climits>
+#include <filesystem>
+#include <fstream>
 #include <fcntl.h>
 #include <sstream>
 #include <sys/mman.h>
@@ -104,6 +106,65 @@ static bool mapping_entry_rejected(SyscallDispatcher& dispatcher,pid_t pid,int n
     if(memcmp(&before,&after,sizeof before)) throw std::runtime_error("mapping admission changed registers");
     return rejected;
 }
+static void check_leaf_abi(SyscallDispatcher& dispatcher,pid_t child) {
+    char temporary[]="/tmp/detsim-leaf-abi-XXXXXX";
+    if(!mkdtemp(temporary)) throw std::runtime_error("leaf ABI directory");
+    const std::filesystem::path base(temporary);
+    struct Cleanup {std::filesystem::path path;~Cleanup(){std::filesystem::remove_all(path);}} cleanup{base};
+    std::ofstream(base/"a")<<"a";std::ofstream(base/"b")<<"b";std::filesystem::create_directory(base/"d");
+    auto& fs=ptmc_state.fs_states[0];fs.init_from_mappings({{base.string(),base.string()}});
+    const int hostdir=open(base.c_str(),O_RDONLY|O_DIRECTORY),dir=fs.do_open(base.string(),O_RDONLY|O_DIRECTORY,0);
+    if(hostdir<0 || dir<0) throw std::runtime_error("leaf ABI dirfds");
+    const auto before=archive(fs);const auto descriptors=*ptmc_state.fd_managers[0];
+    const auto bad=reinterpret_cast<const char*>(1);
+    for(const auto& old:std::vector<std::string>{"a","missing","missing/child","",".",std::string(256,'n')}) {
+        // Both processes can read compiled literals; this dynamic old string is
+        // copied into an ordinary guest mapping before invoking the model.
+        const long scratch=tracee_do_syscall(child,SYS_mmap,0,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+        if(scratch<=0) throw std::runtime_error("leaf pathname copy fixture");
+        copy_to(child,reinterpret_cast<void*>(scratch),old.c_str(),old.size()+1);
+        errno=0;const long native=syscall(SYS_renameat2,hostdir,old.c_str(),hostdir,bad,0);
+        check(emu_vfs_renameat2(dir,reinterpret_cast<const char*>(scratch),dir,bad,0)==(native<0?-errno:native),
+              "rename copies second path after old parent walk and before old leaf lookup");
+        tracee_do_syscall(child,SYS_munmap,scratch,4096,0,0,0,0);
+    }
+    for(unsigned flags:{3U,6U,7U,8U,0x80000000U}) {
+        errno=0;check(syscall(SYS_renameat2,hostdir,bad,hostdir,bad,flags)==-1 && errno==EINVAL &&
+            execute(dispatcher,child,SYS_renameat2,{uint64_t(dir),1,uint64_t(dir),1,flags,0})==-EINVAL,
+            "unknown or conflicting rename flags precede pointer access");
+    }
+    errno=0;check(syscall(SYS_unlinkat,hostdir,bad,1)==-1 && errno==EINVAL &&
+        execute(dispatcher,child,SYS_unlinkat,{uint64_t(dir),1,1,0,0,0})==-EINVAL,
+        "unknown unlink flags precede pointer access");
+    for(unsigned flags:{2U,4U,5U}) {
+        bool denied=false;try {emu_vfs_renameat2(dir,bad,dir,bad,flags);}catch(const std::runtime_error&){denied=true;}
+        check(denied,"known exchange and whiteout operations remain explicitly unsupported");
+    }
+    bool denied=false;try {emu_vfs_unlinkat(dir,bad,AT_REMOVEDIR);}catch(const std::runtime_error&){denied=true;}
+    check(denied,"known directory removal flag remains explicitly unsupported");
+    for(const auto& item:std::vector<std::pair<int,std::string>>{{-1,"missing"},{-1,"a"},{dir,"missing"}}) {
+        const int native_old=item.first<0?-1:hostdir;
+        const char* name=item.second=="a"?"a":"missing";
+        errno=0;const long native=syscall(SYS_renameat,native_old,name,-1,"b");const long expected=native<0?-errno:native;
+        check(emu_vfs_renameat2(item.first,name,-1,"b",0)==expected,"rename dirfd validation precedes missing old leaf");
+    }
+    check(archive(fs)==before && *ptmc_state.fd_managers[0]==descriptors,"failed namespace ABI validation leaves all modeled state unchanged");
+    errno=0;const long native_same=syscall(SYS_renameat2,hostdir,"a",hostdir,"a",1);
+    check(native_same==-1 && errno==EEXIST && execute(dispatcher,child,SYS_renameat2,
+          {uint64_t(dir),reinterpret_cast<uint64_t>("a"),uint64_t(dir),reinterpret_cast<uint64_t>("a"),0x100000001ULL,0})==-EEXIST,
+          "NOREPLACE low32 alias keeps same-path EEXIST");
+    check(syscall(SYS_renameat,hostdir,"a",hostdir,"b")==0 && execute(dispatcher,child,SYS_renameat,
+          {0xffffffff00000000ULL|uint64_t(dir),reinterpret_cast<uint64_t>("a"),uint64_t(dir),reinterpret_cast<uint64_t>("b"),~0ULL,0})==0,
+          "renameat uses low32 dirfd and ignores nonexistent flags argument");
+    check(syscall(SYS_renameat2,hostdir,"b",hostdir,"c",1)==0 && execute(dispatcher,child,SYS_renameat2,
+          {uint64_t(dir),reinterpret_cast<uint64_t>("b"),uint64_t(dir),reinterpret_cast<uint64_t>("c"),0xffffffff00000001ULL,0})==0,
+          "renameat2 admits low32 NOREPLACE and preserves closed file");
+    check(syscall(SYS_unlinkat,hostdir,"c",0)==0 && execute(dispatcher,child,SYS_unlinkat,
+          {0xffffffff00000000ULL|uint64_t(dir),reinterpret_cast<uint64_t>("c"),0x100000000ULL,0,0,0})==0,
+          "unlinkat uses low32 dirfd and flags");
+    close(hostdir);fs.do_close(dir);
+}
+
 static void check_ftruncate(SyscallDispatcher& dispatcher,pid_t child) {
     char path[]="/tmp/detsim-ftruncate-XXXXXX";
     const int native_writer=mkstemp(path),native_reader=open(path,O_RDONLY);
@@ -313,7 +374,7 @@ int main() {
               guest_read_exact(children[0],guest_pollfds,&broken,sizeof broken) && broken.revents==(POLLOUT|POLLERR),
               "poll closed-reader matches native oracle");emu_close(poll_pipe[1]);
         bool unsupported_rejected=true;
-        for (int number:{SYS_dup,SYS_readv,SYS_unlink,SYS_fchdir,SYS_flock,SYS_sync,SYS_syncfs,SYS_readahead,SYS_fadvise64}) {
+        for (int number:{SYS_dup,SYS_readv,SYS_fchdir,SYS_flock,SYS_sync,SYS_syncfs,SYS_readahead,SYS_fadvise64}) {
             syscall_info rejected{};rejected.nr=number;
             bool threw=false;
             try {dispatcher.on_enter(children[0],number,rejected);}
@@ -332,6 +393,17 @@ int main() {
               "actual entry blocks host descriptor mutation");
         check_cloexec_ioctls(dispatcher,children[0],file,socket,real_fd);
         check_ftruncate(dispatcher,children[0]);
+        check_leaf_abi(dispatcher,children[0]);
+        check(execute(dispatcher,children[0],SYS_unlink,
+                      {reinterpret_cast<uint64_t>("/absent-cleanup"),0,0,0,0,0})==-ENOENT,
+              "absent startup leaf cleanup returns real ENOENT");
+        const int metadata_tmp=fs.do_open("/metadata.tmp",O_CREAT|O_RDWR,0600);
+        check(metadata_tmp>=0 && fs.do_write(metadata_tmp,"metadata",8)==8 && fs.do_close(metadata_tmp)==0,
+              "closed metadata replacement fixture");
+        check(execute(dispatcher,children[0],SYS_rename,
+                      {reinterpret_cast<uint64_t>("/metadata.tmp"),reinterpret_cast<uint64_t>("/metadata"),0,0,0,0})==0 &&
+              !fs.filesystem.contains("/metadata.tmp") && fs.filesystem.at("/metadata").content==std::vector<char>({'m','e','t','a','d','a','t','a'}),
+              "closed metadata rename preserves payload atomically");
         check(execute(dispatcher,children[0],SYS_pipe,{reinterpret_cast<uint64_t>(guest_pipefds),0xdeadbeef,0,0,0,0})==0,
               "pipe ignores nonexistent second argument");
         const int mapped=fs.do_open("/mapped",O_CREAT|O_RDWR,0600);

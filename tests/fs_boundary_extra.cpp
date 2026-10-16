@@ -18,6 +18,34 @@
 extern "C" detsim::ui::NCursesUI *get_ncurses_ui() { return nullptr; }
 #define CHECK(condition) do { if (!(condition)) throw std::runtime_error(#condition); } while (false)
 
+static int allocation_failure=0;
+extern "C" int __real__ZN9FdManager11allocate_fdE6FdTypeii(FdManager*,FdType,int,int);
+extern "C" int __wrap__ZN9FdManager11allocate_fdE6FdTypeii(FdManager* manager,FdType type,int status,int descriptor) {
+  if(allocation_failure==1) return -EMFILE;
+  if(allocation_failure==2) throw std::bad_alloc();
+  return __real__ZN9FdManager11allocate_fdE6FdTypeii(manager,type,status,descriptor);
+}
+
+static void check_open_failure_atomicity()
+{
+  auto manager=std::make_shared<FdManager>();FileSystemState fs(manager);
+  const std::string parent="/long-parent-directory-for-atomic-allocation";
+  fs.ensure_dir_exists(parent);
+  const std::string existing=parent+"/existing",missing=parent+"/missing";
+  const int fd=fs.do_open(existing,O_CREAT|O_RDWR,0600);
+  CHECK(fd>=0 && fs.do_write(fd,"payload",7)==7 && fs.do_close(fd)==0);
+  auto encode=[&] {std::ostringstream out;{cereal::BinaryOutputArchive ar(out);ar(fs,*manager);}return out.str();};
+  for(int failure:{1,2}) for(bool create:{false,true}) {
+    const auto before=encode();const auto counter=fs.next_inode();
+    allocation_failure=failure;bool failed=false;
+    try {failed=fs.do_open(create?missing:existing,O_RDWR|(create?O_CREAT:O_TRUNC),0600)==-EMFILE;}
+    catch(const std::bad_alloc&) {failed=true;}
+    allocation_failure=0;
+    CHECK(failed && encode()==before && fs.next_inode()==counter);
+  }
+  std::cout << "PASS open failure: EMFILE/bad_alloc preserve namespace parent mtime inode counter and descriptors" << std::endl;
+}
+
 // Use the same absolute namespace on both sides so absolute link targets and
 // relative targets can share one native Linux oracle without rewriting bytes.
 static void check_symlink_walk(const std::filesystem::path& root)
@@ -41,7 +69,8 @@ static void check_symlink_walk(const std::filesystem::path& root)
     const std::string target = count == 40 ? "tree/file" : "hop" + std::to_string(count+1);
     CHECK(symlink(target.c_str(), (base / ("hop" + std::to_string(count))).c_str()) == 0);
   }
-  FileSystemState fs(std::make_shared<FdManager>());
+  auto manager=std::make_shared<FdManager>();
+  FileSystemState fs(manager);
   fs.init_from_mappings({{base.string(), base.string()}});
   const int host_dir = open(base.c_str(), O_RDONLY | O_DIRECTORY);
   const int guest_dir = fs.do_open(base.string(), O_RDONLY | O_DIRECTORY, 0);
@@ -114,9 +143,9 @@ static void check_symlink_walk(const std::filesystem::path& root)
   { cereal::BinaryOutputArchive archive(bytes); archive(fs); }
   FileSystemState restored;
   { cereal::BinaryInputArchive archive(bytes); archive(restored); }
-  restored.set_fd_manager(std::make_shared<FdManager>());
+  restored.set_fd_manager(std::make_shared<FdManager>(*manager));
   FileSystemState branch = restored;
-  branch.set_fd_manager(std::make_shared<FdManager>());
+  branch.set_fd_manager(std::make_shared<FdManager>(*manager));
   CHECK(close(host_dir) == 0);
   std::filesystem::remove_all(base);
   const int writer = branch.do_open((base / "relative").string(), O_RDWR, 0);
@@ -321,6 +350,118 @@ static void check_truncate_and_mapping_sources(const std::filesystem::path& root
   std::cout << "PASS VFS ftruncate: native bytes/mtime/offset, copy/archive, mapped aliases and source closure" << std::endl;
 }
 
+static void check_leaf_namespace(const std::filesystem::path& root)
+{
+  auto encode=[](FileSystemState& fs) {std::ostringstream out;{cereal::BinaryOutputArchive ar(out);ar(fs);}return out.str();};
+  const std::vector<std::pair<std::string,std::string>> cases={
+    {"a","b"},{"missing","b"},{"a","missing/child"},{"missing","missing/child"},
+    {"a",""},{"a","b/"},{"a","missing/"},{"a/","b"},{"l/","b"},{"ld/","b"},
+    {"dangling/","b"},{"missing/","b"},{"a","l/"},{"a","ld/"},{"a","d"},{"d","a"},
+    {".","b"},{"..","b"},{"a","."},{"a",".."},{"a","a"},{"l","l"},{"a","l"},{"l","a"},
+    {std::string(256,'n'),"missing/b"},{"missing",std::string(256,'n')},{"a",std::string(256,'n')},
+    {"a/",std::string(256,'n')},{"missing","."},{"d","d"}};
+  unsigned index=0;
+  for(unsigned flags:{0U,1U}) for(const auto& [oldname,newname]:cases) {
+    const auto base=root/("leaf-"+std::to_string(index++));std::filesystem::create_directories(base/"d");
+    std::ofstream(base/"a")<<"source";std::ofstream(base/"b")<<"target";
+    CHECK(symlink("a",(base/"l").c_str())==0 && symlink("d",(base/"ld").c_str())==0 &&
+          symlink("missing",(base/"dangling").c_str())==0);
+    auto manager=std::make_shared<FdManager>();FileSystemState fs(manager);fs.init_from_mappings({{base.string(),base.string()}});
+    const int hostdir=open(base.c_str(),O_DIRECTORY|O_RDONLY),dir=fs.do_open(base.string(),O_DIRECTORY|O_RDONLY,0);
+    CHECK(hostdir>=0 && dir>=0);
+    const auto before=encode(fs);struct stat prior{};
+    const bool existed=fs.do_stat((base/oldname).string(),&prior,false)==0;
+    errno=0;const long native=syscall(SYS_renameat2,hostdir,oldname.c_str(),hostdir,newname.c_str(),flags);
+    const long expected=native<0?-errno:native;
+    const auto actual=fs.do_renameat2(dir,oldname,dir,newname,flags);
+    if(actual!=expected) std::cerr << "rename oracle " << oldname << " -> " << newname << " flags=" << flags << " native=" << expected << " model=" << actual << std::endl;
+    CHECK(actual==expected);
+    if(expected) CHECK(encode(fs)==before);
+    else if(oldname==newname) CHECK(encode(fs)==before);
+    else {
+      struct stat after{};CHECK(existed && fs.do_stat((base/newname).string(),&after,false)==0 &&
+        prior.st_ino==after.st_ino && prior.st_mode==after.st_mode && prior.st_size==after.st_size &&
+        prior.st_mtim.tv_sec==after.st_mtim.tv_sec && prior.st_mtim.tv_nsec==after.st_mtim.tv_nsec);
+    }
+    close(hostdir);
+  }
+  for(const auto& name:std::vector<std::string>{"a","a/","l","l/","ld","ld/","dangling/","missing","missing/","d","d/",".","./","..","../"}) {
+    const auto base=root/("unlink-"+std::to_string(index++));std::filesystem::create_directories(base/"d");
+    std::ofstream(base/"a")<<"source";symlink("a",(base/"l").c_str());symlink("d",(base/"ld").c_str());symlink("missing",(base/"dangling").c_str());
+    FileSystemState fs(std::make_shared<FdManager>());fs.init_from_mappings({{base.string(),base.string()}});
+    const int hostdir=open(base.c_str(),O_DIRECTORY|O_RDONLY),dir=fs.do_open(base.string(),O_DIRECTORY|O_RDONLY,0);
+    CHECK(hostdir>=0 && dir>=0);const auto before=encode(fs);
+    errno=0;const long native=syscall(SYS_unlinkat,hostdir,name.c_str(),0);const long expected=native<0?-errno:native;
+    CHECK(fs.do_unlinkat(dir,name)==expected);if(expected) CHECK(encode(fs)==before);close(hostdir);
+  }
+  const auto input=root/"inode-input";std::ofstream(input)<<"immutable input";
+  auto manager=std::make_shared<FdManager>();FileSystemState fs(manager);fs.init_from_mappings({{input.string(),"/old"}});
+  const auto previous_time=ptmc_state.time[0];const auto previous_cursor=ptmc_state.cursor;
+  ptmc_state.cursor=0;ptmc_state.time[0]={0,0};
+  const auto initial=encode(fs);struct stat before{},after{};CHECK(fs.do_stat("/old",&before)==0 && (before.st_ino>>63)==1);
+  CHECK(fs.do_renameat2(AT_FDCWD,"/old",AT_FDCWD,"/moved")==0 && fs.do_stat("/moved",&after)==0 &&
+        after.st_ino==before.st_ino && fs.filesystem.at("/moved").metadata.st_ino==before.st_ino);
+  const auto moved=encode(fs);auto branch=fs;
+  CHECK(fs.do_renameat2(AT_FDCWD,"/moved",AT_FDCWD,"/old")==0 && fs.filesystem.at("/old").metadata.st_ino==0 && encode(fs)==initial);
+  FileSystemState restored;{std::istringstream in(moved);cereal::BinaryInputArchive ar(in);ar(restored);}
+  restored.set_fd_manager(std::make_shared<FdManager>(*manager));
+  CHECK(restored.do_stat("/moved",&after)==0 && after.st_ino==before.st_ino && branch.filesystem.contains("/moved"));
+  CHECK(fs.do_unlinkat(AT_FDCWD,"/old")==0);
+  int fd=fs.do_open("/old",O_CREAT|O_RDWR,0640);CHECK(fd>=0 && fs.do_fstat(fd,&after)==0 && after.st_ino< (uint64_t(1)<<63) &&
+        after.st_ino!=before.st_ino && fs.do_close(fd)==0);
+  const auto first=after.st_ino;CHECK(fs.do_unlinkat(AT_FDCWD,"/old")==0);
+  fd=fs.do_open("/old",O_CREAT|O_RDWR,0640);CHECK(fd>=0 && fs.do_fstat(fd,&after)==0 && after.st_ino>first);
+  auto denied=[&](auto action) {const auto saved=encode(fs);bool rejected=false;try {action();}catch(const std::runtime_error&) {rejected=true;}CHECK(rejected && encode(fs)==saved);};
+  denied([&] {fs.do_unlinkat(AT_FDCWD,"/old");});denied([&] {fs.do_renameat2(AT_FDCWD,"/old",AT_FDCWD,"/new");});
+  CHECK(fs.do_renameat2(AT_FDCWD,"/old",AT_FDCWD,"/old")==0 && fs.do_renameat2(AT_FDCWD,"/old",AT_FDCWD,"/old",1)==-EEXIST);
+  fs.ensure_dir_exists("/dir-a");fs.ensure_dir_exists("/dir-b");
+  denied([&] {fs.do_renameat2(AT_FDCWD,"/dir-a",AT_FDCWD,"/dir-b");});
+  denied([&] {fs.do_renameat2(AT_FDCWD,"/",AT_FDCWD,"/new-root");});
+  CHECK(fs.do_unlinkat(AT_FDCWD,"/")==-EISDIR);
+  CHECK(fs.do_close(fd)==0);fs.add_virtual_file_mapping(0x1000,0x2000,"/old");
+  denied([&] {fs.do_unlinkat(AT_FDCWD,"/old");});denied([&] {fs.do_renameat2(AT_FDCWD,"/old",AT_FDCWD,"/new");});
+  fs.remove_virtual_file_mapping(0x1000,0x2000);
+  const int target=fs.do_open("/target",O_CREAT|O_RDWR,0600);
+  denied([&] {fs.do_renameat2(AT_FDCWD,"/old",AT_FDCWD,"/target");});CHECK(fs.do_close(target)==0);
+  fs.add_virtual_file_mapping(0x3000,0x4000,"/target");denied([&] {fs.do_renameat2(AT_FDCWD,"/old",AT_FDCWD,"/target");});
+  fs.remove_virtual_file_mapping(0x3000,0x4000);CHECK(fs.do_renameat2(AT_FDCWD,"/old",AT_FDCWD,"/target")==0);
+  CHECK(fs.do_stat("/target",&before)==0 && before.st_ino==after.st_ino);
+  auto invalid=fs;invalid.filesystem.at("/target").metadata.st_ino=invalid.next_inode();bool rejected=false;
+  try {(void)encode(invalid);}catch(const std::runtime_error&) {rejected=true;}CHECK(rejected);
+  invalid=branch;CHECK(invalid.do_renameat2(AT_FDCWD,"/moved",AT_FDCWD,"/old")==0);
+  CHECK(invalid.do_stat("/old",&before)==0);
+  const auto canonical_archive=encode(invalid);
+  auto node_bytes=[](VFSNode& node) {std::ostringstream out;{cereal::BinaryOutputArchive ar(out);ar(node);}return out.str();};
+  const auto marker_bytes=node_bytes(invalid.filesystem.at("/old"));
+  invalid.filesystem.at("/old").metadata.st_ino=before.st_ino;rejected=false;
+  try {(void)encode(invalid);}catch(const std::runtime_error&) {rejected=true;}CHECK(rejected);
+  auto bad_marker=canonical_archive;const auto marker_position=bad_marker.find(marker_bytes);
+  CHECK(marker_position!=std::string::npos && bad_marker.find(marker_bytes,marker_position+1)==std::string::npos);
+  bad_marker.replace(marker_position,marker_bytes.size(),node_bytes(invalid.filesystem.at("/old")));rejected=false;
+  try {std::istringstream in(bad_marker);cereal::BinaryInputArchive ar(in);FileSystemState bad;ar(bad);}catch(const std::runtime_error&) {rejected=true;}CHECK(rejected);
+  auto malformed=encode(fs);uint64_t counter=0;memcpy(malformed.data()+malformed.size()-8,&counter,8);rejected=false;
+  try {std::istringstream in(malformed);cereal::BinaryInputArchive ar(in);FileSystemState bad;ar(bad);}catch(const std::runtime_error&) {rejected=true;}CHECK(rejected);
+  malformed=encode(fs);counter=uint64_t(1)<<63;memcpy(malformed.data()+malformed.size()-8,&counter,8);
+  {std::istringstream in(malformed);cereal::BinaryInputArchive ar(in);ar(restored);}restored.set_fd_manager(std::make_shared<FdManager>(*manager));
+  const auto exhausted=encode(restored);rejected=false;try {restored.do_open("/exhausted",O_CREAT|O_RDWR,0600);}catch(const std::runtime_error&) {rejected=true;}
+  CHECK(rejected && encode(restored)==exhausted);
+  fs.filesystem.at("/").metadata.st_mode|=S_ISVTX;
+  CHECK(fs.do_unlinkat(AT_FDCWD,"/missing")==-ENOENT);
+  denied([&] {fs.do_unlinkat(AT_FDCWD,"/target");});fs.filesystem.at("/").metadata.st_mode&=~S_ISVTX;
+  fs.capture_executable(input.string());
+  denied([&] {fs.do_unlinkat(AT_FDCWD,input.string());});
+  denied([&] {fs.do_unlinkat(AT_FDCWD,"/proc/self/exe");});
+  denied([&] {fs.do_renameat2(AT_FDCWD,"/proc/self/exe",AT_FDCWD,"/link-new");});
+  denied([&] {fs.do_renameat2(AT_FDCWD,input.string(),AT_FDCWD,"/exe-new");});
+  denied([&] {fs.do_renameat2(AT_FDCWD,"/target",AT_FDCWD,input.string());});
+  VFSNode link;link.metadata.st_mode=S_IFLNK|0777;const auto path=input.string();link.content.assign(path.begin(),path.end());link.metadata.st_size=path.size();fs.filesystem["/exe-alias"]=std::move(link);
+  const int executable_fd=fs.do_open(path,O_RDONLY,0);
+  CHECK(executable_fd>=0 && fs.do_unlinkat(AT_FDCWD,"/exe-alias")==0 && fs.filesystem.contains(path) &&
+        fs.do_fstat(executable_fd,&after)==0 && fs.do_close(executable_fd)==0);
+  ptmc_state.time[0]=previous_time;ptmc_state.cursor=previous_cursor;
+  std::cout << "PASS leaf namespace: native rename/unlink matrix, stable inode lifecycle and reference guards" << std::endl;
+}
+
 int main()
 {
   try
@@ -330,6 +471,8 @@ int main()
     CHECK(chmod(temporary, 0755) == 0);
     const std::filesystem::path root(temporary);
     struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{root};
+    check_open_failure_atomicity();
+    check_leaf_namespace(root);
     std::ofstream(root / "regular") << "payload";
     CHECK(symlink("regular", (root / "link").c_str()) == 0);
     CHECK(symlink("missing", (root / "dangling").c_str()) == 0);

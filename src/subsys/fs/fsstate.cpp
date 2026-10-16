@@ -133,6 +133,12 @@ template<class Archive> void FileContent::load(Archive& ar) {
 template void FileContent::save<cereal::BinaryOutputArchive>(cereal::BinaryOutputArchive&) const;
 template void FileContent::load<cereal::BinaryInputArchive>(cereal::BinaryInputArchive&);
 
+static constexpr uint64_t guest_inode_limit = uint64_t(1) << 63;
+static uint64_t initial_vfs_inode(const std::string& path)
+{
+  return XXHash64::hash(path.data(), path.size()) | guest_inode_limit;
+}
+
 /* --- Serialization Implementations --- */
 
 template <class Archive>
@@ -149,7 +155,7 @@ void VFSNode::serialize(Archive &ar)
      CEREAL_NVP(metadata.st_ctime));
 #else
   ar(CEREAL_NVP(content), CEREAL_NVP(metadata.st_size),
-     CEREAL_NVP(metadata.st_mode), CEREAL_NVP(metadata.st_mtim.tv_sec),
+     CEREAL_NVP(metadata.st_mode), CEREAL_NVP(metadata.st_ino), CEREAL_NVP(metadata.st_mtim.tv_sec),
      CEREAL_NVP(metadata.st_mtim.tv_nsec));
 #endif
   if (metadata.st_mtim.tv_nsec < 0 || metadata.st_mtim.tv_nsec >= 1000000000)
@@ -178,7 +184,7 @@ template <class Archive>
 void FileSystemState::serialize(Archive &ar)
 {
   /* Note: fd_manager_ is shared and not serialized per instance */
-  ar(filesystem, open_files, cwd, mappings, pipes_, pipe_fds_, creation_mask_, virtual_file_mappings, virtual_file_mapping_sources);
+  ar(filesystem, open_files, cwd, mappings, pipes_, pipe_fds_, creation_mask_, virtual_file_mappings, virtual_file_mapping_sources, next_inode_);
   uint64_t previous_end = 0;
   bool first = true;
   for (const auto& [start, end] : virtual_file_mappings) {
@@ -203,6 +209,7 @@ void FileSystemState::serialize(Archive &ar)
   }
   if (mapping_coverage(virtual_file_mapping_sources) != virtual_file_mappings)
     throw std::runtime_error("Virtual file mapping sources do not cover provenance");
+  validate_inode_state();
   if (creation_mask_ & ~0777)
     throw std::runtime_error("Invalid virtual filesystem creation mask");
 }
@@ -620,31 +627,7 @@ int FileSystemState::do_openat(int dirfd, const std::string &input, int flags, m
   }
   else
   {
-    if (flags & O_DIRECTORY)
-      return -ENOENT;
-    // File does not exist.
-    if (flags & O_CREAT)
-    {
-      // Create a new file node
-      VFSNode newNode{};
-#ifdef FSSTATE_DETAILED_METADATA
-      memset(&newNode.metadata, 0, sizeof(struct stat));
-      newNode.metadata.st_nlink = 1;
-      newNode.metadata.st_uid = 0;
-      newNode.metadata.st_gid = 0;
-      newNode.metadata.st_atime = newNode.metadata.st_ctime = modeled_fs_time().tv_sec;
-#endif
-      newNode.metadata.st_mtim = modeled_fs_time();
-      newNode.metadata.st_mode = S_IFREG | ((mode & 07777) & ~creation_mask_);
-      newNode.metadata.st_size = 0;
-      filesystem[path] = newNode;
-      const size_t slash = path.find_last_of('/');
-      filesystem.at(slash == 0 ? "/" : path.substr(0, slash)).metadata.st_mtim = modeled_fs_time();
-    }
-    else
-    {
-      return -ENOENT;
-    }
+    if ((flags & O_DIRECTORY) || !(flags & O_CREAT)) return -ENOENT;
   }
 
   const auto executable_link = filesystem.find("/proc/self/exe");
@@ -657,24 +640,53 @@ int FileSystemState::do_openat(int dirfd, const std::string &input, int flags, m
 
   if (flags & O_TRUNC) require_unmapped_file(path);
 
-  // If we got here, the file is accessible or was created.
-  // Now, create an open file description for it.
-  int fd = allocate_fd(FdType::FILE,
-                       flags & ~(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC),
-                       (flags & O_CLOEXEC) ? FD_CLOEXEC : 0);
-  if (fd < 0)
-    return -EMFILE;
-  if ((flags & O_TRUNC) && (flags & O_ACCMODE) != O_RDONLY)
-  {
-    filesystem.at(path).content.clear();
-    filesystem.at(path).metadata.st_size = 0;
-    filesystem.at(path).metadata.st_mtim = modeled_fs_time();
+  // Allocate every fallible namespace/description object before publishing a
+  // descriptor or a new inode. Node-handle insertion below cannot allocate.
+  const int candidate = fd_manager_->get_next_fd();
+  if (candidate < 0) return -EMFILE;
+  if (open_files.contains(candidate))
+    throw std::runtime_error("Free descriptor still has a virtual file description");
+  std::map<int, OpenFileDescription> prepared_description;
+  prepared_description.emplace(candidate, OpenFileDescription{path, 0});
+  std::map<std::string, VFSNode> prepared_file;
+  auto prepared_parent = filesystem.end();
+  const auto timestamp = modeled_fs_time();
+  if (!exists) {
+    const size_t slash = path.find_last_of('/');
+    prepared_parent = filesystem.find(slash == 0 ? "/" : path.substr(0, slash));
+    if (prepared_parent == filesystem.end() || !S_ISDIR(prepared_parent->second.metadata.st_mode))
+      throw std::runtime_error("New virtual file has no directory parent");
+    if (next_inode_ >= guest_inode_limit)
+      throw std::runtime_error("Virtual guest inode domain exhausted");
+    VFSNode node;
+    node.metadata.st_mode = S_IFREG | ((mode & 07777) & ~creation_mask_);
+    node.metadata.st_ino = next_inode_;
+    node.metadata.st_mtim = timestamp;
+#ifdef FSSTATE_DETAILED_METADATA
+    node.metadata.st_nlink = 1;
+    node.metadata.st_atime = node.metadata.st_ctime = timestamp.tv_sec;
+#endif
+    prepared_file.emplace(path, std::move(node));
   }
-  OpenFileDescription ofd;
-  ofd.path = path;
-  ofd.offset = 0;
-
-  open_files[fd] = ofd;
+  const int fd = allocate_fd(FdType::FILE,
+      flags & ~(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC), (flags & O_CLOEXEC) ? FD_CLOEXEC : 0);
+  if (fd < 0) return fd;
+  if (fd != candidate) {
+    release_fd(fd);
+    throw std::runtime_error("Virtual descriptor allocation changed during open");
+  }
+  auto current = it;
+  if (!exists) {
+    current = filesystem.insert(prepared_file.extract(prepared_file.begin())).position;
+    ++next_inode_;
+    prepared_parent->second.metadata.st_mtim = timestamp;
+  }
+  if ((flags & O_TRUNC) && (flags & O_ACCMODE) != O_RDONLY) {
+    current->second.content.clear();
+    current->second.metadata.st_size = 0;
+    current->second.metadata.st_mtim = timestamp;
+  }
+  open_files.insert(prepared_description.extract(prepared_description.begin()));
 
   return fd;
 }
@@ -825,21 +837,168 @@ off_t FileSystemState::do_lseek(int fd, off_t offset, int whence)
   return new_offset;
 }
 
-// Captured paths are the supported object identity: hard links, rename and
-// unlink are not modeled. Recompute against the complete saved namespace so
-// creation never renumbers old objects and collisions cannot depend on history.
+// Initial objects use a high-bit path-derived domain. Guest-created objects
+// retain monotonically allocated low-domain IDs across closed-leaf renames.
 static std::map<std::string, uint64_t> vfs_inodes(const std::map<std::string, VFSNode>& filesystem)
 {
   std::map<std::string, uint64_t> result;
   std::map<uint64_t, std::string> owners;
   for (const auto& [path, node] : filesystem) {
-    uint64_t inode = XXHash64::hash(path.data(), path.size());
-    if (!inode) inode = 1;
+    const uint64_t inode = node.metadata.st_ino ? node.metadata.st_ino : initial_vfs_inode(path);
     if (!owners.emplace(inode, path).second)
       throw std::runtime_error("Captured VFS path inode collision");
     result.emplace(path, inode);
   }
   return result;
+}
+
+void FileSystemState::validate_inode_state() const
+{
+  if (!next_inode_ || next_inode_ > guest_inode_limit)
+    throw std::runtime_error("Invalid virtual guest inode counter");
+  for (const auto& [path, node] : filesystem) {
+    const uint64_t inode = node.metadata.st_ino;
+    if (inode && (inode == initial_vfs_inode(path) ||
+        (!S_ISREG(node.metadata.st_mode) && !S_ISLNK(node.metadata.st_mode)) ||
+        (inode < guest_inode_limit && inode >= next_inode_)))
+      throw std::runtime_error("Invalid virtual inode override");
+  }
+  (void)vfs_inodes(filesystem);
+}
+
+static int leaf_unlink_flags(unsigned flags)
+{
+  if (flags & ~unsigned(AT_REMOVEDIR)) return -EINVAL;
+  if (flags) throw std::runtime_error("Directory removal is unsupported");
+  return 0;
+}
+
+static int leaf_rename_flags(unsigned flags)
+{
+  // Linux RENAME_NOREPLACE/EXCHANGE/WHITEOUT, using the unsigned32 ABI.
+  if ((flags & ~7U) || ((flags & 2U) && (flags & 5U))) return -EINVAL;
+  if (flags & 6U) throw std::runtime_error("Rename exchange/whiteout is unsupported");
+  return 0;
+}
+
+int FileSystemState::resolve_namespace_leaf(int dirfd, const std::string& input, NamespaceLeaf& leaf)
+{
+  if (input.empty()) return -ENOENT;
+  if (input.find('\0') != std::string::npos) return -EINVAL;
+  leaf = NamespaceLeaf{};
+  leaf.trailing_slash = input.back() == '/';
+  const size_t last = input.find_last_not_of('/');
+  if (last == std::string::npos) {
+    leaf.kind = NamespaceLeaf::Kind::Root;leaf.parent = leaf.path = "/";return 0;
+  }
+  const std::string stem = input.substr(0, last + 1);
+  const size_t slash = stem.find_last_of('/');
+  leaf.name = stem.substr(slash == std::string::npos ? 0 : slash + 1);
+  const std::string parent = slash == std::string::npos ? "./" : stem.substr(0, slash + 1);
+  // Only the parent walk follows symlinks, including the parent's final slash.
+  const int error = resolve_path_checked(dirfd, parent, leaf.parent);
+  if (error) return error;
+  const auto directory = filesystem.find(leaf.parent);
+  if (directory == filesystem.end()) return -ENOENT;
+  if (!S_ISDIR(directory->second.metadata.st_mode)) return -ENOTDIR;
+  if (leaf.name == ".") {
+    leaf.kind = NamespaceLeaf::Kind::Dot;leaf.path = leaf.parent;
+  } else if (leaf.name == "..") {
+    leaf.kind = NamespaceLeaf::Kind::DotDot;
+    const auto end = leaf.parent.find_last_of('/');
+    leaf.path = end == 0 ? "/" : leaf.parent.substr(0, end);
+  } else leaf.path = join_paths(leaf.parent, leaf.name);
+  return 0;
+}
+
+void FileSystemState::require_namespace_mutable(const std::string& path) const
+{
+  if (path == "/proc/self/exe")
+    throw std::runtime_error("Synthetic executable link namespace mutation is unsupported");
+  const auto executable = filesystem.find("/proc/self/exe");
+  if (executable != filesystem.end() && S_ISLNK(executable->second.metadata.st_mode) &&
+      path == std::string(executable->second.content.begin(), executable->second.content.end()))
+    throw std::runtime_error("Running executable namespace mutation is unsupported");
+  for (const auto& [fd, opened] : open_files) {
+    (void)fd;
+    if (opened.path == path) throw std::runtime_error("Open virtual object namespace mutation is unsupported");
+  }
+  require_unmapped_file(path);
+}
+
+int FileSystemState::do_unlinkat(int dirfd, const std::string& input, unsigned flags)
+{
+  const int flag_error = leaf_unlink_flags(flags);if (flag_error) return flag_error;
+  NamespaceLeaf leaf;
+  const int error = resolve_namespace_leaf(dirfd, input, leaf);if (error) return error;
+  if (leaf.kind != NamespaceLeaf::Kind::Normal) return -EISDIR;
+  if (leaf.name.size() > NAME_MAX) return -ENAMETOOLONG;
+  const auto node = filesystem.find(leaf.path);
+  if (node == filesystem.end()) return -ENOENT;
+  if (leaf.trailing_slash && !S_ISDIR(node->second.metadata.st_mode)) return -ENOTDIR;
+  if (S_ISDIR(node->second.metadata.st_mode)) return -EISDIR;
+  if (!S_ISREG(node->second.metadata.st_mode) && !S_ISLNK(node->second.metadata.st_mode))
+    throw std::runtime_error("Only regular or symlink leaf deletion is supported");
+  if (filesystem.at(leaf.parent).metadata.st_mode & S_ISVTX)
+    throw std::runtime_error("Sticky-directory namespace mutation is unsupported");
+  require_namespace_mutable(leaf.path);
+  validate_inode_state();
+  auto& parent = filesystem.at(leaf.parent);
+  const auto timestamp = modeled_fs_time();
+  filesystem.erase(node);
+  parent.metadata.st_mtim = timestamp;
+  return 0;
+}
+
+int FileSystemState::do_renameat2(int olddirfd, const std::string& oldname,
+                                 int newdirfd, const std::string& newname, unsigned flags)
+{
+  const int flag_error = leaf_rename_flags(flags);if (flag_error) return flag_error;
+  NamespaceLeaf oldleaf, newleaf;
+  int error = resolve_namespace_leaf(olddirfd, oldname, oldleaf);if (error) return error;
+  error = resolve_namespace_leaf(newdirfd, newname, newleaf);if (error) return error;
+  if (oldleaf.kind == NamespaceLeaf::Kind::Root || newleaf.kind == NamespaceLeaf::Kind::Root)
+    throw std::runtime_error("Root/mount namespace rename is unsupported");
+  if (oldleaf.kind != NamespaceLeaf::Kind::Normal) return -EBUSY;
+  if (newleaf.kind != NamespaceLeaf::Kind::Normal) return (flags & 1U) ? -EEXIST : -EBUSY;
+  if (oldleaf.name.size() > NAME_MAX) return -ENAMETOOLONG;
+  const auto source = filesystem.find(oldleaf.path);
+  if (source == filesystem.end()) return -ENOENT;
+  if (newleaf.name.size() > NAME_MAX) return -ENAMETOOLONG;
+  const auto target = filesystem.find(newleaf.path);
+  if ((flags & 1U) && target != filesystem.end()) return -EEXIST;
+  const bool directory = S_ISDIR(source->second.metadata.st_mode);
+  if ((oldleaf.trailing_slash || newleaf.trailing_slash) && !directory) return -ENOTDIR;
+  if (target != filesystem.end()) {
+    if (!directory && S_ISDIR(target->second.metadata.st_mode)) return -EISDIR;
+    if (directory && !S_ISDIR(target->second.metadata.st_mode)) return -ENOTDIR;
+  }
+  if (oldleaf.path == newleaf.path) return 0;
+  if (directory) throw std::runtime_error("Directory moves are unsupported");
+  if (!S_ISREG(source->second.metadata.st_mode) && !S_ISLNK(source->second.metadata.st_mode))
+    throw std::runtime_error("Only regular or symlink leaf rename is supported");
+  if ((filesystem.at(oldleaf.parent).metadata.st_mode | filesystem.at(newleaf.parent).metadata.st_mode) & S_ISVTX)
+    throw std::runtime_error("Sticky-directory namespace mutation is unsupported");
+  require_namespace_mutable(oldleaf.path);
+  require_namespace_mutable(newleaf.path);
+  validate_inode_state();
+  uint64_t inode = source->second.metadata.st_ino;
+  if (!inode) inode = initial_vfs_inode(oldleaf.path);
+  if (inode == initial_vfs_inode(newleaf.path)) inode = 0;
+  // Allocate the new key before extracting either live object. Swapping keys
+  // and moving node handles after validation cannot allocate.
+  std::string prepared_key = newleaf.path;
+  auto& old_parent = filesystem.at(oldleaf.parent);
+  auto& new_parent = filesystem.at(newleaf.parent);
+  const auto timestamp = modeled_fs_time();
+  auto moved = filesystem.extract(source);
+  auto replaced = target == filesystem.end() ? decltype(filesystem)::node_type{} : filesystem.extract(target);
+  moved.key().swap(prepared_key);
+  moved.mapped().metadata.st_ino = inode;
+  filesystem.insert(std::move(moved));
+  old_parent.metadata.st_mtim = timestamp;
+  new_parent.metadata.st_mtim = timestamp;
+  return 0;
 }
 
 static void copy_vfs_stat(const VFSNode& node, uint64_t inode, struct stat* statbuf)
@@ -1038,6 +1197,29 @@ static long read_guest_string(const char *guest_addr, std::string &result)
     result += ch;
   }
   return -ENAMETOOLONG;
+}
+
+long emu_vfs_unlinkat(int dirfd, const char* pointer, unsigned flags)
+{
+  const int error = leaf_unlink_flags(flags);if (error) return error;
+  std::string path;
+  const long copied = read_guest_string(pointer, path);if (copied) return copied;
+  return ptmc_state.fs_states[ptmc_state.cursor].do_unlinkat(dirfd, path, flags);
+}
+
+long emu_vfs_renameat2(int olddirfd, const char* oldpointer, int newdirfd, const char* newpointer, unsigned flags)
+{
+  const int error = leaf_rename_flags(flags);if (error) return error;
+  std::string oldname, newname;
+  long copied = read_guest_string(oldpointer, oldname);if (copied) return copied;
+  auto& fs = ptmc_state.fs_states[ptmc_state.cursor];
+  FileSystemState::NamespaceLeaf oldleaf;
+  // Linux walks the old parent before copying the second pathname. It does not
+  // look up the old leaf until both parent walks and pathname copies succeeded.
+  const int parent_error = fs.resolve_namespace_leaf(olddirfd, oldname, oldleaf);
+  if (parent_error) return parent_error;
+  copied = read_guest_string(newpointer, newname);if (copied) return copied;
+  return fs.do_renameat2(olddirfd, oldname, newdirfd, newname, flags);
 }
 
 long emu_vfs_openat(int dirfd, const char *path_ptr, int flags, mode_t mode)

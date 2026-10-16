@@ -197,6 +197,97 @@ finally:
                 self.assertIn("exit_group(0)", output)
                 self.assertIn("Complete explore all", output)
 
+    def test_leaf_namespace_search_and_replay(self):
+        source = self.root / "leaf.c"
+        source.write_text(r"""
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+volatile unsigned long long first_inode, second_inode, third_inode;
+int main(int argc, char **argv) {
+    if (argc != 4) return 70;
+    if (syscall(SYS_unlink, argv[3]) != -1 || errno != ENOENT) return 71;
+    int fd = syscall(SYS_openat, AT_FDCWD, argv[1], O_CREAT|O_EXCL|O_RDWR, 0600);
+    if (fd < 0 || write(fd, "payload", 7) != 7) return 72;
+    struct stat before, after;
+    if (fstat(fd, &before) || close(fd)) return 73;
+    first_inode = before.st_ino;
+    if (!first_inode || syscall(SYS_rename, argv[1], argv[2])) return 74;
+    if (stat(argv[1], &after) != -1 || errno != ENOENT) return 75;
+    if (stat(argv[2], &after) || after.st_ino != first_inode || after.st_size != 7) return 76;
+    fd = syscall(SYS_openat, AT_FDCWD, argv[1], O_CREAT|O_EXCL|O_RDWR, 0600);
+    if (fd < 0 || fstat(fd, &after) || close(fd)) return 77;
+    second_inode = after.st_ino;
+    if (!second_inode || second_inode == first_inode || syscall(SYS_unlink, argv[1])) return 78;
+    if (syscall(SYS_renameat2, AT_FDCWD, argv[2], AT_FDCWD, argv[2], 1) != -1 || errno != EEXIST) return 79;
+    if (syscall(SYS_rename, argv[2], argv[2]) || syscall(SYS_unlinkat, AT_FDCWD, argv[2], 0)) return 80;
+    if (stat(argv[2], &after) != -1 || errno != ENOENT) return 81;
+    fd = syscall(SYS_openat, AT_FDCWD, argv[1], O_CREAT|O_EXCL|O_RDWR, 0600);
+    if (fd < 0 || fstat(fd, &after) || close(fd)) return 82;
+    third_inode = after.st_ino;
+    /* Linux may reuse an inode after unlink; only live-object uniqueness is ABI. */
+    if (!third_inode) return 83;
+    if (syscall(SYS_unlink, argv[1])) return 84;
+    return write(1, "VFS_LEAF_OK\n", 12) != 12;
+}
+""")
+        subprocess.run(shlex.split(os.environ.get("CC", "/usr/bin/gcc")) +
+            ["-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie", str(source),
+             "-o", str(self.root / "probe")], check=True)
+        inputs = self.root / "leaf-input"
+        inputs.mkdir()
+        paths = [str(inputs / name) for name in ("meta.tmp", "meta", "absent")]
+        native = subprocess.run([str(self.root / "probe"), *paths], check=True,
+                                stdout=subprocess.PIPE, timeout=5)
+        self.assertEqual(native.stdout, b"VFS_LEAF_OK\n")
+        self.assertEqual(list(inputs.iterdir()), [])
+
+        def scenario(send):
+            def edge():
+                matches = re.findall(r"([0-9a-f]{16}) => ([0-9a-f]{16})", send("info current"))
+                self.assertEqual(len(matches), 1)
+                return matches[0]
+
+            send("sw 0")
+            edges = []
+            marker = False
+            for _ in range(60):
+                reply = send("si")
+                self.assertNotIn("DetSim state/execution error:", reply)
+                self.assertNotIn("Fatal signal", reply)
+                marker |= "VFS_LEAF_OK" in reply
+                edges.append(edge())
+                if "has exited with status" in reply:
+                    self.assertIn("has exited with status 0", reply)
+                    break
+            else:
+                self.fail("leaf lifecycle did not reach checked exit")
+            self.assertTrue(marker, "missing successful namespace/inode checks")
+            self.assertGreater(len(edges), 20)
+            self.assertIn("Loaded state", send("load " + edges[0][0]))
+            search = send("dfs 80 --quiet")
+            count = re.search(r"Complete explore all (\d+) sys_states", search)
+            self.assertIsNotNone(count, search)
+            self.assertGreater(int(count[1]), 20)
+            self.assertNotIn("illegal state", search)
+            for predecessor, successor in edges:
+                for _ in range(3):
+                    self.assertIn("Loaded state", send("load " + predecessor))
+                    send("si")
+                    self.assertEqual(edge()[1], successor, "namespace replay changed state identity")
+
+        for backend in ("full", "pages"):
+            with self.subTest(backend=backend):
+                code, output = self.run_tracer(scenario, name="leaf_" + backend,
+                    tracee_args=paths, fsmap=[{"Host": str(inputs), "Target": str(inputs)}],
+                    extra_env={"DETSIM_SNAPSHOT_BACKEND": backend})
+                self.assertEqual(code, 0, output)
+        self.assertEqual(list(inputs.iterdir()), [], "model namespace writes reached host inputs")
+
     def test_late_bootstrap_name_search_and_replay(self):
         source = self.root / "late_comm.c"
         source.write_text(r"""

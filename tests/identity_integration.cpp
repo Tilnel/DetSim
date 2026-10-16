@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fcntl.h>
 #include <sstream>
 #include <stdexcept>
 #include <unistd.h>
@@ -64,6 +65,31 @@ int main()
       const auto manifest=encode_page_manifest({},metadata,"",user_regs_struct{},{});
       return StateStore::instance().save(manifest.data(),manifest.size());
     };
+    auto filesystem_snapshot = [](const FileSystemState& fs) {
+      tracee_state saved;saved.fs_state=fs;
+      std::ostringstream output;{cereal::BinaryOutputArchive ar(output);ar(saved);}
+      const auto bytes=output.str();
+      const std::vector<uint8_t> metadata(bytes.begin(),bytes.end());
+      const auto manifest=encode_page_manifest({}, metadata, "", user_regs_struct{}, {});
+      return StateStore::instance().save(manifest.data(),manifest.size());
+    };
+    FileSystemState empty_fs(std::make_shared<FdManager>());
+    auto used_fs=empty_fs;
+    const int created=used_fs.do_open("/temporary",O_CREAT|O_RDWR,0600);
+    require(created>=0 && used_fs.do_close(created)==0 && used_fs.do_unlinkat(AT_FDCWD,"/temporary")==0,
+            "create/delete inode allocator fixture");
+    // Remove parent timestamp changes, leaving only the saved allocation cursor.
+    used_fs.filesystem=empty_fs.filesystem;
+    require(filesystem_snapshot(used_fs)!=filesystem_snapshot(empty_fs),
+            "deleted object's inode allocator disappeared from machine identity");
+    FileSystemState moved_fs;
+    moved_fs.filesystem["/source"].metadata.st_mode=S_IFREG|0600;
+    require(moved_fs.do_renameat2(AT_FDCWD,"/source",AT_FDCWD,"/target",0)==0,
+            "initial inode relocation fixture");
+    auto pathname_fs=moved_fs;
+    pathname_fs.filesystem.at("/target").metadata.st_ino=0;
+    require(filesystem_snapshot(moved_fs)!=filesystem_snapshot(pathname_fs),
+            "preserved inode override disappeared from machine identity");
     sys_state original;
     original.ts_hash[0] = snapshot(1);
     original.ts_hash[1] = snapshot(2);

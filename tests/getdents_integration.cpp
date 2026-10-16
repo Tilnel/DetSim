@@ -73,6 +73,22 @@ int main() {
     int regular=fs.do_open("/dir/a",O_RDWR,0);fs.do_fstat(regular,&st);auto old=st.st_ino;
     fs.do_open("/dir/a",O_WRONLY|O_TRUNC,0);require(fs.do_fstat(regular,&st)==0 && st.st_ino==old,"truncation keeps inode");
     require(fs.do_getdents64(regular,output,256,getpid())==-ENOTDIR && fs.do_getdents64(-1,output,256,getpid())==-EBADF,"descriptor errors");
+    const int created=fs.do_open("/dir/id-old",O_CREAT|O_RDWR,0600);
+    require(created>=0 && fs.do_fstat(created,&st)==0,"new inode fixture");
+    const auto created_inode=st.st_ino;require((created_inode>>63)==0 && fs.do_close(created)==0,"guest inode low domain");
+    require(fs.do_renameat2(AT_FDCWD,"/dir/id-old",AT_FDCWD,"/dir/id-new")==0,"closed rename for dirent identity");
+    require(fs.do_stat("/dir/id-new",&st)==0 && st.st_ino==created_inode,"rename keeps effective inode");
+    require(fs.do_lseek(fd,0,SEEK_SET)==0,"rewind renamed directory");
+    const auto renamed_bytes=get(output,sizeof(output));bool found=false;
+    for(long position=0;position<renamed_bytes;) {
+      uint16_t length;memcpy(&length,output+position+16,2);require(length>=24,"renamed dirent length");
+      if(!strcmp(output+position+19,"id-new")) {found=true;require(number(output+position)==created_inode,"renamed dirent inode agrees with stat");}
+      position+=length;
+    }
+    require(found && fs.do_unlinkat(AT_FDCWD,"/dir/id-new")==0,"find and unlink renamed directory entry");
+    const int recreated=fs.do_open("/dir/id-new",O_CREAT|O_RDWR,0600);
+    require(recreated>=0 && fs.do_fstat(recreated,&st)==0 && st.st_ino!=created_inode && fs.do_close(recreated)==0,
+            "same-name recreation never reuses inode");
     collide=true;bool rejected=false;try{fs.do_stat("/",&st);}catch(const std::exception&){rejected=true;}collide=false;
     require(rejected,"all-path inode collision explicitly rejected");
     auto malformed_rejected=[&](FileSystemState& invalid,int directory_fd) {

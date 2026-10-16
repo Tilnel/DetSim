@@ -754,3 +754,30 @@ tests and exact unique output cells. The controlled model attempt in
 run-xofb6fg3 still rejects unlink87 before business initialization; all owned
 processes were cleaned up. Model full/pages bounded search and threefold replay
 remain unfinished. Native success does not close any snapshot or schedule gap.
+
+### Closed leaf namespace lifecycle
+
+unlink/unlinkat and rename/renameat/renameat2 now admit regular/symlink leaves,
+including NOREPLACE. Parent walks retain native symlink/error order; the leaf
+itself is not followed. Initial path-derived inodes and monotonic guest-created
+inodes occupy separate domains. Rename preserves identity, and the saved inode
+allocator remains semantic even after its last object is deleted. Archives reject
+collisions, invalid counters and noncanonical overrides. Open/mapped objects,
+synthetic exe and actual executable names are protected rather than losing refs.
+
+Preallocating namespace/description nodes also fixes an existing O_CREAT defect:
+EMFILE or allocation failure previously could leave a newly created file behind.
+FD allocation and all fallible preparation now precede the mutation commit;
+rename uses preallocated keys and map node handles. Native pointer/flag/dirfd/
+slash priority oracles and old-open RED cover both defects. Directory moves,
+sticky mutations, root/mount operations, EXCHANGE/WHITEOUT and referenced-object
+mutations remain explicitly unsupported; this is not full Linux VFS fidelity.
+
+Independent review approves. NP2IO311/getdents, identity, policy, full/pages
+capture with ordinary/tiny caches; NP1 page/state-I/O;26native scenarios;12case
+rows;make check and NP1/NP4 production builds pass. The actual-process lifecycle
+searches and replays every recorded edge3x in both backends, including rename,
+unlink and recreate. Format37/38 and kernel22 reject incompatible stores.
+Evidence: /tmp/detsim-iteration12-{wire,io,np1-wire,scenarios,check}.log and
+build/cases/run-davl3_p9/results.json. Real module business/search acceptance
+remains a separate unfinished goal.

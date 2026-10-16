@@ -21,6 +21,8 @@ void *memcpy_guest2host(void *dest, const void *src, size_t n);
  * They follow the naming convention of other emulated syscalls (emu_*).
  */
 long emu_vfs_openat(int dirfd, const char *path, int flags, mode_t mode);
+long emu_vfs_unlinkat(int dirfd, const char* path, unsigned flags);
+long emu_vfs_renameat2(int olddirfd, const char* oldpath, int newdirfd, const char* newpath, unsigned flags);
 long emu_vfs_lseek(int fd, off_t offset, int whence);
 long emu_vfs_getdents64(int fd, void* buffer, unsigned int count);
 long emu_vfs_stat(const char *path, struct stat *statbuf);
@@ -99,6 +101,7 @@ struct VFSNode
   {
     off_t st_size;
     mode_t st_mode;
+    ino_t st_ino; // Zero is the canonical initial path-derived identity marker.
     struct timespec st_mtim;
   } metadata{};
 #endif
@@ -152,6 +155,9 @@ class FileSystemState
   // FdManager for unified fd allocation (shared with SockState)
   FdManagerPtr fd_manager_;
   mode_t creation_mask_ = 0022;
+  uint64_t next_inode_ = 1;
+  void validate_inode_state() const;
+  void require_namespace_mutable(const std::string& path) const;
 
   public:
   // Default constructor - ensures all members are properly initialized
@@ -170,6 +176,7 @@ class FileSystemState
   // Attach the captured descriptor namespace without creating any descriptors.
   void set_fd_manager(FdManagerPtr fd_mgr) { fd_manager_ = fd_mgr; }
   mode_t creation_mask() const { return creation_mask_; }
+  uint64_t next_inode() const { return next_inode_; }
   void set_creation_mask(mode_t mask) { creation_mask_ = mask & 0777; }
 
   template <class Archive>
@@ -184,6 +191,15 @@ class FileSystemState
   int do_ftruncate(int fd, int64_t length);
   // Implementation staging bound, not a Linux file-size/resource limit.
   static constexpr uint64_t maximum_dense_growth = 64ULL * 1024 * 1024;
+  struct NamespaceLeaf {
+    enum class Kind { Normal, Dot, DotDot, Root } kind = Kind::Normal;
+    std::string parent, path, name;
+    bool trailing_slash = false;
+  };
+  int resolve_namespace_leaf(int dirfd, const std::string& path, NamespaceLeaf& leaf);
+  int do_unlinkat(int dirfd, const std::string& path, unsigned flags = 0);
+  int do_renameat2(int olddirfd, const std::string& oldpath,
+                   int newdirfd, const std::string& newpath, unsigned flags = 0);
   int do_close(int fd);
   off_t do_lseek(int fd, off_t offset, int whence);
   int do_stat(const std::string &path, struct stat *statbuf, bool follow = true);
