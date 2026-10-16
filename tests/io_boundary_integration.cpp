@@ -104,6 +104,41 @@ static bool mapping_entry_rejected(SyscallDispatcher& dispatcher,pid_t pid,int n
     if(memcmp(&before,&after,sizeof before)) throw std::runtime_error("mapping admission changed registers");
     return rejected;
 }
+static void check_ftruncate(SyscallDispatcher& dispatcher,pid_t child) {
+    char path[]="/tmp/detsim-ftruncate-XXXXXX";
+    const int native_writer=mkstemp(path),native_reader=open(path,O_RDONLY);
+    unlink(path);
+    const int native_dir=open("/tmp",O_RDONLY|O_DIRECTORY),native_char=open("/dev/null",O_RDWR);
+    int native_pipe[2];
+    if(native_writer<0 || native_reader<0 || native_dir<0 || native_char<0 || pipe(native_pipe))
+        throw std::runtime_error("native ftruncate fixtures");
+    const int native_socket=socket(AF_INET,SOCK_DGRAM,0),native_epoll=epoll_create1(0);
+    auto& fs=ptmc_state.fs_states[0];
+    const int writer=fs.do_open("/truncate",O_CREAT|O_RDWR,0600);
+    const int reader=fs.do_open("/truncate",O_RDONLY,0),directory=fs.do_open("/",O_DIRECTORY|O_RDONLY,0);
+    int pipefd[2];
+    if(writer<0 || reader<0 || directory<0 || fs.do_pipe(pipefd,0)) throw std::runtime_error("virtual ftruncate fixtures");
+    const int socket_fd=ptmc_state.sock_states[0].do_socket(AF_INET,SOCK_DGRAM,0),epoll_fd=emu_epoll_create(1);
+    const std::array<int,9> native_fds{-1,native_writer,native_reader,native_dir,native_char,
+                                    native_pipe[0],native_pipe[1],native_socket,native_epoll};
+    const std::array<int,9> virtual_fds{-1,writer,reader,directory,1,pipefd[0],pipefd[1],socket_fd,epoll_fd};
+    for(size_t index=0;index<native_fds.size();++index)
+        for(int64_t length:{int64_t(-1),int64_t(4)}) {
+            errno=0;
+            const long result=syscall(SYS_ftruncate,native_fds[index],length);
+            const long expected=result<0?-errno:result;
+            check(expected==(length<0?-EINVAL:index==0?-EBADF:index==1?0:-EINVAL),
+                  "native ftruncate validates negative length before descriptor kind and access");
+            check(execute(dispatcher,child,SYS_ftruncate,{uint64_t(virtual_fds[index]),uint64_t(length),0,0,0,0})==expected,
+                  "actual ftruncate matches native descriptor and negative-length priority");
+        }
+    check(syscall(SYS_ftruncate,0xffffffff00000000ULL|uint64_t(native_writer),6)==0 &&
+          execute(dispatcher,child,SYS_ftruncate,{0x100000000ULL|uint64_t(writer),6,0,0,0,0})==0,
+          "ftruncate uses low32 descriptor aliases with signed64 lengths");
+    for(int fd:native_fds) if(fd>=0) close(fd);
+    for(int fd:virtual_fds) if(fd>=3) emu_close(fd);
+}
+
 static void check_cloexec_ioctls(SyscallDispatcher& dispatcher, pid_t child, int file, int socket, int real_fd) {
     char path[]="/tmp/detsim-ioctl-cloexec-XXXXXX";
     const int native=mkstemp(path);
@@ -296,6 +331,7 @@ int main() {
               tracee_do_syscall(children[0],SYS_fcntl,real_fd,F_GETFD,0,0,0,0)==physical_flags,
               "actual entry blocks host descriptor mutation");
         check_cloexec_ioctls(dispatcher,children[0],file,socket,real_fd);
+        check_ftruncate(dispatcher,children[0]);
         check(execute(dispatcher,children[0],SYS_pipe,{reinterpret_cast<uint64_t>(guest_pipefds),0xdeadbeef,0,0,0,0})==0,
               "pipe ignores nonexistent second argument");
         const int mapped=fs.do_open("/mapped",O_CREAT|O_RDWR,0600);

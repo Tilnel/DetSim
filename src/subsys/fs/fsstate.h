@@ -70,6 +70,7 @@ public:
     assign(value.begin(), value.end()); return *this;
   }
   void write(size_t offset, const void* source, size_t count);
+  void resize(size_t size) { writable().resize(size); }
   bool operator==(const FileContent& other) const {
     return payload_ == other.payload_ || bytes() == other.bytes();
   }
@@ -133,7 +134,10 @@ class FileSystemState
   // Virtual file mappings use anonymous host VMAs. Preserve their semantic
   // provenance independently of /proc maps: canonical page-aligned [start,end).
   std::map<uint64_t, uint64_t> virtual_file_mappings;
-  void add_virtual_file_mapping(uint64_t start, uint64_t end);
+  // start -> (exclusive end, resolved regular-file path). Its union is coverage.
+  std::map<uint64_t, std::pair<uint64_t, std::string>> virtual_file_mapping_sources;
+  void add_virtual_file_mapping(uint64_t start, uint64_t end, const std::string& path);
+  void require_unmapped_file(const std::string& path) const;
   void remove_virtual_file_mapping(uint64_t start, uint64_t end);
   bool overlaps_virtual_file_mapping(uint64_t start, uint64_t end) const;
 
@@ -177,6 +181,9 @@ class FileSystemState
   int do_openat(int dirfd, const std::string &path, int flags, mode_t mode);
   ssize_t do_read(int fd, void *buf, size_t count);
   ssize_t do_write(int fd, const void *buf, size_t count);
+  int do_ftruncate(int fd, int64_t length);
+  // Implementation staging bound, not a Linux file-size/resource limit.
+  static constexpr uint64_t maximum_dense_growth = 64ULL * 1024 * 1024;
   int do_close(int fd);
   off_t do_lseek(int fd, off_t offset, int whence);
   int do_stat(const std::string &path, struct stat *statbuf, bool follow = true);

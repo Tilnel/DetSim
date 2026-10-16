@@ -162,11 +162,23 @@ void OpenFileDescription::serialize(Archive &ar)
   ar(CEREAL_NVP(path), CEREAL_NVP(offset));
 }
 
+static std::map<uint64_t,uint64_t> mapping_coverage(
+    const std::map<uint64_t,std::pair<uint64_t,std::string>>& sources)
+{
+  std::map<uint64_t,uint64_t> coverage;
+  for (const auto& [start, source] : sources) {
+    if (!coverage.empty() && coverage.rbegin()->second == start)
+      coverage.rbegin()->second = source.first;
+    else coverage.emplace(start, source.first);
+  }
+  return coverage;
+}
+
 template <class Archive>
 void FileSystemState::serialize(Archive &ar)
 {
   /* Note: fd_manager_ is shared and not serialized per instance */
-  ar(filesystem, open_files, cwd, mappings, pipes_, pipe_fds_, creation_mask_, virtual_file_mappings);
+  ar(filesystem, open_files, cwd, mappings, pipes_, pipe_fds_, creation_mask_, virtual_file_mappings, virtual_file_mapping_sources);
   uint64_t previous_end = 0;
   bool first = true;
   for (const auto& [start, end] : virtual_file_mappings) {
@@ -175,6 +187,22 @@ void FileSystemState::serialize(Archive &ar)
     first = false;
     previous_end = end;
   }
+  previous_end = 0;
+  std::string previous_path;
+  first = true;
+  for (const auto& [start, source] : virtual_file_mapping_sources) {
+    const auto& [end, path] = source;
+    std::string canonical;
+    const auto node = filesystem.find(path);
+    if (start >= end || start % 4096 || end % 4096 ||
+        (!first && (start < previous_end || (start == previous_end && path == previous_path))) ||
+        node == filesystem.end() || !S_ISREG(node->second.metadata.st_mode) ||
+        resolve_path_checked(AT_FDCWD, path, canonical) || canonical != path)
+      throw std::runtime_error("Invalid virtual file mapping source");
+    first = false; previous_end = end; previous_path = path;
+  }
+  if (mapping_coverage(virtual_file_mapping_sources) != virtual_file_mappings)
+    throw std::runtime_error("Virtual file mapping sources do not cover provenance");
   if (creation_mask_ & ~0777)
     throw std::runtime_error("Invalid virtual filesystem creation mask");
 }
@@ -214,32 +242,52 @@ void FileSystemState::remove_virtual_file_mapping(uint64_t start, uint64_t end)
   if (start >= end) return;
   if (start % 4096 || end % 4096)
     throw std::runtime_error("Unaligned virtual file mapping removal");
-  auto next = virtual_file_mappings.lower_bound(start);
-  if (next != virtual_file_mappings.begin()) --next;
-  while (next != virtual_file_mappings.end() && next->first < end) {
-    const auto [left, right] = *next;
+  auto next = virtual_file_mapping_sources.lower_bound(start);
+  if (next != virtual_file_mapping_sources.begin()) --next;
+  while (next != virtual_file_mapping_sources.end() && next->first < end) {
+    const auto left = next->first;
+    const auto [right, path] = next->second;
     if (right <= start) { ++next; continue; }
-    next = virtual_file_mappings.erase(next);
-    if (left < start) virtual_file_mappings.emplace(left, start);
+    next = virtual_file_mapping_sources.erase(next);
+    if (left < start) virtual_file_mapping_sources.emplace(left, std::make_pair(start, path));
     if (right > end) {
-      virtual_file_mappings.emplace(end, right);
+      virtual_file_mapping_sources.emplace(end, std::make_pair(right, path));
       break;
     }
   }
+  virtual_file_mappings = mapping_coverage(virtual_file_mapping_sources);
 }
 
-void FileSystemState::add_virtual_file_mapping(uint64_t start, uint64_t end)
+void FileSystemState::add_virtual_file_mapping(uint64_t start, uint64_t end, const std::string& path)
 {
-  if (start >= end || start % 4096 || end % 4096)
-    throw std::runtime_error("Invalid virtual file mapping extent");
-  auto next = virtual_file_mappings.lower_bound(start);
-  if (next != virtual_file_mappings.begin() && std::prev(next)->second >= start) --next;
-  while (next != virtual_file_mappings.end() && next->first <= end) {
-    start = std::min(start, next->first);
-    end = std::max(end, next->second);
-    next = virtual_file_mappings.erase(next);
+  std::string canonical;
+  const auto node = filesystem.find(path);
+  if (start >= end || start % 4096 || end % 4096 ||
+      node == filesystem.end() || !S_ISREG(node->second.metadata.st_mode) ||
+      resolve_path_checked(AT_FDCWD, path, canonical) || canonical != path)
+    throw std::runtime_error("Invalid virtual file mapping source");
+  remove_virtual_file_mapping(start, end);
+  auto next = virtual_file_mapping_sources.lower_bound(start);
+  if (next != virtual_file_mapping_sources.begin()) {
+    const auto previous = std::prev(next);
+    if (previous->second.first == start && previous->second.second == canonical) {
+      start = previous->first;virtual_file_mapping_sources.erase(previous);
+    }
   }
-  virtual_file_mappings.emplace(start, end);
+  if (next != virtual_file_mapping_sources.end() && next->first == end && next->second.second == canonical) {
+    end = next->second.first;virtual_file_mapping_sources.erase(next);
+  }
+  virtual_file_mapping_sources.emplace(start, std::make_pair(end, canonical));
+  virtual_file_mappings = mapping_coverage(virtual_file_mapping_sources);
+}
+
+void FileSystemState::require_unmapped_file(const std::string& path) const
+{
+  for (const auto& [start, source] : virtual_file_mapping_sources) {
+    (void)start;
+    if (source.second == path)
+      throw std::runtime_error("Modification of a mapped virtual file is unsupported");
+  }
 }
 
 int FileSystemState::allocate_fd(FdType type, int status_flags, int descriptor_flags)
@@ -607,6 +655,8 @@ int FileSystemState::do_openat(int dirfd, const std::string &input, int flags, m
       return -ETXTBSY;
   }
 
+  if (flags & O_TRUNC) require_unmapped_file(path);
+
   // If we got here, the file is accessible or was created.
   // Now, create an open file description for it.
   int fd = allocate_fd(FdType::FILE,
@@ -685,6 +735,7 @@ ssize_t FileSystemState::do_write(int fd, const void *buf, size_t count)
 
   if (count == 0)
     return 0;
+  require_unmapped_file(ofd.path);
   off_t write_offset = ofd.offset;
   // Output streams retain branch-owned bytes; they are always append-only.
   if ((fd_manager_->get_status_flags(fd) & O_APPEND) ||
@@ -701,6 +752,27 @@ ssize_t FileSystemState::do_write(int fd, const void *buf, size_t count)
   node.metadata.st_mtim = modeled_fs_time();
 
   return count;
+}
+
+int FileSystemState::do_ftruncate(int fd, int64_t length)
+{
+  // Linux checks signed length before looking up even an invalid descriptor.
+  if (length < 0) return -EINVAL;
+  if (!fd_manager_ || !fd_manager_->is_allocated(fd)) return -EBADF;
+  if (fd_manager_->get_fd_type(fd) != FdType::FILE) return -EINVAL;
+  const auto opened = open_files.find(fd);
+  if (opened == open_files.end()) throw std::runtime_error("Truncated descriptor has no file payload");
+  auto& node = filesystem.at(opened->second.path);
+  if (!S_ISREG(node.metadata.st_mode) ||
+      (fd_manager_->get_status_flags(fd) & O_ACCMODE) == O_RDONLY) return -EINVAL;
+  require_unmapped_file(opened->second.path);
+  const uint64_t size = static_cast<uint64_t>(length);
+  if (size > node.content.size() && size - node.content.size() > maximum_dense_growth)
+    throw std::runtime_error("Virtual ftruncate exceeds single-operation dense growth bound");
+  node.content.resize(size);
+  node.metadata.st_size = length;
+  node.metadata.st_mtim = modeled_fs_time();
+  return 0;
 }
 
 int FileSystemState::do_close(int fd)

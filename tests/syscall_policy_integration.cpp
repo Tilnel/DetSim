@@ -132,10 +132,16 @@ static void check_nohugepage(SyscallDispatcher& dispatcher, pid_t child) {
         check(execute(dispatcher,child,SYS_madvise,{address,4096,advice,0,0,0}).rejected,
               "other advice remains explicitly rejected");
     auto& fs=ptmc_state.fs_states[0];
-    fs.add_virtual_file_mapping(address,address+4096);
+    const int provenance_file=fs.do_open("/provenance",O_CREAT|O_RDWR,0600);
+    if(provenance_file<0) throw std::runtime_error("provenance file fixture");
+    const std::string provenance_bytes(4096,0x5a);
+    if(fs.do_write(provenance_file,provenance_bytes.data(),provenance_bytes.size())!=4096)
+        throw std::runtime_error("provenance content fixture");
+    fs.add_virtual_file_mapping(address,address+4096,"/provenance");
     check(execute(dispatcher,child,SYS_madvise,{address,1,MADV_NOHUGEPAGE,0,0,0}).rejected,
           "MADV_NOHUGEPAGE rejects virtual file provenance");
     fs.remove_virtual_file_mapping(address,address+4096);
+    fs.do_close(provenance_file);
     check(munmap(native+4096,4096)==0,"native nohugepage hole");
     const auto hole=execute(dispatcher,child,SYS_munmap,{address+4096,4096,0,0,0,0});
     check(!hole.rejected && hole.value==0,"virtual nohugepage hole");
@@ -159,6 +165,40 @@ static void check_nohugepage(SyscallDispatcher& dispatcher, pid_t child) {
     tracee_do_syscall(child,SYS_munmap,shared,4096,0,0,0,0);
     execute(dispatcher,child,SYS_munmap,{address,12288,0,0,0,0});
     munmap(native,12288);
+}
+
+static void check_mapped_file_mutation(SyscallDispatcher& dispatcher,pid_t child) {
+    auto& fs=ptmc_state.fs_states[0];
+    const int writer=fs.do_open("/mapped-mutation",O_CREAT|O_RDWR,0600);
+    const std::string bytes(4096,'m');
+    if(writer<0 || fs.do_write(writer,bytes.data(),bytes.size())!=4096) throw std::runtime_error("mapped mutation file");
+    VFSNode alias;alias.metadata.st_mode=S_IFLNK|0777;
+    const std::string target="mapped-mutation";alias.content.assign(target.begin(),target.end());alias.metadata.st_size=target.size();
+    fs.filesystem["/mapped-alias"]=std::move(alias);
+    const int preopened=fs.do_open("/mapped-alias",O_RDWR,0);
+    const auto mapped=execute(dispatcher,child,SYS_mmap,{0,4096,PROT_READ,MAP_PRIVATE,uint64_t(writer),0});
+    if(mapped.rejected || mapped.value<=0) throw std::runtime_error("mapped mutation mapping");
+    const auto original=fs;const auto manager=*ptmc_state.fd_managers[0];
+    for(const auto args:{std::array<uint64_t,6>{uint64_t(preopened),0,0,0,0,0},
+                         std::array<uint64_t,6>{uint64_t(preopened),8192,0,0,0,0}})
+        check(execute(dispatcher,child,SYS_ftruncate,args).rejected,
+              "actual ftruncate rejects preopened alias of mapped file before mutation");
+    check(execute(dispatcher,child,SYS_write,{uint64_t(preopened),1,UINT64_MAX,0,0,0}).rejected,
+          "mapped write guard precedes guest read and staging allocation");
+    const auto empty=execute(dispatcher,child,SYS_write,{uint64_t(preopened),1,0,0,0,0});
+    check(!empty.rejected && empty.value==0,"zero mapped write remains effect free");
+    check(fs.filesystem.at("/mapped-mutation").content==original.filesystem.at("/mapped-mutation").content &&
+          fs.filesystem.at("/mapped-mutation").metadata.st_size==4096 &&
+          fs.filesystem.at("/mapped-mutation").metadata.st_mtim.tv_sec==original.filesystem.at("/mapped-mutation").metadata.st_mtim.tv_sec &&
+          fs.filesystem.at("/mapped-mutation").metadata.st_mtim.tv_nsec==original.filesystem.at("/mapped-mutation").metadata.st_mtim.tv_nsec &&
+          fs.open_files.at(preopened).offset==original.open_files.at(preopened).offset &&
+          fs.virtual_file_mapping_sources==original.virtual_file_mapping_sources &&
+          *ptmc_state.fd_managers[0]==manager,"failed mapped mutations preserve bytes metadata offsets sources and descriptors");
+    const auto unmapped=execute(dispatcher,child,SYS_munmap,{uint64_t(mapped.value),4096,0,0,0,0});
+    const auto truncated=execute(dispatcher,child,SYS_ftruncate,{uint64_t(preopened),0,0,0,0,0});
+    check(!unmapped.rejected && unmapped.value==0 && !truncated.rejected && truncated.value==0 &&
+          fs.filesystem.at("/mapped-mutation").content.empty(),"last unmap permits truncation through preopened alias");
+    fs.do_close(writer);fs.do_close(preopened);
 }
 
 int main() {
@@ -186,6 +226,8 @@ int main() {
             throw std::runtime_error("ptrace options");
         ptmc_state.pids[0] = child;
         ptmc_state.cursor = 0;
+        ptmc_state.fd_managers[0]=std::make_shared<FdManager>();
+        ptmc_state.fs_states[0].set_fd_manager(ptmc_state.fd_managers[0]);
         adopt_thread_signal_mask(0,child);
         SyscallDispatcher dispatcher;
         check(SyscallRoute{}.action == SyscallAction::REJECT, "default route rejects unknown host effects");
@@ -421,6 +463,7 @@ int main() {
             result=execute(dispatcher,child,SYS_munmap,{guard,4096,0,0,0,0});
             check(!result.rejected && result.value==0,"guard can be unmapped");
         }
+        check_mapped_file_mutation(dispatcher,child);
         check_nohugepage(dispatcher,child);
         const auto discard=execute(dispatcher,child,SYS_mmap,
                        {0,8192,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,uint64_t(-1),0});

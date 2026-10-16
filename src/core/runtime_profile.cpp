@@ -20,7 +20,7 @@ int startup_syscall_for_node(size_t node) {
 std::string runtime_profile_identity() {
   nlohmann::json identity{
     {"profile", "linux-x86_64-syscall-prelude-v1"},
-    {"kernel_model", "linux-x86_64-closed-syscalls-v20"},
+    {"kernel_model", "linux-x86_64-closed-syscalls-v21"},
     {"rseq", "unavailable-enosys"},
     {"altstack_min_size", 2048},
     {"initial_time_us", profile.initial_time_us},

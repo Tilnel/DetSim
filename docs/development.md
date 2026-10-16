@@ -806,3 +806,27 @@ normal/tiny lifecycle runs pass. A real startup157 scenario executes native
 SET_NAME in the prelude, then checks controlled GET_NAME, search, output/exit and
 three identical replays in both backends.25 native scenarios,12 paired case rows,
 page-snapshot/state-I/O, make check and NP1/NP3 production builds also pass.
+
+
+Virtual ftruncate supports writable regular files, preserves FD offset, zero-fills
+growth and discards a shrunken tail. Successful calls use modeled mtime; native
+negative-length/FD/type/access priorities are covered. One call may add at most
+64MiB of dense zero bytes; larger growth explicitly rejects without changing state,
+while existing larger files can grow modestly. This is an encoding/resource limit,
+not a Linux maximum file size; sparse storage and global memory bounds are absent.
+
+Every virtual file mapping now retains its canonical source path/range as semantic
+state. Its union must equal existing mapping coverage; archive validation rejects
+missing/nonregular/noncanonical sources, overlaps and unmerged equal neighbors.
+Successful MAP_FIXED/munmap/brk shrink update both tables, failed calls preserve
+them. Positive writes, O_TRUNC and ftruncate to a still-mapped path reject before
+guest staging/allocation or mutation. Alias and previously-opened writers cannot
+bypass this. Closing an FD does not release mapping provenance; final unmap does.
+This establishes fixed input images rather than mutable file-mapping coherence.
+
+Layouts35/36 and kernelv21 identify it. NP2 IO/VFS/syscall-policy, full/pages normal/
+tiny capture, identity, NP1 page-snapshot/state-I/O,25 native scenarios,12 paired
+cases, make check and NP1/NP4 production builds pass. Detailed-metadata compilation
+also passes. Interval-map allocation failures remain fail-stop; do not continue a
+conversion after a partial allocation failure. Existing sparse write allocation
+is not bounded by the ftruncate-specific64MiB check.

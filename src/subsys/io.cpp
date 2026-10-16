@@ -76,6 +76,7 @@ long emu_write(int fd, const void* source, size_t count) {
     case FdType::STDIO: {
       require_file(fd);
       if ((manager.get_status_flags(fd)&O_ACCMODE)==O_RDONLY) return -EBADF;
+      if (count) files().require_unmapped_file(files().open_files.at(fd).path);
       std::vector<char> buffer(count);
       if (!guest_read_exact(ptmc_state.pids[ptmc_state.cursor],source,buffer.data(),count)) return -EFAULT;
       return files().do_write(fd,buffer.data(),count);
@@ -124,6 +125,14 @@ long emu_fstat(int fd, struct stat* destination) {
 int emu_fcntl(int fd,int command,long argument) {
   if (command == F_SETFL) require_no_pending_fd(ptmc_state.cursor, fd);
   return descriptors().do_fcntl(fd,command,static_cast<int>(argument));
+}
+int emu_ftruncate(int fd, int64_t length) {
+  if (length < 0) return -EINVAL;
+  auto& manager=descriptors();
+  if (!manager.is_allocated(fd)) return -EBADF;
+  if (manager.get_fd_type(fd)!=FdType::FILE) return -EINVAL;
+  require_file(fd);
+  return files().do_ftruncate(fd,length);
 }
 int emu_fsync(int fd) {
   auto& manager=descriptors();

@@ -228,6 +228,99 @@ static void check_modification_times(const std::filesystem::path& root)
   ptmc_state.time[0] = previous_time;
 }
 
+static void check_truncate_and_mapping_sources(const std::filesystem::path& root)
+{
+  const auto host=root/"truncate-input";
+  std::ofstream(host)<<"abcd";
+  const timespec known[2]={{9,123},{9,123}};
+  CHECK(utimensat(AT_FDCWD,host.c_str(),known,0)==0);
+  auto manager=std::make_shared<FdManager>();
+  FileSystemState fs(manager);
+  fs.init_from_mappings({{host.string(),"/file"}});
+  const int writer=fs.do_open("/file",O_RDWR,0);
+  CHECK(writer>=0 && fs.do_lseek(writer,7,SEEK_SET)==7);
+  auto encode=[](FileSystemState& value) {std::ostringstream out;{cereal::BinaryOutputArchive ar(out);ar(value);}return out.str();};
+  const auto source=encode(fs);
+  const auto before_time=ptmc_state.time[0];const int before_cursor=ptmc_state.cursor;
+  ptmc_state.cursor=0;ptmc_state.time[0]={73,456789};
+  auto branch=fs;branch.set_fd_manager(std::make_shared<FdManager>(*manager));
+  CHECK(branch.do_ftruncate(writer,2)==0 && branch.do_ftruncate(writer,6)==0);
+  CHECK(branch.filesystem.at("/file").content==std::vector<char>({'a','b',0,0,0,0}));
+  CHECK(branch.open_files.at(writer).offset==7 && encode(fs)==source);
+  struct stat value{};
+  CHECK(branch.do_fstat(writer,&value)==0 && value.st_size==6 &&
+        value.st_mtim.tv_sec==73 && value.st_mtim.tv_nsec==456789000);
+  ptmc_state.time[0]={74,1};
+  CHECK(branch.do_ftruncate(writer,6)==0 && branch.do_fstat(writer,&value)==0 && value.st_mtim.tv_sec==74);
+  const int native=open(host.c_str(),O_RDWR);
+  CHECK(native>=0 && ftruncate(native,4)==0 && fstat(native,&value)==0 && value.st_mtim.tv_sec!=9);
+  CHECK(lseek(native,7,SEEK_SET)==7 && ftruncate(native,2)==0 && ftruncate(native,6)==0 && lseek(native,0,SEEK_CUR)==7);
+  char bytes[6];CHECK(pread(native,bytes,6,0)==6 && !memcmp(bytes,"ab\0\0\0\0",6));close(native);
+  const auto unchanged=encode(branch);bool rejected=false;
+  try {branch.do_ftruncate(writer,6+FileSystemState::maximum_dense_growth+1);}catch(const std::runtime_error&) {rejected=true;}
+  CHECK(rejected && encode(branch)==unchanged && branch.open_files.at(writer).offset==7);
+  auto restored=FileSystemState();
+  {std::istringstream in(source);cereal::BinaryInputArchive ar(in);ar(restored);}
+  restored.set_fd_manager(std::make_shared<FdManager>(*manager));
+  CHECK(restored.do_ftruncate(writer,2)==0 && restored.filesystem.at("/file").content==std::vector<char>({'a','b'}));
+  CHECK(encode(fs)==source);
+  VFSNode link;link.metadata.st_mode=S_IFLNK|0777;link.content={'f','i','l','e'};link.metadata.st_size=4;
+  fs.filesystem["/alias"]=link;
+  const int alias=fs.do_open("/alias",O_RDWR,0);
+  const int other=fs.do_open("/other",O_CREAT|O_RDWR,0600);
+  CHECK(alias>=0 && other>=0 && fs.do_write(other,"x",1)==1);
+  fs.add_virtual_file_mapping(0x1000,0x2000,"/file");
+  fs.add_virtual_file_mapping(0x3000,0x4000,"/file");
+  fs.add_virtual_file_mapping(0x5000,0x6000,"/other");
+  auto blocked=[&](auto operation) {bool denied=false;try {operation();}catch(const std::runtime_error& error) {
+      denied=std::string(error.what())=="Modification of a mapped virtual file is unsupported";}CHECK(denied);};
+  const auto mapped=encode(fs);const auto descriptors=*manager;
+  fs.add_virtual_file_mapping(0x1000,0x2000,fs.virtual_file_mapping_sources.begin()->second.second);
+  CHECK(encode(fs)==mapped); // Source references may alias the entry being replaced.
+  CHECK(fs.do_write(alias,nullptr,0)==0 && encode(fs)==mapped);
+  blocked([&] {fs.do_write(writer,nullptr,1);});
+  blocked([&] {fs.do_ftruncate(alias,0);});
+  blocked([&] {fs.do_open("/alias",O_WRONLY|O_TRUNC,0);});
+  CHECK(encode(fs)==mapped && *manager==descriptors);
+  const int log=fs.do_open("/log",O_CREAT|O_RDWR,0600);
+  CHECK(log>=0 && fs.do_write(log,"unrelated",9)==9 && fs.do_ftruncate(log,2)==0);
+  fs.add_virtual_file_mapping(0x2000,0x3000,"/file");
+  CHECK(fs.virtual_file_mapping_sources.at(0x1000)==std::make_pair(uint64_t(0x4000),std::string("/file")));
+  CHECK(fs.virtual_file_mapping_sources.size()==2);
+  fs.remove_virtual_file_mapping(0x2000,0x3000);
+  CHECK(fs.virtual_file_mapping_sources.size()==3 && fs.virtual_file_mapping_sources.at(0x3000).second=="/file");
+  auto different=fs;different.virtual_file_mapping_sources.begin()->second.second="/other";
+  CHECK(encode(different)!=encode(fs));
+  tracee_state original;original.fs_state=fs;tracee_state changed=original;changed.fs_state=different;
+  CHECK(!original.metadata_equal(changed));
+  auto missing_coverage=fs;missing_coverage.virtual_file_mappings.clear();rejected=false;
+  try {(void)encode(missing_coverage);}catch(const std::runtime_error&) {rejected=true;}CHECK(rejected);
+  const auto valid=encode(fs);auto malformed=valid;
+  const auto position=malformed.rfind("/file");CHECK(position!=std::string::npos);
+  malformed.replace(position,5,"/nope");rejected=false;
+  try {std::istringstream in(malformed);cereal::BinaryInputArchive ar(in);FileSystemState invalid;ar(invalid);}
+  catch(const std::runtime_error&) {rejected=true;}CHECK(rejected);
+  {std::istringstream in(valid);cereal::BinaryInputArchive ar(in);ar(restored);}
+  restored.set_fd_manager(std::make_shared<FdManager>(*manager));
+  blocked([&] {restored.do_ftruncate(alias,0);});
+  CHECK(fs.do_close(writer)==0 && fs.do_close(alias)==0);
+  fs.remove_virtual_file_mapping(0x1000,0x2000);
+  blocked([&] {fs.do_open("/file",O_WRONLY|O_TRUNC,0);});
+  fs.remove_virtual_file_mapping(0x3000,0x4000);
+  const int writable=fs.do_open("/alias",O_WRONLY|O_TRUNC,0);
+  CHECK(writable>=0 && fs.do_ftruncate(writable,8)==0 && fs.filesystem.at("/file").content==std::vector<char>(8,0));
+  CHECK(fs.virtual_file_mapping_sources.size()==1 && fs.virtual_file_mapping_sources.begin()->second.second=="/other");
+  // The bound is per-operation zero fill, not a maximum imported file size.
+  VFSNode large;large.metadata.st_mode=S_IFREG|0600;
+  large.content.assign(FileSystemState::maximum_dense_growth+1,'b');large.metadata.st_size=large.content.size();
+  fs.filesystem["/large"]=std::move(large);
+  const int large_fd=fs.do_open("/large",O_RDWR,0);
+  CHECK(large_fd>=0 && fs.do_ftruncate(large_fd,FileSystemState::maximum_dense_growth+2)==0 &&
+        fs.filesystem.at("/large").content[FileSystemState::maximum_dense_growth+1]==0);
+  ptmc_state.time[0]=before_time;ptmc_state.cursor=before_cursor;
+  std::cout << "PASS VFS ftruncate: native bytes/mtime/offset, copy/archive, mapped aliases and source closure" << std::endl;
+}
+
 int main()
 {
   try
@@ -252,6 +345,7 @@ int main()
     CHECK(dotdot_rejected);
     check_symlink_walk(root);
     check_modification_times(root);
+    check_truncate_and_mapping_sources(root);
     // A mapping root is an object, not an implicitly manufactured directory.
     std::ofstream(root / ".hidden", std::ios::binary) << std::string("a\0b", 3);
     CHECK(chmod((root / "real").c_str(), 0711) == 0);

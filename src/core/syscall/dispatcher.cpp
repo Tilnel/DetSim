@@ -4,6 +4,7 @@
 
 #include "dispatcher.h"
 #include "handlers.h"
+#include "io.h"
 #include "guest.h"
 #include "utils.h"
 #include "log_wrapper.h"
@@ -145,6 +146,7 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         case SYS_pipe:
         case SYS_pipe2:
         case SYS_fcntl:
+        case SYS_ftruncate:
         case SYS_fsync:
         case SYS_fdatasync:
         case SYS_ioctl:
@@ -169,7 +171,7 @@ SyscallRoute SyscallDispatcher::get_route(int syscall_nr) const
         case SYS_socketpair: case SYS_shutdown:
         case SYS_ppoll: case SYS_select:
         case SYS_sendfile: case SYS_splice: case SYS_tee: case SYS_vmsplice: case SYS_copy_file_range:
-        case SYS_getdents: case SYS_ftruncate:
+        case SYS_getdents:
         case SYS_fchdir: case SYS_flock: case SYS_sync: case SYS_syncfs:
         case SYS_readahead: case SYS_fadvise64:
         case SYS_eventfd: case SYS_eventfd2:
@@ -397,6 +399,10 @@ int SyscallDispatcher::on_exit(pid_t pid, syscall_info& info)
         case SYS_faccessat2:
             return handle_fs_exit(pid, info);
 
+        case SYS_ftruncate:
+            info.rval=emu_ftruncate(static_cast<int>(info.args[0]),static_cast<int64_t>(info.args[1]));
+            tracee_set_rax(pid,info.rval);return CKPT_YES;
+
         case SYS_getpid:
             info.rval=logical_process_id(ptmc_state.cursor);
             tracee_set_rax(pid,info.rval);return CKPT_YES;
@@ -594,7 +600,7 @@ int SyscallDispatcher::handle_fs_exit(pid_t pid, syscall_info& info)
                 if (!(operation.protection&PROT_WRITE) &&
                     tracee_do_syscall(pid,SYS_mprotect,info.rval,operation.length,operation.protection,0,0,0)!=0)
                     throw std::runtime_error("Virtual mapping protection restore failed");
-                fs.add_virtual_file_mapping(info.rval, info.rval + ((operation.length + 4095) & ~uint64_t(4095)));
+                fs.add_virtual_file_mapping(info.rval, info.rval + ((operation.length + 4095) & ~uint64_t(4095)), description.path);
             }
         }
     }

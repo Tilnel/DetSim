@@ -10,6 +10,7 @@ long emu_write(int fd, const void* source, size_t count);
 long emu_close(int fd);
 long emu_fstat(int fd, struct stat* destination);
 int emu_fcntl(int fd, int command, long argument);
+int emu_ftruncate(int fd, int64_t length);
 int emu_fsync(int fd);
 int emu_fdatasync(int fd);
 int emu_ioctl(int fd, unsigned long request, void* argument);

@@ -104,6 +104,10 @@ int main(int argc, char**)
         const uint64_t provenance_page=tracee_do_syscall(children[1],SYS_mmap,0,4096,
             PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,uint64_t(-1),0);
         require(provenance_page>0 && provenance_page<uint64_t(-4095),"provenance fixture mapping");
+        const int provenance_fd=ptmc_state.fs_states[1].do_open("/provenance",O_CREAT|O_RDWR,0600);
+        require(provenance_fd>=0 && ptmc_state.fs_states[1].do_write(provenance_fd,std::string(4096,0).data(),4096)==4096,
+                "provenance source file");
+        require(ptmc_state.fs_states[1].do_close(provenance_fd)==0,"close provenance source fixture");
         std::array<ProcessKernelState,NP> initial_process_states;
         for (int i=0;i<NP;++i) {
             ptmc_state.process_states[i].random_state^=uint64_t(i+123);
@@ -184,7 +188,7 @@ int main(int argc, char**)
         sys_state process_replayed(info,&source);
         require(process_replayed.ss_hash==source.ss_hash,"RNG/signal branch restore identity drift");
         compare_full(process_replayed);
-        ptmc_state.fs_states[1].add_virtual_file_mapping(provenance_page,provenance_page+4096);
+        ptmc_state.fs_states[1].add_virtual_file_mapping(provenance_page,provenance_page+4096,"/provenance");
         sys_state file_backed(info,&source);
         require(file_backed.ts_hash[1]!=source.ts_hash[1] && file_backed.ss_hash!=source.ss_hash &&
                 source.child[1].fs_state.virtual_file_mappings.empty(),

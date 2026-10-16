@@ -709,3 +709,29 @@ recorded owner group has no surviving tasks. Evidence:
 build/workloads/module-control-1b3dchvf/result.json. This is execution/search
 progress only. Next prioritize a controlled startup prefix and real client, not
 unbounded startup interleavings; ftruncate is statically identified at log init.
+
+
+### Fixed-image mapping origins and log truncation
+
+SYS_ftruncate now implements regular writable-file size/zero-fill/truncation,
+offset preservation and modeled mtime with native error-order oracles. Copy/
+archive/identity distinguish content and mapped origin changes. Saved canonical
+path ranges exactly cover virtual file mapping coverage; clipping and replacement
+update both. Positive write/O_TRUNC/ftruncate guards protect mapped inputs through
+symlink/pre-opened aliases, retain refs after close, and release only after unmap.
+This closes the mutable-backing admission hole for these writes, not full mapping
+coherence. Registering with an aliased source-table string is independently safe.
+
+Independent review approves. NP2IO282/policy140 and four capture backend/cache
+runs, detailed syntax, identity, NP1snapshot/state-I/O,25native+12case rows,make
+check and NP1/NP4 builds pass. Layout35/36/kernel21. Single ftruncate zero extension
+above64MiB is explicitly unsupported, with no mutation; already-large inputs can
+still grow a little. General sparse-write memory bounds remain open. Allocation
+failure during interval-table changes must abort the conversion; no failed
+successor is published. Native real module log initialization motivates this gate.
+
+Hand-controlled real module startup now concretely reaches unlink87, whose native
+operation is absent dump.rdb.tmp.recv cleanup (ENOENT). Following INIT also needs
+atomic closed meta.tmp→meta rename. Next leaf namespace slice must preserve inode
+identity, saved allocator and implicit executable/proc references; no fabricated
+unlink success or pathname-based inode recomputation after rename.
