@@ -916,3 +916,22 @@ and model evidence must include the common case driver source hash and the new
 policy; old prototypes do not satisfy that matrix. No core timer delivery or
 general fairness guarantee was added; continuously runnable processes can still
 postpone their timed workers under this retained-path policy.
+
+### Case-driver transcript polling
+
+Actual sibling exploration rooted before the first SET captured1128task-clock samples
+over10s, zero lost; Python accounted for40.21% of sampled CPU, tracer59.52%, target
+0.36% (rounding applies). Artifacts: build/case-jobs/iteration17-module-healthy-pages/
+search-profile-summary.json and search-dwarf-perf.data. This is a prototype search
+sample, not wall-time attribution or a completed business check.
+
+Session.send formerly reread/decoded the complete growing transcript per poll.
+It now seeks to the consumed byte offset, preserving locale decoding, malformed
+byte replacement, split UTF-8, newline normalization and prompt/EOF/deadline
+behavior.16component tests include a measured RED→GREEN: a23byte reply after a
+1MiB consumed prefix formerly read3,145,788bytes across3polls, now at most69bytes.
+In3trial100reply microbenchmarks, a16MiB prefix costs6.025s before versus0.010s
+after (median); reply hashes match. See build/case-session/benchmark.json and
+verification.json. This is polling-only improvement, not full exploration speedup.
+Real full/pages actor equivalence and the runner's incomplete/missing-tool failure
+gates pass; current binary C/C++/pthread12row cases pass with the final reader.

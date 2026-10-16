@@ -141,3 +141,4 @@
 !writev_native_oracle.cpp
 !writev_integration.cpp
 !writev.mk
+!case_session_test.py

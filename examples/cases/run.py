@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import itertools
 import json
+import locale
 import os
 from pathlib import Path
 import re
@@ -87,10 +88,14 @@ class Session:
                 pass
         deadline = self.started + self.timeout
         while time.monotonic() < deadline:
-            content = self.log.read_text(errors="replace")
-            reply = content[self.offset:]
+            with self.log.open("rb") as transcript:
+                transcript.seek(self.offset)
+                content = transcript.read()
+            # Offset counts raw bytes. Re-reading this unfinished reply preserves
+            # split UTF-8 sequences and universal-newline behavior across polls.
+            reply = content.decode(locale.getpreferredencoding(False), errors="replace").replace("\r\n", "\n").replace("\r", "\n")
             if reply.endswith("(ptmc) "):
-                self.offset = len(content)
+                self.offset += len(content)
                 return reply
             if self.proc.poll() is not None:
                 raise CaseFailure(reply[-4000:] or f"tracer exited {self.proc.returncode}")
