@@ -16,6 +16,7 @@
 
 /* Forward declarations */
 struct syscall_info;
+enum class TransitionAction;
 
 /* ========================================================================
  * Initialization
@@ -38,7 +39,7 @@ int exec_once(syscall_info *info);
 int exec_store(void);
 
 /* Load state and continue execution */
-int load_exec_store(void);
+int load_exec_store(TransitionAction action);
 
 /* Continue execution in auto mode */
 int exec_bfs(void);

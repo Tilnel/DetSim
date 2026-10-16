@@ -1,5 +1,8 @@
 #ifndef DETSIM_API_PLUGIN_H
 #define DETSIM_API_PLUGIN_H
+
+/* Explicit manual timeout transition; ordinary transitions retain -1/choices. */
+enum { DETSIM_CHOICE_TIMEOUT = -2 };
 /* Stable C ABI. Plugins may inspect supplied views, never the live runtime.
  * Every callback is synchronous. Views, host, diagnostics and writers are borrowed
  * for the callback only. Plugins must not retain pointers or mutate globals as

@@ -6,6 +6,7 @@
 #define __SOCKSTATE_H
 
 #include "common.h"
+class FileSystemState;
 #include "fd_manager.h"
 #include <deque>
 #include <fcntl.h>
@@ -215,7 +216,9 @@ class SockState
 
   /* epoll_wait(epfd, events, maxevents, timeout) -> num_events or -errno */
   uint32_t ready_events(int fd, int node) const;
+  uint32_t ready_events(int fd, const FileSystemState& fs) const;
   bool epoll_ready(int epfd, int node) const;
+  bool epoll_ready(int epfd, const FileSystemState& fs) const;
   int do_epoll_wait(int epfd, struct epoll_event *events, int maxevents,
                     int timeout);
 

@@ -177,21 +177,43 @@ static bool check_assertions(const sys_state& state, unsigned actor)
 }
 
 TransitionResult state_transition(const sys_state &source_state,
-                                  int process_index, int requested_thread)
+                                  int process_index, int requested_thread, TransitionAction action)
 {
   if (&source_state == &ptmc_state.running_state) {
     const sys_state detached_source=source_state;
-    return state_transition(detached_source,process_index,requested_thread);
+    return state_transition(detached_source,process_index,requested_thread,action);
   }
   if (process_index < 0 || process_index >= NP)
     throw std::runtime_error("Transition process index out of range");
+  if (action != TransitionAction::Normal && action != TransitionAction::Timeout)
+    throw std::runtime_error("Invalid transition action");
+  const auto preflight_timeout = [&](const tracee_state& child) {
+    if (DISDEAD(source_state.status[process_index]) || source_state.property_failed)
+      throw ActionRejected("actor belongs to a terminal state");
+    validate_pending_syscalls(child);
+    if (requested_thread < 0 || requested_thread >= static_cast<int>(child.threads.size()))
+      throw ActionRejected("thread index out of range");
+    const auto& actor = child.threads[requested_thread];
+    if (!actor.alive || !actor.pending_syscall || actor.pending_syscall->phase != PendingPhase::Waiting || !actor.pending_syscall->deadline)
+      throw ActionRejected("actor requires a waiting syscall with a finite deadline");
+    const auto& pending = *actor.pending_syscall;
+    syscall_info call{}; call.nr = pending.nr;
+    std::copy(std::begin(pending.args), std::end(pending.args), call.args);
+    if (pending.reason == PendingReason::Io && io_retry_ready(child, call))
+      throw ActionRejected("I/O is already ready");
+    return pending_timeout_clock(child.tv, *pending.deadline);
+  };
+  if (action == TransitionAction::Timeout) {
+    if (requested_thread == -1) requested_thread = source_state.child[process_index].current_thread_idx;
+    (void)preflight_timeout(source_state.child[process_index]);
+  }
   if (DISDEAD(source_state.status[process_index]))
     throw std::runtime_error("Cannot execute a terminated process; load a predecessor state first");
   if (source_state.property_failed)
     throw std::runtime_error("Cannot execute a terminal property violation; load a predecessor state first");
   if (requested_thread < -1 || requested_thread >= static_cast<int>(source_state.child[process_index].threads.size()))
     throw std::runtime_error("Transition thread index out of range");
-  if (requested_thread >= 0) {
+  if (action == TransitionAction::Normal && requested_thread >= 0) {
     const auto& actor=source_state.child[process_index].threads[requested_thread];
     if (!actor.alive || (actor.pending_syscall && actor.pending_syscall->phase == PendingPhase::Waiting))
       throw std::runtime_error("Transition thread is not runnable");
@@ -219,7 +241,23 @@ TransitionResult state_transition(const sys_state &source_state,
   // Get current thread index for the active process
   int thread_idx = ptmc_state.current_thread_idx[process_index];
   syscall_info executed = new_syscalls[process_index][thread_idx];
-  int ckpt = exec_once(source_state, executed);
+  int ckpt;
+  if (action == TransitionAction::Timeout) {
+    const auto target = preflight_timeout(ptmc_state.running_state.child[process_index]);
+    const auto& actor = ptmc_state.running_state.child[process_index].threads.at(thread_idx);
+    const auto logical_tid = actor.tid;
+    const auto physical_tid = actor.physical_tid;
+    ptmc_state.time[process_index] = target;
+    ptmc_state.tracee_image_dirty[process_index] = true;
+    if (!expire_pending_syscall(process_index, logical_tid) ||
+        !complete_pending_syscall(process_index, physical_tid, executed))
+      throw std::runtime_error("Admitted timeout failed to complete");
+    ckpt = CKPT_YES;
+  } else {
+    ckpt = exec_once(source_state, executed);
+  }
+  const int transition_choice = action == TransitionAction::Timeout ? DETSIM_CHOICE_TIMEOUT :
+      (ptmc_state.n_choose ? ptmc_state.choose : -1);
   // Automatic execution may skip a blocked/exited thread. Attribute the
   // completed syscall to the actor that actually ran, preserving other slots.
   thread_idx = ptmc_state.current_thread_idx[process_index];
@@ -240,7 +278,7 @@ TransitionResult state_transition(const sys_state &source_state,
     detsim_event_v2 event{};
     event.process = process_index; event.thread = thread_idx;
     event.syscall_number = executed.nr;
-    event.choice = ptmc_state.n_choose ? ptmc_state.choose : -1;
+    event.choice = transition_choice;
     std::copy(std::begin(executed.args), std::end(executed.args), event.args);
     const bool unfinished=result.new_state.child[process_index].threads.at(thread_idx).pending_syscall.has_value();
     if (ckpt==CKPT_STOP) {
@@ -267,7 +305,7 @@ TransitionResult state_transition(const sys_state &source_state,
 
   // add to state tree for future exploration
   state_tree_add(source_state, result.new_state, process_index,
-                 ptmc_state.n_choose ? ptmc_state.choose : -1);
+                 transition_choice);
   ptmc_state.running_state = result.new_state;
   for (int node=0; node<NP; ++node) ptmc_state.tracee_image_dirty[node]=false;
   return result;

@@ -808,3 +808,38 @@ changes presentation/control cost only, not snapshot identity or atom policy.
 Nine controller and three native-acceptance regressions,27actual scenarios
 (including full/pages pending/list/restore3x),make check and NP1/NP4 builds pass;
 independent review approves. Full module acceptance remains pending.
+
+### Explicit pending timeout transitions
+
+The fair-controller run-t8wxa5r8 completes2295 actual transitions and real INIT
+in183s, then has no runnable actor: three main threads wait in1ms epoll, workers
+wait in futex and the client waits in read. It fails explicitly with clean
+shutdown. A single-thread native nanosleep fixture independently demonstrates
+the same missing control path. Neither stall is called a successful search.
+
+`si timeout` now admits a saved finite Waiting actor, advances only its process
+clock to max(current,ceil_us(deadline)), expires and directly completes its
+pending call. No next user instruction runs. Source-resource preflight is pure;
+live and saved readiness share one implementation with explicit FS context.
+Ready/Retry, infinite waits and existing I/O readiness reject before restoring
+or mutating the machine. Legal deadline kind/clock/result combinations are
+validated. Existing capture/predicate/monitor/commit publication owns the result;
+plugin event and TSS record the explicit timeout action(-2), original syscall,
+actor and result. Strict CLI parsing prevents accidental atoi choice0 aliases.
+No new persistent field is needed;kernel23 retains format37/38.
+
+Independent review approves. Seven waiting syscall families pass actual
+state_transition tests with full/pages and ordinary/1byte caches,3x persisted
+replay, clock carry/KTIME_MAX/monotonicity, readiness/queue/resource rejection
+isolation and both state/edge terminal predicates. The tiny-cache test drains
+async saves and proves fresh disk reads;1byte capacity bypasses oversized entries
+and is not an eviction-count claim. NP2pending/IO/snapshot,identity,policy,plugins,
+runtime-profile and full/pages capture gates;NP1page/state-I/O/futex-snapshot;
+27native scenarios;12case rows;make check and NP1/NP4 builds pass. Targeted Clang
+analysis of pending,transition and IO paths is clean. Logs:
+/tmp/detsim-timeout-*-green.log and /tmp/detsim-iteration14-*.log.
+
+This is explicit manual completion, not automatic timer/actor enumeration.
+Builtin BFS/DFS/RAND still omit timeout actions (C03), and independent non-main
+thread timeout execution is not established by the node0/slot0 integration gate.
+Full module business/search/replay remains separately unfinished.

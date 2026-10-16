@@ -4,6 +4,10 @@
 
 #include "commands.h"
 #include "scheduler.h"
+#include "state/state_transition.h"
+#include <charconv>
+#include <string_view>
+#include <cctype>
 #include "state/state.h"
 #include "state/state_store.h"
 #include "state/sysstate_store.h"
@@ -48,7 +52,7 @@ static CommandEntry cmd_table[] = {
     {"dfs", "Perform depth-first search <depth> [--quiet]", cmd_dfs},
     {"rand", "Perform random search <depth> [--quiet]", cmd_rand},
     {"q", "Exit ptraceMC", cmd_q},
-    {"si", "Step from current state, on focused process", cmd_si},
+    {"si", "Step selected actor [NONNEGATIVE_CHOICE|timeout]", cmd_si},
     {"sw", "Switch control focus on the n-th process", cmd_sw},
     {"thread", "Switch to thread N in current process (thread to list)", cmd_thread},
     {"load", "Load state of given StateHash", cmd_load},
@@ -184,16 +188,27 @@ int cmd_si(char *args) {
         return 0;
     }
 
-    if (args && args[0]) {
-        int choice = atoi(args);
-        if (choice >= 0) {
-            ptmc_state.batch_choice_preset = choice;
+    std::string_view text = args ? args : "";
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) text.remove_prefix(1);
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) text.remove_suffix(1);
+    const auto action = text == "timeout" ? TransitionAction::Timeout : TransitionAction::Normal;
+    if (!text.empty() && action == TransitionAction::Normal) {
+        int choice = -1;
+        const auto parsed = std::from_chars(text.data(), text.data()+text.size(), choice);
+        if (text.front() < '0' || text.front() > '9' || parsed.ec != std::errc{} || parsed.ptr != text.data()+text.size() || choice < 0) {
+            detsim::ui::ui_printf("Usage: si [NONNEGATIVE_CHOICE|timeout]\n");
+            return 0;
         }
+        ptmc_state.batch_choice_preset = choice;
     }
-
-    int ret = load_exec_store();
-    if (ret == 0) {
-        show_syscall(ptmc_state.pids[cursor], ptmc_state.running_state.ts_hash[cursor]);
+    try {
+        int ret = load_exec_store(action);
+        if (ret == 0) {
+            if (action == TransitionAction::Timeout) detsim::ui::ui_printf("Timeout completed.\n");
+            show_syscall(ptmc_state.pids[cursor], ptmc_state.running_state.ts_hash[cursor]);
+        }
+    } catch (const ActionRejected& error) {
+        detsim::ui::ui_printf("Timeout action rejected: %s\n", error.what());
     }
     return 0;
 }
@@ -235,9 +250,17 @@ int cmd_thread(char *args) {
                 const char* state = !thread.alive ? "exited" :
                     thread.pending_syscall && thread.pending_syscall->phase == PendingPhase::Waiting
                         ? "waiting" : "runnable";
-                detsim::ui::ui_printf("%s [%zu] TID %d state=%s %s\n",
+                detsim::ui::ui_printf("%s [%zu] TID %d state=%s %s",
                                       marker, i, thread.tid, state,
                                       threads[i].is_main ? "(main)" : "");
+                if (thread.alive && thread.pending_syscall &&
+                    thread.pending_syscall->phase == PendingPhase::Waiting &&
+                    thread.pending_syscall->deadline) {
+                    const auto& deadline = *thread.pending_syscall->deadline;
+                    detsim::ui::ui_printf(" deadline=%lld.%09d",
+                                          static_cast<long long>(deadline.sec), deadline.nsec);
+                }
+                detsim::ui::ui_printf("\n");
             }
         }
         return 0;

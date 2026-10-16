@@ -9,6 +9,7 @@
 #include <limits>
 #include <time.h>
 #include <sys/syscall.h>
+#include <linux/futex.h>
 
 namespace {
 void validate_deadline(const PendingDeadline& deadline)
@@ -16,6 +17,38 @@ void validate_deadline(const PendingDeadline& deadline)
     if ((deadline.clock_id != CLOCK_REALTIME && deadline.clock_id != CLOCK_MONOTONIC) ||
         deadline.sec < 0 || deadline.nsec < 0 || deadline.nsec >= 1000000000)
         throw std::runtime_error("Invalid pending syscall deadline");
+}
+
+void validate_timed_pending(const PendingSyscall& pending)
+{
+    const auto& deadline = *pending.deadline;
+    bool allowed = false;
+    if (pending.reason == PendingReason::Futex) {
+        const int operation = static_cast<int>(pending.args[1]);
+        const int command = operation & FUTEX_CMD_MASK;
+        allowed = (command == FUTEX_WAIT || command == FUTEX_WAIT_BITSET) &&
+            (!(operation & FUTEX_CLOCK_REALTIME) || command == FUTEX_WAIT_BITSET) &&
+            (command != FUTEX_WAIT_BITSET || static_cast<uint32_t>(pending.args[5]) != 0) && pending.args[3] &&
+            deadline.timeout_result == -ETIMEDOUT &&
+            deadline.clock_id == ((operation & FUTEX_CLOCK_REALTIME) ? CLOCK_REALTIME : CLOCK_MONOTONIC);
+    } else if (pending.reason == PendingReason::Timer) {
+        allowed = deadline.timeout_result == 0;
+        if (pending.nr == SYS_nanosleep)
+            allowed &= pending.args[0] && deadline.clock_id == CLOCK_MONOTONIC;
+        else if (pending.nr == SYS_clock_nanosleep)
+            allowed &= pending.args[2] && (static_cast<int>(pending.args[1]) & ~TIMER_ABSTIME) == 0 &&
+                deadline.clock_id == static_cast<int>(pending.args[0]);
+        else allowed &= pending.nr == SYS_pselect6 && pending.args[4] && deadline.clock_id == CLOCK_MONOTONIC;
+    } else if (pending.reason == PendingReason::Io) {
+        allowed = deadline.timeout_result == 0 && deadline.clock_id == CLOCK_MONOTONIC &&
+            ((pending.nr == SYS_epoll_pwait2 && pending.args[3]) ||
+             ((pending.nr == SYS_epoll_wait || pending.nr == SYS_epoll_pwait) && static_cast<int>(pending.args[3]) > 0));
+    }
+    if (!allowed) throw std::runtime_error("Unsupported pending deadline combination");
+    validate_deadline(*pending.deadline);
+    if (static_cast<__int128>(pending.deadline->sec) * 1000000000 + pending.deadline->nsec >
+            std::numeric_limits<int64_t>::max())
+        throw std::runtime_error("Pending deadline exceeds Linux ktime range");
 }
 
 thread_state* logical_actor(int node, pid_t logical_tid)
@@ -67,6 +100,19 @@ PendingDeadline make_pending_deadline(int node, int clock_id, int64_t sec,
     return deadline;
 }
 
+timeval pending_timeout_clock(const timeval& source, const PendingDeadline& deadline)
+{
+    validate_deadline(deadline);
+    if (source.tv_sec < 0 || source.tv_usec < 0 || source.tv_usec >= 1000000 ||
+        static_cast<__int128>(deadline.sec)*1000000000 + deadline.nsec > std::numeric_limits<int64_t>::max())
+        throw std::runtime_error("Invalid pending timeout clock");
+    timeval target{deadline.sec, (deadline.nsec + 999) / 1000};
+    if (target.tv_usec == 1000000) { ++target.tv_sec; target.tv_usec = 0; }
+    if (source.tv_sec > target.tv_sec || (source.tv_sec == target.tv_sec && source.tv_usec > target.tv_usec))
+        return source;
+    return target;
+}
+
 void set_pending_deadline(int node, pid_t logical_tid, const PendingDeadline& deadline)
 {
     validate_deadline(deadline);
@@ -75,6 +121,9 @@ void set_pending_deadline(int node, pid_t logical_tid, const PendingDeadline& de
     auto* thread = logical_actor(node, logical_tid);
     if (!thread || !thread->pending_syscall || thread->pending_syscall->phase == PendingPhase::Ready)
         throw std::runtime_error("Deadline requires an unfinished waiting syscall");
+    auto candidate = *thread->pending_syscall;
+    candidate.deadline = deadline;
+    validate_timed_pending(candidate);
     thread->pending_syscall->deadline = deadline;
 }
 
@@ -260,10 +309,7 @@ void validate_pending_syscalls(const tracee_state& state)
         if (pending.reason == PendingReason::Io && !supports_pending_io(pending.nr))
             throw std::runtime_error("Unsupported unfinished I/O syscall");
         if (pending.deadline) {
-            validate_deadline(*pending.deadline);
-            if (static_cast<__int128>(pending.deadline->sec) * 1000000000 + pending.deadline->nsec >
-                    std::numeric_limits<int64_t>::max())
-                throw std::runtime_error("Pending deadline exceeds Linux ktime range");
+            validate_timed_pending(pending);
         }
         const bool expected_queue = pending.reason == PendingReason::Futex && pending.phase == PendingPhase::Waiting;
         if (queued != expected_queue) throw std::runtime_error("Futex queue disagrees with unfinished syscall phase");

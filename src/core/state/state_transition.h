@@ -4,6 +4,11 @@
 #include "state.h"
 #include <functional>
 #include <chrono>
+#include <stdexcept>
+enum class TransitionAction { Normal, Timeout };
+class ActionRejected : public std::runtime_error {
+public: using std::runtime_error::runtime_error;
+};
 
 // Checkpoint return codes - must match values in handlers.h and exec_engine.cpp
 enum TransitionResultCode {
@@ -24,6 +29,7 @@ struct TransitionResult {
     bool property_violation = false;
 };
 int state_initialization();
-TransitionResult state_transition(const sys_state &source_state, int process_index, int thread_index = -1);
+TransitionResult state_transition(const sys_state &source_state, int process_index, int thread_index = -1,
+    TransitionAction action = TransitionAction::Normal);
 
 #endif /* __STATE_TRANSITION_H */

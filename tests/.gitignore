@@ -135,3 +135,5 @@
 !redisraft_case_runner_test.py
 
 !file_eof_native_oracle.cpp
+!pending_timeout_integration.cpp
+!pending_timeout.mk

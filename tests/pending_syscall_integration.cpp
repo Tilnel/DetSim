@@ -145,11 +145,36 @@ int main(int argc, char** argv)
             9223372036LL, 0, false, -ETIMEDOUT);
         require(absolute_saturated.sec == saturated.sec && absolute_saturated.nsec == saturated.nsec,
                 "absolute timeout disagrees with Linux ktime_set saturation");
+        // This branch models a timed WAIT; the original archive remains untimed.
+        state.threads[0].pending_syscall->args[3] = reinterpret_cast<uint64_t>(&requested);
+        state.si[0].args[3] = reinterpret_cast<uint64_t>(&requested);
         set_pending_deadline(0, 1, deadline);
+        const auto carried = pending_timeout_clock({0, 0}, {CLOCK_MONOTONIC, 4, 999999999, 0});
+        require(carried.tv_sec == 5 && carried.tv_usec == 0, "timeout ceil lost second carry");
+        const auto max_clock = pending_timeout_clock({0, 0}, saturated);
+        require(max_clock.tv_sec == 9223372036LL && max_clock.tv_usec == 854776,
+                "KTIME_MAX timeout ceil overflowed");
+        const auto past_clock = pending_timeout_clock({20, 1}, deadline);
+        require(past_clock.tv_sec == 20 && past_clock.tv_usec == 1, "timeout moved clock backwards");
         requested = {99, 0};
         tracee_state timed(0, state.si);
         const auto timed_hash = timed.save(child);
         tracee_state disk_timed(timed_hash);
+        const auto reject_deadline = [&](auto change) {
+            auto malformed = timed;
+            change(*malformed.threads[0].pending_syscall);
+            bool rejected = false;
+            try { validate_pending_syscalls(malformed); }
+            catch (const std::runtime_error&) { rejected = true; }
+            require(rejected, "malformed timed syscall accepted");
+        };
+        reject_deadline([](auto& p) { p.deadline->timeout_result = 0; });
+        reject_deadline([](auto& p) { p.deadline->clock_id = CLOCK_REALTIME; });
+        reject_deadline([](auto& p) { p.args[3] = 0; });
+        reject_deadline([](auto& p) { p.args[1] |= 256; p.deadline->clock_id = CLOCK_REALTIME; });
+        reject_deadline([](auto& p) { p.args[1] = 9; p.args[5] = 0; });
+        reject_deadline([](auto& p) { p.deadline->nsec = 1000000000; });
+        reject_deadline([](auto& p) { p.deadline->sec = 9223372037LL; });
         auto changed_deadline = timed;
         changed_deadline.threads[0].pending_syscall->deadline->nsec++;
         require(!changed_deadline.metadata_equal(timed), "deadline missing from state identity");

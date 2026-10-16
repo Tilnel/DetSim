@@ -1,3 +1,4 @@
+#include "api/plugin.h"
 /*
  * state.cpp - State management
  */
@@ -105,7 +106,8 @@ void show_syscall_current()
   }
   const auto [predecessor, which, choice, slot] = edge->second;
   detsim::ui::ui_printf(HASH_FORMAT " => " HASH_FORMAT "\n Tracee %d", predecessor, state.ss_hash, which);
-  if (choice >= 0) detsim::ui::ui_printf(" (choose %d)", choice);
+  if (choice == DETSIM_CHOICE_TIMEOUT) detsim::ui::ui_printf(" (timeout)");
+  else if (choice >= 0) detsim::ui::ui_printf(" (choose %d)", choice);
   detsim::ui::ui_printf(": ");
   const int status = state.status[which];
   if (DISCRASHED(status) || DISSIGNALED(status)) {
@@ -159,7 +161,9 @@ void show_syscall_history()
     format_syscall_for_history(buf, ptmc_state.pids[which], s.ts_hash[which]);
     print_stack.push(std::string(buf) + "\n");
 
-    if (choose >= 0)
+    if (choose == DETSIM_CHOICE_TIMEOUT)
+      sprintf(buf, HASH_FORMAT " => " HASH_FORMAT "\n Tracee %d (timeout): ", pre, ss, which);
+    else if (choose >= 0)
       sprintf(buf,
               HASH_FORMAT " => " HASH_FORMAT "\n Tracee %d (choose %d): ", pre,
               ss, which, choose);

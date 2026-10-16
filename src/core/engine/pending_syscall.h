@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <sys/types.h>
+#include <sys/time.h>
 
 struct syscall_info;
 struct tracee_state;
@@ -49,6 +50,8 @@ struct PendingSyscall {
 // deadline. Conversion and addition saturate at Linux KTIME_MAX (signed 64-bit ns).
 PendingDeadline make_pending_deadline(int node, int clock_id, int64_t sec,
     int32_t nsec, bool relative, int64_t timeout_result);
+// Earliest microsecond clock at/after deadline; never moves the source backwards.
+timeval pending_timeout_clock(const timeval& source, const PendingDeadline& deadline);
 void set_pending_deadline(int node, pid_t logical_tid, const PendingDeadline& deadline);
 bool pending_timeout_due(int node, pid_t logical_tid);
 // A control operation only: no virtual time advance and no user-code resume.

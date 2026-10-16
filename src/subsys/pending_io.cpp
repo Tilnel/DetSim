@@ -75,15 +75,13 @@ void configure_pending_io(int node, pid_t tid, const syscall_info& call) {
   throw std::runtime_error("Pending epoll deadline has no live bound actor");
 }
 
-bool io_retry_ready(int node, const syscall_info& call) {
+static bool io_retry_ready(const FdManager& manager, const FileSystemState& fs,
+                           const SockState& network, const syscall_info& call) {
   const int fd = static_cast<int>(call.args[0]);
-  const auto& manager = ptmc_state.fd_managers[node];
-  if (!manager || !manager->is_allocated(fd)) return true;
-  const auto& network = ptmc_state.sock_states[node];
-  if (epoll_call(call.nr)) return network.epoll_ready(fd, node);
+  if (!manager.is_allocated(fd)) return true;
+  if (epoll_call(call.nr)) return network.epoll_ready(fd, fs);
   if (!data_call(call.nr)) throw std::runtime_error("Unknown pending I/O syscall");
-  if (manager->get_fd_type(fd) == FdType::PIPE) {
-    const auto& fs = ptmc_state.fs_states[node];
+  if (manager.get_fd_type(fd) == FdType::PIPE) {
     const auto descriptor = fs.pipe_fds_.find(fd);
     if (descriptor == fs.pipe_fds_.end()) return true;
     const auto pipe = fs.pipes_.find(std::abs(descriptor->second));
@@ -96,8 +94,16 @@ bool io_retry_ready(int node, const syscall_info& call) {
     }
     return descriptor->second < 0 || !pipe->second.buffer.empty() || pipe->second.write_closed;
   }
-  if (manager->get_fd_type(fd) != FdType::SOCKET) return true;
-  return network.ready_events(fd, node) & (EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP);
+  if (manager.get_fd_type(fd) != FdType::SOCKET) return true;
+  return network.ready_events(fd, fs) & (EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP);
+}
+
+bool io_retry_ready(int node, const syscall_info& call) {
+  const auto& manager = ptmc_state.fd_managers[node];
+  return !manager || io_retry_ready(*manager, ptmc_state.fs_states[node], ptmc_state.sock_states[node], call);
+}
+bool io_retry_ready(const tracee_state& source, const syscall_info& call) {
+  return io_retry_ready(source.fd_manager_state, source.fs_state, source.sock_state, call);
 }
 
 bool retry_pending_io(int node, pid_t tid, syscall_info& call) {

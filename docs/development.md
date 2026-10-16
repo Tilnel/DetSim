@@ -29,6 +29,7 @@ make audit-runtimes      # NP=1 language admission; reports unsupported cases as
 make check-scenarios     # build NP=1 tracer and run isolated native ptrace scenarios
 make check-thread-control check-thread-identity check-thread-carrier # NP=1 thread gates
 make check-pending-syscall # NP=1 blocked/wake/completion/deadline replay
+make check-pending-timeout # NP=2 explicit timeout event, zero user resume, cold replay
 make check-pending-io check-pending-io-snapshot # NP=2 IO wait/retry/EOF and persisted replay
 make check-thread-robust # NP=1 native owner-death oracle, group exit, persisted replay
 make check-thread-altstack # NP=1 virtual per-task sigaltstack and carrier replay
@@ -151,6 +152,16 @@ and missing file-backed restore mappings fail explicitly.
 Logical thread slots and futex queues survive restore. Raw-thread births/exits
 restore onto retained stopped carriers; unexpected host thread death or creation rejects. PI futex operations remain unsupported. Timed waits retain normalized deadlines;
 expiry and completion require explicit control operations, not host wall time.
+
+`thread` lists saved runnable/waiting/exited slots and finite waiting deadlines.
+After `sw PROCESS` and `thread SLOT`, `si timeout` advances that process's model
+clock to its saved deadline (rounded up to microseconds, never backwards) and
+completes the pending call without executing subsequent guest instructions.
+It rejects untimed waits, Ready/Retry calls and existing I/O readiness. Ordinary
+`si` then resumes user code. The timeout edge retains the original syscall and
+records choice `DETSIM_CHOICE_TIMEOUT` in plugin events and history. This is manual
+control: builtin BFS/DFS/RAND do not enumerate timeout actions or advance time
+automatically. It is not complete exploration of timeout/readiness races.
 
 Run the NP=1 and NP=2 gates in separate make invocations. The Redis gate requires
 the existing `examples/redis/redis/src/redis-server`; it downloads nothing and

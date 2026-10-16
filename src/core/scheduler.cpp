@@ -64,21 +64,21 @@ void load(hash_type hash)
 static void stop_status_monitor();
 static void poll_status_monitor();
 
-int load_exec_store()
+int load_exec_store(TransitionAction action)
 {
   int index = ptmc_state.cursor;
   // Save original state before attempting transition
   sys_state original_state = ptmc_state.running_state;
   sys_state s = original_state;
 
-  if (DISEXITED(s.status[index]))
+  if (action == TransitionAction::Normal && DISEXITED(s.status[index]))
   {
     detsim::ui::ui_printf(
         "Tracee #%d has exited with status %d. Please do something else.\n",
         index, DEXITSTATUS(s.status[index]));
     return 0;
   }
-  else if (DISCRASHED(s.status[index]))
+  else if (action == TransitionAction::Normal && DISCRASHED(s.status[index]))
   {
     detsim::ui::ui_printf(
         "Tracee #%d stopped for signal %s. Please do something else.\n", index,
@@ -86,7 +86,7 @@ int load_exec_store()
     return 0;
   }
 
-  TransitionResult result = state_transition(s, index);
+  TransitionResult result = state_transition(s, index, action == TransitionAction::Timeout ? ptmc_state.current_thread_idx[index] : -1, action);
   poll_status_monitor();
 
   // Check if the current thread is blocked

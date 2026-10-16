@@ -1247,6 +1247,9 @@ int SockState::do_epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
 }
 
 uint32_t SockState::ready_events(int fd, int node) const
+{ return ready_events(fd, ptmc_state.fs_states[node]); }
+
+uint32_t SockState::ready_events(int fd, const FileSystemState& fs) const
 {
   uint32_t ready = 0;
   const Socket *socket = get_socket(fd);
@@ -1266,7 +1269,6 @@ uint32_t SockState::ready_events(int fd, int node) const
       }
     }
   } else {
-    const auto &fs = ptmc_state.fs_states[node];
     auto pipe_fd = fs.pipe_fds_.find(fd);
     if (pipe_fd != fs.pipe_fds_.end()) {
       auto pipe = fs.pipes_.find(std::abs(pipe_fd->second));
@@ -1285,11 +1287,14 @@ uint32_t SockState::ready_events(int fd, int node) const
 }
 
 bool SockState::epoll_ready(int epfd, int node) const
+{ return epoll_ready(epfd, ptmc_state.fs_states[node]); }
+
+bool SockState::epoll_ready(int epfd, const FileSystemState& fs) const
 {
   const auto it = epoll_instances_.find(epfd);
   if (it == epoll_instances_.end()) return true; // Retry produces EBADF.
   for (const auto &[fd, watch] : it->second.watched_fds)
-    if (ready_events(fd, node) & (watch.events | EPOLLERR | EPOLLHUP)) return true;
+    if (ready_events(fd, fs) & (watch.events | EPOLLERR | EPOLLHUP)) return true;
   return false;
 }
 

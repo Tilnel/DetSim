@@ -203,9 +203,11 @@ finally:
 #include <time.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+volatile int after_sleep;
 int main(void) {
     const struct timespec delay = {0, 1000};
     if (syscall(SYS_nanosleep, &delay, 0)) return 71;
+    after_sleep = 1;
     return write(1, "TIMER_DONE\n", 11) != 11;
 }
 """)
@@ -227,6 +229,26 @@ int main(void) {
             predecessor, successor = edges[0]
             self.assertIn("state=waiting", send("thread"))
             self.assertEqual(send("info current"), history)
+            completed = send("si timeout")
+            self.assertIn("Timeout completed.", completed)
+            self.assertNotIn("<pending:", completed)
+            self.assertIn("after_sleep = 0", send("p after_sleep"))
+            timed_history = send("info current")
+            self.assertIn("(timeout)", timed_history)
+            timed_hash = re.findall(r"=> ([0-9a-f]{16})", timed_history)[-1]
+            self.assertNotEqual(timed_hash, successor)
+            for invalid in ("-1", "-0", "wat", "1junk", "2147483648", "timeout extra"):
+                self.assertIn("Usage: si", send("si " + invalid))
+                self.assertEqual(send("info current"), timed_history)
+            self.assertIn("Timeout action rejected:", send("si timeout"))
+            self.assertEqual(send("info current"), timed_history)
+            for _ in range(3):
+                self.assertIn("Loaded state", send("load " + successor))
+                self.assertIn("Timeout completed.", send("si timeout"))
+                self.assertIn("after_sleep = 0", send("p after_sleep"))
+                self.assertEqual(re.findall(r"=> ([0-9a-f]{16})", send("info current"))[-1], timed_hash)
+                self.assertIn("TIMER_DONE", send("si"))
+                self.assertIn("after_sleep = 1", send("p after_sleep"))
             for _ in range(3):
                 self.assertIn("Loaded state", send("load " + predecessor))
                 self.assertIn("state=runnable", send("thread"))
