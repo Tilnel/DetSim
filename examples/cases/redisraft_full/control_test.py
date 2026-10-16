@@ -62,6 +62,33 @@ class ControllerTest(unittest.TestCase):
         self.assertEqual([(e["node"],e["thread"]) for e in events[-8:]],
                          [(0,0),(0,1),(0,2),(1,0),(1,1),(2,0),(2,1),(3,0)])
 
+    def test_full_session_declares_public_time_inputs(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner.subprocess,"Popen"):
+            root=Path(directory)
+            session=runner.FullSession(Path("tracer"),[["server","--loadmodule","module"],["server"],["server"],["client"]],
+                                       Path("checker.so"),["log1","log2","log3"],root/"model","pages",10,root/"time-choice.so")
+            try:
+                configuration=json.loads((root/"model/config.json").read_text())
+                self.assertEqual(configuration["ChoosePoint"],[{"syscall":96,"choose":2}])
+                self.assertEqual(session.normal_choices,(0,1))
+                self.assertEqual(configuration["Plugins"][1]["Path"],str(root/"time-choice.so"))
+            finally:session.output.close()
+
+    def test_explicit_profile_startup_holds_and_business_advances(self):
+        class ProfileSession(Session):
+            normal_choices=(0,1)
+            def send(self,command):
+                if command=="si 1":
+                    reply=super().send("si 0");self.commands[-1]="si 1";return reply
+                return super().send(command)
+        session=ProfileSession()
+        runner.control_step(session,0,0,[],[""]*4,[])
+        self.assertEqual(session.commands[-1],"si 0")
+        session.commands=[];events=[]
+        runner.actor_round(session,events,[""]*4,[])
+        self.assertTrue(events and all(event["choice"]==1 for event in events))
+        self.assertNotIn("si 0",session.commands)
+
     def test_waiting_and_exited_skip_then_woken_actor_reappears(self):
         session=Session();session.states={(0,1):"waiting",(0,2):"exited"}
         events=[]
@@ -182,7 +209,7 @@ class ControllerTest(unittest.TestCase):
 
     def test_model_assertion_is_failed_even_with_unsupported_in_log(self):
         class ModelSession(Session):
-            def __init__(self,tracer,tracees,checker,logs,directory,backend,timeout):
+            def __init__(self,tracer,tracees,checker,logs,directory,backend,timeout,time_plugin=None):
                 super().__init__();directory.mkdir()
                 self.directory=directory;self.proc=SimpleNamespace(pid=99999990)
                 self.log=directory/"transcript.log"

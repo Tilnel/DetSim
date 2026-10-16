@@ -22,6 +22,15 @@ ROOT=Path(__file__).resolve().parents[2]
 HERE=Path(__file__).resolve().parent / "redisraft_full"
 SOURCE=ROOT / "build/workloads/redisraft-full"
 SERVER=ROOT / "build/workloads/redis-7.4.2/src/redis-server"
+CLOCK_PROFILE={"id":"cases.redisraft-full.clock-input","syscall":96,"normal_choices":[0,1],
+               "advance_microseconds":10000,"startup_choice":0,"business_choice":1}
+GUIDE_POLICY="normal actors first; RR(node,slot); normal preset1 when configured else0; timeout only without normal; variant/property independent"
+
+
+def time_policy_context(plugin):
+    return copy.deepcopy(CLOCK_PROFILE)|{"plugin_sha256":common.digest(plugin),"source_sha256":common.digest(HERE/"time_choice.cpp")}
+
+
 BEFORE="""        case RAFT_LOGTYPE_NORMAL:
             executeLogEntry(rr, entry, entry_idx, req);
             break;"""
@@ -95,10 +104,10 @@ def native_result(records,returncode,variant):
     else: common.require(returncode==42 and records[-1]["event"]=="violation","mutant did not hit exact skipped local apply")
 
 
-def native(work,module,client,variant,timeout,checker_test=None):
+def native(work,module,client,variant,timeout,checker_test=None,time_policy=None):
     directory=work / (variant+"-native")
     directory.mkdir()
-    row={"target":"redisraft-full","variant":variant,"backend":"native","NP":4,"status":"failed","artifacts":str(directory)}
+    row={"target":"redisraft-full","variant":variant,"backend":"native","NP":4,"status":"failed","artifacts":str(directory),"time_policy":time_policy}
     owned=[]
     try:
         reservations=[]
@@ -130,7 +139,7 @@ def native(work,module,client,variant,timeout,checker_test=None):
         expected=0 if variant=="healthy" else 1
         common.require(checked.returncode==expected,"native saved-log checker verdict differs: "+checked.stdout)
         if variant=="mutant": common.require("acknowledged local value missing at node 3 key alpha" in checked.stdout,"native checker hit unintended property")
-        configuration={"servers":[entry[2] for entry in owned],"client":argv,"checker":{"logs":[str(entry[3]/"raftlog.db") for entry in owned]},"environment":common.ENV}
+        configuration={"servers":[entry[2] for entry in owned],"client":argv,"checker":{"logs":[str(entry[3]/"raftlog.db") for entry in owned]},"environment":common.ENV,"model_time_policy":time_policy}
         (directory/"native-config.json").write_text(json.dumps(configuration,indent=2)+"\n")
         row.update(status="pass" if variant=="healthy" else "violation",client_exit=result.returncode,
             checker_exit=checked.returncode,checker_output=checked.stdout,config_sha256=common.digest(directory/"native-config.json"),
@@ -158,15 +167,17 @@ def native(work,module,client,variant,timeout,checker_test=None):
 
 class FullSession(common.Session):
     """Use the existing CLI lifecycle with this case's configured public checker."""
-    def __init__(self,tracer,tracees,checker,logs,directory,backend,timeout):
+    def __init__(self,tracer,tracees,checker,logs,directory,backend,timeout,time_plugin=None):
         self.directory=directory;directory.mkdir(parents=True)
-        self.owned_pids=set()
+        self.owned_pids=set();self.normal_choices=(0,1)
+        time_plugin=time_plugin or directory.parent/"time-choice.so"
         self.timeout=timeout;self.started=time.monotonic();self.offset=0;self.commands=[]
         self.log=directory/"transcript.log"
         configuration={"Nodes":4,"Loglevel":4,"Tracee":tracees,
             "Addr":["192.168.0.1","192.168.0.2","192.168.0.3","192.168.0.4"],
             "RuntimeProfile":{"startup_syscall":11},
-            "Plugins":[{"Path":str(checker),"Configuration":{"logs":logs}}],
+            "Plugins":[{"Path":str(checker),"Configuration":{"logs":logs}},{"Path":str(time_plugin)}],
+            "ChoosePoint":[{"syscall":96,"choose":2}],
             "FSMap":[{"Host":str(path),"Target":str(path)} for path in
                      (Path(tracees[0][tracees[0].index("--loadmodule")+1]),
                       Path("/usr/lib/x86_64-linux-gnu/libm.so.6"),Path("/usr/lib/x86_64-linux-gnu/libc.so.6"))],
@@ -191,8 +202,14 @@ class ClientAssertion(common.CaseFailure):
     """A workload assertion is a failed case, before abort's later syscalls."""
 
 
+def configured_normal_choices(session):
+    choices=tuple(getattr(session,"normal_choices",(0,)))
+    common.require(choices in ((0,),(0,1)) and all(type(choice) is int for choice in choices),"unknown normal-choice profile")
+    return choices
+
+
 def control_step(session,node,slot,events,last,observed,choice=0,allow_violation=False):
-    common.require(choice in (0,-2),"unknown controller action")
+    common.require(choice==-2 or choice in configured_normal_choices(session),"unknown controller action")
     session.send("sw "+str(node))
     if slot is not None:
         selected=session.send("thread "+str(slot))
@@ -200,7 +217,7 @@ def control_step(session,node,slot,events,last,observed,choice=0,allow_violation
     item={"node":node,"thread":0 if slot is None else slot,"choice":choice,"predecessor":session.current_hash(),
           "executed":False,"status":"attempted"}
     events.append(item)
-    try:reply=session.send("si timeout" if choice==-2 else "si 0")
+    try:reply=session.send("si timeout" if choice==-2 else "si "+str(choice))
     except Exception as error:
         item["reply"]=str(error);item["status"]="error";last[node]=str(error)
         if node==3 and re.search(r"\bAssertion\b|assertion failed",str(error),re.IGNORECASE):
@@ -270,7 +287,7 @@ def actor_round(session,events,last,observed):
     for node in range(4):
         for slot,state,_ in thread_actors(session,node):
             if state!="runnable":continue
-            control_step(session,node,slot,events,last,observed)
+            control_step(session,node,slot,events,last,observed,choice=max(configured_normal_choices(session)))
             if observed and observed[-1].get("event")=="before_set":return
     if any(item["executed"] for item in events[start:]):return
     # Re-read after the attempted round: stepping peers may have changed eligibility.
@@ -322,7 +339,7 @@ def search_actions(session,process_count=4):
     actions=[]
     for node in range(process_count):
         for slot,state,deadline in thread_actors(session,node):
-            if state=="runnable":actions.append((node,slot,0))
+            if state=="runnable":actions.extend((node,slot,choice) for choice in configured_normal_choices(session))
             elif state=="waiting" and deadline is not None:actions.append((node,slot,-2))
     return sorted(actions)
 
@@ -343,7 +360,7 @@ def search_layer(session,source,driver,events,process_count=4,deadline=float("in
         edge=events[-1]
         common.require(edge["executed"] and edge["predecessor"]==source,"enumerated actor did not execute from source")
         edge["observations"]=copy.deepcopy(branch["observations"][count:])
-        if node==3 and choice==0:
+        if node==3 and choice>=0:
             exited=re.search(r"\bexit_group\((\d+)\)",edge["reply"])
             if exited:branch["client_exit"]=int(exited[1])
         edge["client_exit"]=branch["client_exit"]
@@ -389,7 +406,7 @@ def replay_candidate(session,source,driver,candidate,variant,results=None,deadli
         control_step(session,node,slot,events,[""]*4,replay_driver["observations"],choice,allow_violation=True)
         check_search_deadline(deadline)
         event=events[-1]
-        if node==3 and choice==0:
+        if node==3 and choice>=0:
             exited=re.search(r"\bexit_group\((\d+)\)",event["reply"])
             if exited:replay_driver["client_exit"]=int(exited[1])
         expected=candidate["edge"]
@@ -405,14 +422,22 @@ def replay_candidate(session,source,driver,candidate,variant,results=None,deadli
     return results
 
 
+def select_continuation(candidates,cursor):
+    normal=[candidate for candidate in candidates if candidate["action"][2]>=0]
+    pool=normal or candidates
+    actors=sorted({candidate["action"][:2] for candidate in pool})
+    actor=next((actor for actor in actors if cursor is None or actor>cursor),actors[0])
+    return max((candidate for candidate in pool if candidate["action"][:2]==actor),key=lambda candidate:candidate["action"][2])
+
+
 def guided_search(session,root,driver,variant,max_depth,wall_seconds):
     common.require(max_depth>0 and math.isfinite(wall_seconds) and wall_seconds>0,"positive finite guided search bounds required")
     started=time.monotonic()
     result={"status":"incomplete","termination":"depth_cutoff","root":root,"root_observations":copy.deepcopy(driver["observations"]),"beam_width":1,"seed":0,
             "wall_cutoff":False,
             "bounds":{"depth":max_depth,"wall_seconds":wall_seconds},"expanded_layers":0,"attempted_edges":0,
-            "unique_successors":0,"pruned_successors":0,"partial_last_layer":False,"branching_observed":False,
-            "selection":"lexicographic(node,slot,choice), first after cursor with wrap; independent of property/variant",
+            "unique_successors":0,"duplicate_successor_edges":0,"pruned_successors":0,"partial_last_layer":False,"branching_observed":False,
+            "selection":GUIDE_POLICY,"normal_choices":list(configured_normal_choices(session)),
             "cursor":None,"edges":[],"path":[],"replays":[],"replay_verified":False}
     source=root;source_driver=copy.deepcopy(driver);cursor=None;visited={root}
     deadline=min(started+wall_seconds,getattr(session,"started",float("inf"))+getattr(session,"timeout",0))
@@ -426,6 +451,7 @@ def guided_search(session,root,driver,variant,max_depth,wall_seconds):
                 if not candidates:
                     result["termination"]="no_legal_actions";break
                 successors={x["edge"]["successor"] for x in candidates}
+                result["duplicate_successor_edges"]+=len(candidates)-len(successors)
                 result["branching_observed"]|=len(successors)>=2
                 terminal=[]
                 for candidate in candidates:
@@ -447,11 +473,11 @@ def guided_search(session,root,driver,variant,max_depth,wall_seconds):
                     check_search_deadline(deadline)
                     result.update(status=outcome,termination="healthy_completion" if outcome=="pass" else "exact_violation",replay_verified=True)
                     break
-                candidate=next((x for x in candidates if cursor is None or x["action"]>cursor),candidates[0])
+                candidate=select_continuation(candidates,cursor)
                 result["pruned_successors"]+=len(successors-{candidate["edge"]["successor"]})
-                cursor=candidate["action"];result["cursor"]=list(cursor)
+                cursor=candidate["action"][:2];result["cursor"]=list(cursor)
                 candidate["edge"]["selected"]=True
-                result["path"].append({"source":source,"action":list(cursor),"target":candidate["edge"]["successor"],"edge_index":start+candidates.index(candidate)})
+                result["path"].append({"source":source,"action":list(candidate["action"]),"target":candidate["edge"]["successor"],"edge_index":start+candidates.index(candidate)})
                 source=candidate["edge"]["successor"];source_driver=candidate["driver"]
                 if source in visited:
                     result["termination"]="retained_path_cycle";break
@@ -479,6 +505,11 @@ def matrix_acceptance(rows,variants,backends,native_only=False):
             variant=row["variant"];expected_status="pass" if variant=="healthy" else "violation"
             common.require(row.get("status")==expected_status and row.get("cleanup")=="pass" and row.get("NP")==4,
                            "row lacks expected outcome/NP4/cleanup")
+            policy=row["time_policy"]
+            common.require(all(policy.get(name)==value for name,value in CLOCK_PROFILE.items()) and
+                           all(re.fullmatch(r"[0-9a-f]{64}",policy.get(name,"")) for name in ("plugin_sha256","source_sha256")),
+                           "clock input policy missing or different")
+            common.require(policy["source_sha256"]==row["sources"].get("time_choice.cpp"),"clock policy source hash differs")
             if row["backend"]=="native":
                 native_result(row["observations"],row["client_exit"],variant)
                 common.require(row.get("checker_exit")== (0 if variant=="healthy" else 1) and
@@ -488,7 +519,7 @@ def matrix_acceptance(rows,variants,backends,native_only=False):
                 common.require(row.get("checker_output","").strip()==expected_check,"native checker diagnostic differs")
                 continue
             prerequisite=next(x for x in rows if x["variant"]==variant and x["backend"]=="native")
-            for name in ("module_sha256","client_sha256","checker_sha256","server_sha256","runner_sha256","sources"):
+            for name in ("module_sha256","client_sha256","checker_sha256","server_sha256","runner_sha256","sources","time_policy"):
                 common.require(name in row and row[name]==prerequisite.get(name),"model/native inputs differ: "+name)
             for name in ("config_sha256","tracer_sha256"):
                 common.require(re.fullmatch(r"[0-9a-f]{64}",row.get(name,"")),"model hash missing: "+name)
@@ -499,6 +530,8 @@ def matrix_acceptance(rows,variants,backends,native_only=False):
                            search.get("expanded_layers",0)>0 and search.get("attempted_edges")==len(edges),"search evidence incomplete")
             common.require(search.get("termination")==("healthy_completion" if variant=="healthy" else "exact_violation"),
                            "search did not reach exact business outcome")
+            common.require(search.get("selection")==GUIDE_POLICY and search.get("normal_choices")==[0,1],
+                           "search guide or normal-choice profile differs")
             prefix=row["observations"];root=search["root"];path=search["path"]
             common.require(re.fullmatch(r"[0-9a-f]{16}",root) and root==row.get("prefix"),"search root differs from saved prefix")
             common.require(prefix and prefix[-1].get("event")=="before_set" and prefix[-1].get("key")=="alpha" and
@@ -518,7 +551,7 @@ def matrix_acceptance(rows,variants,backends,native_only=False):
                 common.require(type(index) is int and previous<index<len(edges),"invalid path edge index")
                 edge=edges[index];action=step["action"]
                 common.require(isinstance(action,list) and len(action)==3 and all(type(value) is int for value in action) and
-                               0<=action[0]<4 and action[1]>=0 and action[2] in (0,-2),"invalid path actor/action")
+                               0<=action[0]<4 and action[1]>=0 and action[2] in (0,1,-2),"invalid path actor/action")
                 common.require(edge.get("selected") is True and edge.get("executed") is True and edge.get("status")=="completed" and
                                type(edge["layer"]) is int and edge["layer"]==layer and edge["predecessor"]==source and
                                edge["successor"]==step["target"] and [edge["node"],edge["thread"],edge["choice"]]==action,
@@ -556,8 +589,9 @@ def matrix_acceptance(rows,variants,backends,native_only=False):
             "model_matrix_complete":bool(full),"passed":valid,"matrix_errors":errors}
 
 
-def model_control(work,tracer,module,client,checker,variant,backend,timeout,max_steps,search_depth=2000,search_seconds=180):
+def model_control(work,tracer,module,client,checker,variant,backend,timeout,max_steps,search_depth=2000,search_seconds=180,time_plugin=None):
     """Reach the pre-SET/fault prefix by real requests; never search startup."""
+    time_plugin=time_plugin or work/"time-choice.so"
     directory=work/(variant+"-"+backend)
     logs=["/node"+str(node)+"-raftlog.db" for node in range(1,4)]
     tracees=[server_argv(module,node,"192.168.0."+str(node),6379,logs[node-1]) for node in range(1,4)]
@@ -568,11 +602,11 @@ def model_control(work,tracer,module,client,checker,variant,backend,timeout,max_
                    "address_space_bytes":common.MODEL_ADDRESS_SPACE_LIMIT},
          "tracer_sha256":common.digest(tracer),"module_sha256":common.digest(module),
          "client_sha256":common.digest(client),"checker_sha256":common.digest(checker),"server_sha256":common.digest(SERVER),
-         "runner_sha256":common.digest(Path(__file__)),
-         "sources":{name:common.digest(HERE/name) for name in ("client.c","checker.cpp","checker_test.cpp")}}
+         "runner_sha256":common.digest(Path(__file__)),"time_policy":time_policy_context(time_plugin),
+         "sources":{name:common.digest(HERE/name) for name in ("client.c","checker.cpp","checker_test.cpp","time_choice.cpp","time_choice_test.cpp")}}
     session=None;events=[];observed=[];phase="startup";last=[""]*4
     try:
-        session=FullSession(tracer,tracees,checker,logs,directory,backend,timeout)
+        session=FullSession(tracer,tracees,checker,logs,directory,backend,timeout,time_plugin)
         session.send()
         children=Path(f"/proc/{session.proc.pid}/task/{session.proc.pid}/children")
         session.owned_pids={int(pid) for pid in children.read_text().split()}
@@ -648,6 +682,12 @@ def main():
         client=work/"client"
         checker_test=work/"checker-test"
         checker=work/"checker.so"
+        time_plugin=work/"time-choice.so"
+        time_test=work/"time-choice-test"
+        command(["/usr/bin/g++","-std=c++20","-O2","-g","-Wall","-Wextra","-Werror","-I"+str(ROOT/"src"),HERE/"time_choice.cpp",HERE/"time_choice_test.cpp","-o",time_test],ROOT,work/"time-choice-test-build.log")
+        command([time_test],ROOT,work/"time-choice-test.log")
+        command(["/usr/bin/g++","-std=c++20","-O2","-g","-Wall","-Wextra","-Werror","-fPIC","-shared","-I"+str(ROOT/"src"),HERE/"time_choice.cpp","-o",time_plugin],ROOT,work/"time-choice-build.log")
+        policy=time_policy_context(time_plugin)
         command(["/usr/bin/g++","-std=c++20","-O2","-g","-Wall","-Wextra","-Werror","-I"+str(ROOT/"src"),"-I"+str(ROOT/"third_party"),HERE/"checker_test.cpp","-o",checker_test],ROOT,work/"checker-test-build.log")
         command([checker_test],ROOT,work/"checker-test.log")
         command(["/usr/bin/g++","-std=c++20","-O2","-g","-Wall","-Wextra","-Werror","-fPIC","-shared","-I"+str(ROOT/"src"),"-I"+str(ROOT/"third_party"),HERE/"checker.cpp","-o",checker],ROOT,work/"checker-build.log")
@@ -658,10 +698,10 @@ def main():
                 module=manifest.parent/"source/redisraft.so"
                 common.require(module.exists() and common.digest(module)==json.loads(manifest.read_text())["module_sha256"],"reused module does not match manifest")
             else:module,manifest=build(work,variant)
-            row=native(work,module,client,variant,args.timeout,checker_test)
+            row=native(work,module,client,variant,args.timeout,checker_test,policy)
             row.update(manifest=str(manifest),client_sha256=common.digest(client),module_sha256=common.digest(module),server_sha256=common.digest(SERVER),
                 checker_sha256=common.digest(checker),checker_test_sha256=common.digest(checker_test),runner_sha256=common.digest(Path(__file__)),
-                sources={name:common.digest(HERE/name) for name in ("client.c","checker.cpp","checker_test.cpp")})
+                sources={name:common.digest(HERE/name) for name in ("client.c","checker.cpp","checker_test.cpp","time_choice.cpp","time_choice_test.cpp")})
             rows.append(row)
             if not args.native_only:
                 common.require(args.tracer and args.tracer.exists(),"matching immutable NP4 --tracer required")
@@ -669,7 +709,7 @@ def main():
                 common.MODEL_ADDRESS_SPACE_LIMIT=args.address_space_mb*1024**2
                 for backend in backends:
                     rows.append(model_control(work,args.tracer.resolve(),module,client,checker,variant,backend,args.timeout,args.max_control_steps,
-                                              args.search_depth,args.search_seconds))
+                                              args.search_depth,args.search_seconds,time_plugin))
     except Exception as error: report["diagnostic"]=str(error)
     report.update(matrix_acceptance(rows,variants,backends,args.native_only))
     (work/"result.json").write_text(json.dumps(report,indent=2)+"\n")

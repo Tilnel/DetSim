@@ -33,13 +33,30 @@ class GraphSession:
             if not slots:slots=[0]
             return "Threads in process %d (pid=99999):\n"%self.node+"".join(
                 " [%d] TID %d state=%s\n"%(slot,slot+1,"runnable" if (self.state,self.node,slot,0) in self.graph else "waiting") for slot in slots)
-        if command=="si 0":
-            self.state,reply=self.graph[(self.state,self.node,self.slot,0)];return reply
+        if command in ("si 0","si 1"):
+            self.state,reply=self.graph[(self.state,self.node,self.slot,int(command.split()[1]))];return reply
         if command=="info current":return "00000000deadbeef => "+self.state+" (wrong first incoming action)"
         raise RuntimeError("unexpected command "+command)
 
 
 class SearchTest(unittest.TestCase):
+    def test_explicit_time_profile_enumerates_both_presets_and_aliases_are_not_branches(self):
+        session=GraphSession();session.normal_choices=(0,1)
+        self.assertEqual(runner.search_actions(session),[(3,0,0),(3,0,1),(3,1,0),(3,1,1)])
+        session.graph={(ROOT,3,0,0):("0000000000000001","exit_group(0) = 0"),
+                       (ROOT,3,0,1):("0000000000000001","exit_group(0) = 0")}
+        result=runner.guided_search(session,ROOT,{"observations":records(False),"client_exit":None},"healthy",2,10)
+        self.assertEqual(result["termination"],"degenerate_single_path")
+        self.assertFalse(result["branching_observed"])
+        self.assertEqual(result["duplicate_successor_edges"],1)
+
+    def test_guide_prioritizes_normal_actor_rr_and_positive_preset(self):
+        candidates=[{"action":action} for action in ((0,0,-2),(1,0,0),(1,0,1),(2,0,0),(2,0,1))]
+        self.assertEqual(runner.select_continuation(candidates,None)["action"],(1,0,1))
+        self.assertEqual(runner.select_continuation(candidates,(1,0))["action"],(2,0,1))
+        timed=[{"action":action} for action in ((0,0,-2),(2,0,-2))]
+        self.assertEqual(runner.select_continuation(timed,(0,0))["action"],(2,0,-2))
+
     def test_layer_restores_each_candidate_and_isolates_observations(self):
         session=GraphSession();events=[];driver={"observations":[],"client_exit":None}
         layer=runner.search_layer(session,ROOT,driver,events)
@@ -230,6 +247,7 @@ class SearchTest(unittest.TestCase):
                      "driver":{"observations":observed,"client_exit":0 if variant=="healthy" else None}}
             search={"status":status,"branching_observed":True,"replay_verified":True,"beam_width":1,
                     "partial_last_layer":False,"expanded_layers":1,"attempted_edges":2,"witness":witness,
+                    "selection":runner.GUIDE_POLICY,"normal_choices":[0,1],
                     "root":ROOT,"root_observations":prefix,"elapsed_seconds":1,"wall_cutoff":False,
                     "bounds":{"depth":1,"wall_seconds":10,"effective_wall_seconds":10},
                     "path":[{"source":ROOT,"target":witness["target"],"action":[3,0,0],"edge_index":0}],
@@ -247,7 +265,8 @@ class SearchTest(unittest.TestCase):
         for row in rows:
             row.update({name:"0"*64 for name in ("module_sha256","client_sha256","checker_sha256","server_sha256","runner_sha256",
                                                  "config_sha256","tracer_sha256")})
-            row["sources"]={"checker.cpp":"0"*64}
+            row["sources"]={"checker.cpp":"0"*64,"time_choice.cpp":"0"*64}
+            row["time_policy"]=copy.deepcopy(runner.CLOCK_PROFILE)|{"plugin_sha256":"0"*64,"source_sha256":"0"*64}
         return rows
 
     def test_missing_duplicate_and_partial_matrix_never_model_complete(self):
@@ -258,6 +277,11 @@ class SearchTest(unittest.TestCase):
         for field in ("replays","edges"):
             altered=copy.deepcopy(rows);altered[1]["search"][field]=[]
             self.assertFalse(runner.matrix_acceptance(altered,("healthy","mutant"),("full","pages"))["passed"])
+        for field,value in (("selection","old guide"),("normal_choices",[0])):
+            altered=copy.deepcopy(rows);altered[1]["search"][field]=value
+            self.assertFalse(runner.matrix_acceptance(altered,("healthy","mutant"),("full","pages"))["passed"])
+        altered=copy.deepcopy(rows);altered[1]["time_policy"]["plugin_sha256"]="1"*64
+        self.assertFalse(runner.matrix_acceptance(altered,("healthy","mutant"),("full","pages"))["passed"])
         altered=copy.deepcopy(rows);altered[1]["module_sha256"]="1"*64
         self.assertFalse(runner.matrix_acceptance(altered,("healthy","mutant"),("full","pages"))["passed"])
         altered=copy.deepcopy(rows);altered[1]["search"]["replays"][1]["target"]="wrong"

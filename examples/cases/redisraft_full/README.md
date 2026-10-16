@@ -60,14 +60,23 @@ bounded, case-side beam-1 search from that prefix. It never controls the skipped
 apply manually and searches only its later observation.
 
 Each expanded source is restored before every candidate. Fresh public CLI thread
-listings enumerate every runnable `(process, logical slot, normal choice 0)` and
-every finite waiting `(process, logical slot, timeout choice -2)`. This explicit
-TCP profile has no extra ChoosePoint outcomes. Dead and untimed waiting actors
+listings enumerate every runnable `(process, logical slot, normal preset 0 or 1)`
+and every finite waiting `(process, logical slot, timeout choice -2)`. The explicit
+TCP profile configures gettimeofday syscall 96 with two public ChoosePoint
+outcomes. `time_choice.cpp` supplies hold0 and +10000 microseconds1 through the
+public `choose_time` ABI, with normalized source/carry/overflow checks, cost0 and
+no persistent mutable state or private workload inspection. Other syscalls can
+ignore these presets and reach the same hash; `duplicate_successor_edges` records
+aliases, which never count as distinct successors. Dead and untimed waiting actors
 have no transition candidate. Each candidate gets a private copy of the source's
 Python observations; the restored product monitor remains the property oracle.
 All candidates are checked, including siblings that will be pruned. Exactly one
-continuation is selected by a deterministic round-robin cursor over sorted actor
-and action tuples, independently of variant, fault or property. The selected path
+continuation prioritizes normal runnable actors, rotates a deterministic cursor
+over `(process, logical slot)` and uses positive preset1 when configured. Only
+when no normal candidate exists does it retain a timeout in actor round-robin
+order. Every legal hold and timeout sibling is still executed and checked; their
+unretained frontiers are pruned. The guide is independent of variant, fault or
+property, and its exact policy string is validated by matrix acceptance. The selected path
 and every candidate's actual source/action/target are recorded independently of
 TSS history, which retains only the first incoming edge for a target.
 
@@ -99,14 +108,19 @@ To run the requested pages subset with a matching immutable NP4 tracer:
 
 ```sh
 python3 examples/cases/redisraft_full_run.py \
-  --backend pages --tracer build/case-tools/tracer-iteration14-np4 \
+  --variant healthy --backend pages --tracer build/case-tools/tracer-iteration14b-np4 \
   --reuse-modules build/redisraft-full-cases/run-o6dwejfc \
   --timeout 1800 --max-control-steps 6000 \
   --search-depth 2000 --search-seconds 1200
 ```
 
 `--reuse-modules` verifies module hashes against their original manifests and
-avoids rebuilding the external module. `--native-only` runs only the native
+avoids rebuilding the external module. The runner separately builds/tests the
+small time-policy plugin. Model and native report contexts record its binary and
+source hashes plus the declared clock input profile; matrix acceptance requires
+those inputs to match. The native run still uses the host clock: recording this
+context does not apply the model clock schedule to Redis outside DetSim.
+`--native-only` runs only the native
 prerequisites. `passed` and `requested_matrix_complete` refer to the exact unique
 requested rows; requesting one backend or variant cannot set
 `model_matrix_complete`. That flag requires healthy and mutant in full and pages,
@@ -120,7 +134,10 @@ Missing, duplicate, unexpected or incomplete rows fail acceptance.
 The full RedisRaft model matrix remains unverified until those actual runs pass.
 
 The prefix pump reads each process's public CLI `thread` listing afresh every
-round and selects each runnable logical slot with `thread N; si 0`. RedisRaft
+round. Server startup through readiness uses explicit `si 0`; membership/business
+normal steps then use `thread N; si 1`, so real gettimeofday opportunities advance
+saved time even while GET/INFO traffic remains runnable. Every normal action
+specifies a preset again because a non-time syscall may ignore it. RedisRaft
 fsync workers therefore receive explicit steps. The CLI derives
 `state=runnable|waiting|exited` from saved alive/pending state: Waiting is waiting;
 Retry, Ready and no pending call are runnable; dead actors are exited. Waiting
@@ -134,7 +151,9 @@ process index, logical slot)` and issues `si timeout`. Deadlines belong to
 per-process model clocks; numerical ordering is a fixed control policy, not a
 claim of shared global time. Untimed waits are never assigned a deadline. No
 runnable actor and no finite wait fails explicitly. The search instead enumerates
-all admitted normal and timeout candidates at every expanded source.
+all admitted normal presets and timeout candidates at every expanded source.
+These per-process clock inputs are a disclosed environment policy, not a global
+clock claim or an artificial epoll success.
 
 `control-events.json` and search edges distinguish attempts from completed actions.
 Completed actions have `executed=true`, `status=completed` and predecessor/
@@ -151,10 +170,13 @@ Local verification commands:
 python3 examples/cases/redisraft_full/control_test.py
 python3 examples/cases/redisraft_full/native_result_test.py
 python3 examples/cases/redisraft_full/search_test.py
-python3 tests/guided_search_integration.py --tracer build/case-tools/tracer-iteration13-np1
+python3 tests/guided_search_integration.py --tracer build/case-tools/tracer-iteration14b-np1
 ```
 
-The finite integration fixture compares two real runnable logical actors against
+The time-policy callback also has a standalone ABI test, `time_choice_test.cpp`,
+compiled and run by the runner before native/model cases. The finite integration
+fixture has no time plugin/ChoosePoint profile, keeps only normal preset0, and
+compares two real runnable logical actors against
 manual CLI successor sets in full and pages, repeating after alternate-branch
 restores. Its builtin DFS observation is reported separately; C03 actor coverage
 is not closed by the case enumerator.
