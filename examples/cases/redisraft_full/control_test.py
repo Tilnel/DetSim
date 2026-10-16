@@ -99,7 +99,7 @@ class ControllerTest(unittest.TestCase):
         events=[];session.commands=[]
         runner.actor_round(session,events,[""]*4,[])
         self.assertEqual([(e["node"],e["thread"]) for e in events],[(0,0),(0,1),(1,0),(1,1),(2,0),(3,0)])
-        self.assertEqual(session.commands.count("thread"),4)
+        self.assertEqual(session.commands.count("thread"),8)
 
     def test_missing_or_unknown_slot_status_rejected(self):
         for status in ("","unknown","ready"):
@@ -113,19 +113,56 @@ class ControllerTest(unittest.TestCase):
         session.states={(node,slot):"waiting" for node,slots in session.slots.items() for slot in slots}
         return session
 
-    def test_quiescent_finite_wait_uses_one_timeout_then_resumes_normally(self):
+    def test_local_idle_timer_expires_while_peers_remain_runnable(self):
+        session=Session()
+        for slot in session.slots[0]:session.states[(0,slot)]="waiting"
+        session.deadlines[(0,1)]="1.000000000"
+        events=[]
+        runner.actor_round(session,events,[""]*4,[])
+        self.assertTrue(any(event["choice"]==0 and event["node"]==1 for event in events))
+        self.assertEqual([(event["node"],event["thread"]) for event in events if event["choice"]==-2],[(0,1)])
+
+    def test_post_round_peer_wake_prevents_stale_local_timeout(self):
+        class PeerWake(Session):
+            def send(self,command):
+                reply=super().send(command)
+                if command=="si 0" and self.node==1:
+                    self.states[(0,0)]="runnable";self.deadlines.pop((0,0),None)
+                return reply
+        session=PeerWake()
+        for slot in session.slots[0]:session.states[(0,slot)]="waiting"
+        session.deadlines={(0,0):"1.000000000",(0,1):"0.500000000"}
+        events=[]
+        runner.actor_round(session,events,[""]*4,[])
+        self.assertEqual(session.commands.count("thread"),8)
+        self.assertNotIn("si timeout",session.commands)
+        start=len(events);runner.actor_round(session,events,[""]*4,[])
+        self.assertTrue(any(event["node"]==0 and event["thread"]==0 and event["choice"]==0 for event in events[start:]))
+
+    def test_local_idle_node_round_robin_precedes_deadline_order(self):
+        session=Session()
+        for node in (0,2):
+            for slot in session.slots[node]:session.states[(node,slot)]="waiting"
+        session.deadlines={(0,1):"1.000000000",(0,2):"0.500000000",(2,0):"9.000000000"}
+        events=[]
+        runner.actor_round(session,events,[""]*4,[])
+        session.states[(0,2)]="waiting";session.deadlines[(0,2)]="0.500000000"
+        runner.actor_round(session,events,[""]*4,[])
+        self.assertEqual([(event["node"],event["thread"]) for event in events if event["choice"]==-2],[(0,2),(2,0)])
+
+    def test_quiescent_wait_uses_one_timeout_per_round_then_normal_resumes(self):
         session=self.waiting_session()
         session.deadlines={(0,1):"1.000000010",(1,1):"1.000000009",(2,0):"1.000000009"}
         events=[]
         runner.actor_round(session,events,[""]*4,[])
-        self.assertEqual([(e["node"],e["thread"],e["choice"]) for e in events],[(1,1,-2)])
+        self.assertEqual([(e["node"],e["thread"],e["choice"]) for e in events],[(0,1,-2)])
         self.assertEqual(session.commands.count("si timeout"),1)
         self.assertNotIn("si 0",session.commands)
         self.assertTrue(events[0]["executed"])
         self.assertNotEqual(events[0]["predecessor"],events[0]["successor"])
-        runner.actor_round(session,events,[""]*4,[])
-        self.assertEqual(events[-1]["choice"],0)
-        self.assertEqual(session.commands.count("si timeout"),1)
+        start=len(events);runner.actor_round(session,events,[""]*4,[])
+        self.assertEqual(events[start]["choice"],0)
+        self.assertEqual(session.commands.count("si timeout"),2)
 
     def test_runnable_progress_does_not_expire_wait(self):
         session=Session();session.states[(0,1)]="waiting";session.deadlines[(0,1)]="0.000000000"
@@ -241,11 +278,15 @@ class ControllerTest(unittest.TestCase):
 
     def test_before_set_stops_round(self):
         session=Session()
+        for slot in session.slots[0]:session.states[(0,slot)]="waiting"
+        session.deadlines[(0,1)]="1.000000000"
         session.reply='write(1, 0x123"{"v":1,"event":"before_set","key":"alpha"}\\010", 48) = 48'
         events=[];observed=[]
         runner.actor_round(session,events,[""]*4,observed)
         self.assertEqual(observed[-1]["event"],"before_set")
         self.assertEqual(events[-1]["node"],3)
+        self.assertNotIn("si timeout",session.commands)
+        self.assertEqual(session.commands.count("thread"),4)
 
     def test_malformed_thread_listing_rejects(self):
         session=Session();session.slots[1]=[]

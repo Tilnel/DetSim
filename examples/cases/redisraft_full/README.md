@@ -71,10 +71,14 @@ aliases, which never count as distinct successors. Dead and untimed waiting acto
 have no transition candidate. Each candidate gets a private copy of the source's
 Python observations; the restored product monitor remains the property oracle.
 All candidates are checked, including siblings that will be pruned. Exactly one
-continuation prioritizes normal runnable actors, rotates a deterministic cursor
-over `(process, logical slot)` and uses positive preset1 when configured. Only
-when no normal candidate exists does it retain a timeout in actor round-robin
-order. Every legal hold and timeout sibling is still executed and checked; their
+continuation admits normal runnable actors together with finite timeouts on
+processes having no normal candidate. It rotates a deterministic cursor over
+`(process, logical slot)` and uses positive preset1 for a chosen normal actor.
+A waiting worker's timeout is excluded from the retained guide while any actor
+on that same process is runnable. A finite timeout on a locally idle process
+participates even when another process has normal work. Every legal hold and
+timeout sibling is still executed and checked, including nonidle-process workers;
+their
 unretained frontiers are pruned. The guide is independent of variant, fault or
 property, and its exact policy string is validated by matrix acceptance. The selected path
 and every candidate's actual source/action/target are recorded independently of
@@ -145,15 +149,27 @@ with a finite saved absolute deadline additionally shows
 `deadline=SECONDS.NNNNNNNNN`. Missing/unknown state or malformed/noncanonical
 fields fail parsing rather than silently dropping actors.
 
-When a prefix round completes no action, the controller refreshes all lists. If
-there is no runnable actor, it chooses one finite wait by `(saved deadline,
-process index, logical slot)` and issues `si timeout`. Deadlines belong to
-per-process model clocks; numerical ordering is a fixed control policy, not a
-claim of shared global time. Untimed waits are never assigned a deadline. No
-runnable actor and no finite wait fails explicitly. The search instead enumerates
+After every prefix normal round, the controller refreshes all lists. Processes
+with zero runnable actors may each offer finite waits, even while peers keep
+running. At most one timeout is chosen: a transient case-driver cursor rotates
+over eligible process indexes, then the selected process's earliest saved
+deadline and logical slot break ties. Thus a lower-clock idle process cannot
+continually win solely by numerical deadline order. Fresh peer wakeups suppress
+stale timeout choices, and a locally runnable main or worker suppresses every
+timeout on that process. `before_set(alpha)` returns immediately before any
+post-round timeout. Deadlines belong to per-process model clocks; this is an
+explicit case control policy, not a shared-clock or general fairness guarantee.
+Untimed waits are never assigned a deadline. With no eligible local timer, normal
+progress or a fresh runnable actor continues; a closed wait with neither fails.
+The search instead enumerates
 all admitted normal presets and timeout candidates at every expanded source.
 These per-process clock inputs are a disclosed environment policy, not a global
-clock claim or an artificial epoll success.
+clock claim or an artificial epoll success. This local-idle policy supersedes the
+older global-idle prefix rule and normal-only retained guide. Actual prototype
+observations showed long delays while peers continued to make progress, not a
+proven deadlock or a deadline already passed on the waiting process's clock.
+The policy context fingerprint and search guide string identify this revision;
+older global-idle runs remain separate prototypes.
 
 `control-events.json` and search edges distinguish attempts from completed actions.
 Completed actions have `executed=true`, `status=completed` and predecessor/
@@ -163,6 +179,8 @@ attempted actor, reply and `status=error`. A timeout requires the current reply
 `Timeout completed.` and a changed hash; history's `(timeout)` marker never proves
 which action this attempt completed. Client assertion diagnostics fail immediately.
 All model runs retain config/source/binary hashes and process cleanup inventory.
+The shared `examples/cases/run.py` source hash is mandatory and must match the
+native prerequisite, alongside the case-specific runner and plugin inputs.
 
 Local verification commands:
 
@@ -170,7 +188,8 @@ Local verification commands:
 python3 examples/cases/redisraft_full/control_test.py
 python3 examples/cases/redisraft_full/native_result_test.py
 python3 examples/cases/redisraft_full/search_test.py
-python3 tests/guided_search_integration.py --tracer build/case-tools/tracer-iteration14b-np1
+make NP=1 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4
+python3 tests/guided_search_integration.py --tracer ./tracer
 ```
 
 The time-policy callback also has a standalone ABI test, `time_choice_test.cpp`,

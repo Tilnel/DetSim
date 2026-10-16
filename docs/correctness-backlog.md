@@ -898,3 +898,21 @@ pendingIO/persisted full/pages, policy/profile/capture and NP1page/stateIO gates
 pass. Targeted Clang analysis of IO/socket sources reports no diagnostics. These
 component and ptrace results do not establish full RedisRaft business/search
 completion; the fresh NP4 module run is separate evidence.
+
+### Local-idle case timeout guidance
+
+Actual module prototype run-vwsqchuh reached INIT/JOIN3 and the pre-SET search
+root, including real writev1419. It also retained a main epoll deadline1.270s
+while that node's clock stayed1.260s for564listings as peers advanced. This is
+observed scheduling delay/potential starvation, not proven deadlock or an overdue
+wait. The case now permits one timeout on a locally idle process after each
+normal round, node round robin then earliest local deadline. Its search guide
+rotates normals with finite timeouts on locally idle nodes; every finite sibling
+is still executed and checked. Driver cursors remain transient guidance.
+
+43case tests and full/pages finite two-actor manual/enumerator equivalence pass
+(build/guided-search-integration/run-692c1gxd/result.json). Actual-module native
+and model evidence must include the common case driver source hash and the new
+policy; old prototypes do not satisfy that matrix. No core timer delivery or
+general fairness guarantee was added; continuously runnable processes can still
+postpone their timed workers under this retained-path policy.

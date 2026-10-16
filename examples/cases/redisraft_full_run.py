@@ -22,9 +22,10 @@ ROOT=Path(__file__).resolve().parents[2]
 HERE=Path(__file__).resolve().parent / "redisraft_full"
 SOURCE=ROOT / "build/workloads/redisraft-full"
 SERVER=ROOT / "build/workloads/redis-7.4.2/src/redis-server"
+PREFIX_TIMEOUT_POLICY="fresh post-normal eligibility; locally idle node RR; earliest saved deadline then slot within node"
 CLOCK_PROFILE={"id":"cases.redisraft-full.clock-input","syscall":96,"normal_choices":[0,1],
-               "advance_microseconds":10000,"startup_choice":0,"business_choice":1}
-GUIDE_POLICY="normal actors first; RR(node,slot); normal preset1 when configured else0; timeout only without normal; variant/property independent"
+               "advance_microseconds":10000,"startup_choice":0,"business_choice":1,"prefix_timeout_policy":PREFIX_TIMEOUT_POLICY}
+GUIDE_POLICY="RR(node,slot) among normals and finite timeouts on locally idle nodes; normal preset1 when configured else0; all siblings checked; variant/property independent"
 
 
 def time_policy_context(plugin):
@@ -169,7 +170,7 @@ class FullSession(common.Session):
     """Use the existing CLI lifecycle with this case's configured public checker."""
     def __init__(self,tracer,tracees,checker,logs,directory,backend,timeout,time_plugin=None):
         self.directory=directory;directory.mkdir(parents=True)
-        self.owned_pids=set();self.normal_choices=(0,1)
+        self.owned_pids=set();self.normal_choices=(0,1);self.timeout_node_cursor=None
         time_plugin=time_plugin or directory.parent/"time-choice.so"
         self.timeout=timeout;self.started=time.monotonic();self.offset=0;self.commands=[]
         self.log=directory/"transcript.log"
@@ -282,24 +283,30 @@ def thread_actors(session,node):
 
 
 def actor_round(session,events,last,observed):
-    """Run fresh eligible slots; expire one finite wait only without progress."""
+    """Run normal slots, then one timeout on a freshly observed locally idle node."""
     start=len(events)
     for node in range(4):
         for slot,state,_ in thread_actors(session,node):
             if state!="runnable":continue
             control_step(session,node,slot,events,last,observed,choice=max(configured_normal_choices(session)))
             if observed and observed[-1].get("event")=="before_set":return
-    if any(item["executed"] for item in events[start:]):return
-    # Re-read after the attempted round: stepping peers may have changed eligibility.
+    progressed=any(item["executed"] for item in events[start:])
+    # Always re-read after normals: a peer may have made a waiting actor ready.
     current=[(node,slot,state,deadline) for node in range(4)
              for slot,state,deadline in thread_actors(session,node)]
-    if any(state=="runnable" for _,_,state,_ in current):return
+    runnable_nodes={node for node,_,state,_ in current if state=="runnable"}
     candidates=[(deadline,node,slot) for node,slot,state,deadline in current
-                if state=="waiting" and deadline is not None]
-    common.require(candidates,"no runnable actor or finite saved deadline; real request pump cannot progress")
-    deadline,node,slot=min(candidates)
+                if state=="waiting" and deadline is not None and node not in runnable_nodes]
+    if not candidates:
+        common.require(progressed or runnable_nodes,"no runnable actor or finite saved deadline; real request pump cannot progress")
+        return
+    nodes=sorted({node for _,node,_ in candidates})
+    cursor=getattr(session,"timeout_node_cursor",None)
+    node=next((node for node in nodes if cursor is None or node>cursor),nodes[0])
+    deadline,node,slot=min(candidate for candidate in candidates if candidate[1]==node)
     control_step(session,node,slot,events,last,observed,choice=-2)
     events[-1]["deadline"]="%d.%09d"%deadline
+    session.timeout_node_cursor=node
 
 
 def check_search_deadline(deadline):
@@ -423,8 +430,8 @@ def replay_candidate(session,source,driver,candidate,variant,results=None,deadli
 
 
 def select_continuation(candidates,cursor):
-    normal=[candidate for candidate in candidates if candidate["action"][2]>=0]
-    pool=normal or candidates
+    runnable_nodes={candidate["action"][0] for candidate in candidates if candidate["action"][2]>=0}
+    pool=[candidate for candidate in candidates if candidate["action"][2]>=0 or candidate["action"][0] not in runnable_nodes]
     actors=sorted({candidate["action"][:2] for candidate in pool})
     actor=next((actor for actor in actors if cursor is None or actor>cursor),actors[0])
     return max((candidate for candidate in pool if candidate["action"][:2]==actor),key=lambda candidate:candidate["action"][2])
@@ -510,6 +517,8 @@ def matrix_acceptance(rows,variants,backends,native_only=False):
                            all(re.fullmatch(r"[0-9a-f]{64}",policy.get(name,"")) for name in ("plugin_sha256","source_sha256")),
                            "clock input policy missing or different")
             common.require(policy["source_sha256"]==row["sources"].get("time_choice.cpp"),"clock policy source hash differs")
+            common.require(re.fullmatch(r"[0-9a-f]{64}",row["sources"].get("common_runner.py","")),
+                           "common case driver source hash missing")
             if row["backend"]=="native":
                 native_result(row["observations"],row["client_exit"],variant)
                 common.require(row.get("checker_exit")== (0 if variant=="healthy" else 1) and
@@ -603,7 +612,8 @@ def model_control(work,tracer,module,client,checker,variant,backend,timeout,max_
          "tracer_sha256":common.digest(tracer),"module_sha256":common.digest(module),
          "client_sha256":common.digest(client),"checker_sha256":common.digest(checker),"server_sha256":common.digest(SERVER),
          "runner_sha256":common.digest(Path(__file__)),"time_policy":time_policy_context(time_plugin),
-         "sources":{name:common.digest(HERE/name) for name in ("client.c","checker.cpp","checker_test.cpp","time_choice.cpp","time_choice_test.cpp")}}
+         "sources":{name:common.digest(HERE/name) for name in ("client.c","checker.cpp","checker_test.cpp","time_choice.cpp","time_choice_test.cpp")} |
+                   {"common_runner.py":common.digest(Path(common.__file__))}}
     session=None;events=[];observed=[];phase="startup";last=[""]*4
     try:
         session=FullSession(tracer,tracees,checker,logs,directory,backend,timeout,time_plugin)
@@ -701,7 +711,8 @@ def main():
             row=native(work,module,client,variant,args.timeout,checker_test,policy)
             row.update(manifest=str(manifest),client_sha256=common.digest(client),module_sha256=common.digest(module),server_sha256=common.digest(SERVER),
                 checker_sha256=common.digest(checker),checker_test_sha256=common.digest(checker_test),runner_sha256=common.digest(Path(__file__)),
-                sources={name:common.digest(HERE/name) for name in ("client.c","checker.cpp","checker_test.cpp","time_choice.cpp","time_choice_test.cpp")})
+                sources={name:common.digest(HERE/name) for name in ("client.c","checker.cpp","checker_test.cpp","time_choice.cpp","time_choice_test.cpp")} |
+                        {"common_runner.py":common.digest(Path(common.__file__))})
             rows.append(row)
             if not args.native_only:
                 common.require(args.tracer and args.tracer.exists(),"matching immutable NP4 --tracer required")

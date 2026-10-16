@@ -50,12 +50,44 @@ class SearchTest(unittest.TestCase):
         self.assertFalse(result["branching_observed"])
         self.assertEqual(result["duplicate_successor_edges"],1)
 
-    def test_guide_prioritizes_normal_actor_rr_and_positive_preset(self):
-        candidates=[{"action":action} for action in ((0,0,-2),(1,0,0),(1,0,1),(2,0,0),(2,0,1))]
+    def test_guide_excludes_nonidle_worker_timeout_and_prefers_positive_preset(self):
+        candidates=[{"action":action} for action in ((1,1,-2),(1,0,0),(1,0,1),(2,0,0),(2,0,1))]
         self.assertEqual(runner.select_continuation(candidates,None)["action"],(1,0,1))
         self.assertEqual(runner.select_continuation(candidates,(1,0))["action"],(2,0,1))
         timed=[{"action":action} for action in ((0,0,-2),(2,0,-2))]
         self.assertEqual(runner.select_continuation(timed,(0,0))["action"],(2,0,-2))
+
+    def test_guide_admits_locally_idle_timeout_beside_normal_peer(self):
+        candidates=[{"action":action} for action in ((0,0,-2),(1,0,0),(1,0,1),(1,1,-2))]
+        self.assertEqual(runner.select_continuation(candidates,None)["action"],(0,0,-2))
+        self.assertEqual(runner.select_continuation(candidates,(0,0))["action"],(1,0,1))
+        self.assertEqual(runner.select_continuation(candidates,(1,0))["action"],(0,0,-2))
+
+    def test_nonidle_worker_timeout_is_executed_as_sibling_but_not_retained(self):
+        class WithTimeout(GraphSession):
+            def __init__(self):
+                super().__init__()
+                self.graph={(ROOT,0,0,0):("0000000000000001","stepped"),
+                            (ROOT,0,1,-2):("0000000000000002","Timeout completed."),
+                            (ROOT,1,0,-2):("0000000000000003","Timeout completed.")}
+            def send(self,command):
+                if command=="thread":
+                    slots=sorted({slot for state,node,slot,choice in self.graph if state==self.state and node==self.node}) or [0]
+                    reply="Threads in process %d (pid=999):\n"%self.node
+                    for slot in slots:
+                        normal=(self.state,self.node,slot,0) in self.graph
+                        timed=(self.state,self.node,slot,-2) in self.graph
+                        reply+=" [%d] TID %d state=%s%s\n"%(slot,slot+1,"runnable" if normal else "waiting",
+                                                                           " deadline=1.000000000" if timed else "")
+                    return reply
+                if command=="si timeout":
+                    self.state,reply=self.graph[(self.state,self.node,self.slot,-2)];return reply
+                return super().send(command)
+        session=WithTimeout();events=[]
+        candidates=runner.search_layer(session,ROOT,{"observations":[],"client_exit":None},events)
+        self.assertEqual([candidate["action"] for candidate in candidates],[(0,0,0),(0,1,-2),(1,0,-2)])
+        self.assertTrue(all(event["executed"] for event in events))
+        self.assertEqual(runner.select_continuation(candidates,(0,0))["action"],(1,0,-2))
 
     def test_layer_restores_each_candidate_and_isolates_observations(self):
         session=GraphSession();events=[];driver={"observations":[],"client_exit":None}
@@ -265,7 +297,7 @@ class SearchTest(unittest.TestCase):
         for row in rows:
             row.update({name:"0"*64 for name in ("module_sha256","client_sha256","checker_sha256","server_sha256","runner_sha256",
                                                  "config_sha256","tracer_sha256")})
-            row["sources"]={"checker.cpp":"0"*64,"time_choice.cpp":"0"*64}
+            row["sources"]={"checker.cpp":"0"*64,"time_choice.cpp":"0"*64,"common_runner.py":"0"*64}
             row["time_policy"]=copy.deepcopy(runner.CLOCK_PROFILE)|{"plugin_sha256":"0"*64,"source_sha256":"0"*64}
         return rows
 
@@ -280,9 +312,15 @@ class SearchTest(unittest.TestCase):
         for field,value in (("selection","old guide"),("normal_choices",[0])):
             altered=copy.deepcopy(rows);altered[1]["search"][field]=value
             self.assertFalse(runner.matrix_acceptance(altered,("healthy","mutant"),("full","pages"))["passed"])
+        altered=copy.deepcopy(rows);altered[0]["time_policy"].pop("prefix_timeout_policy")
+        self.assertFalse(runner.matrix_acceptance(altered,("healthy","mutant"),("full","pages"))["passed"])
         altered=copy.deepcopy(rows);altered[1]["time_policy"]["plugin_sha256"]="1"*64
         self.assertFalse(runner.matrix_acceptance(altered,("healthy","mutant"),("full","pages"))["passed"])
         altered=copy.deepcopy(rows);altered[1]["module_sha256"]="1"*64
+        self.assertFalse(runner.matrix_acceptance(altered,("healthy","mutant"),("full","pages"))["passed"])
+        altered=copy.deepcopy(rows);altered[0]["sources"].pop("common_runner.py")
+        self.assertFalse(runner.matrix_acceptance(altered,("healthy","mutant"),("full","pages"))["passed"])
+        altered=copy.deepcopy(rows);altered[1]["sources"]["common_runner.py"]="1"*64
         self.assertFalse(runner.matrix_acceptance(altered,("healthy","mutant"),("full","pages"))["passed"])
         altered=copy.deepcopy(rows);altered[1]["search"]["replays"][1]["target"]="wrong"
         self.assertFalse(runner.matrix_acceptance(altered,("healthy","mutant"),("full","pages"))["passed"])
