@@ -935,3 +935,30 @@ after (median); reply hashes match. See build/case-session/benchmark.json and
 verification.json. This is polling-only improvement, not full exploration speedup.
 Real full/pages actor equivalence and the runner's incomplete/missing-tool failure
 gates pass; current binary C/C++/pthread12row cases pass with the final reader.
+
+### Compression output allocation
+
+Actual Go gc full capture includes about1196.71MiB per image,1156.98MiB anonymous
+guards; these bytes still require exact capture. DWARF sampling separates capture
+memset3.77% from IO-worker memset13.33% of CPU samples. The compression workspace
+now uses fresh overwrite-only storage for ZSTD_compressBound capacity, then copies
+only the successful returned frame into a tight vector. Zstd may use spare output
+capacity internally; no published byte depends on preinitialization. Full capture,
+encoded-frame validation, duplicate checks and formats remain unchanged.
+
+15poisoned-allocation comparisons verify complete frame equality against an
+independent zero-filled Zstd reference, raw roundtrip and tight capacity;3empty
+cases make no output allocation. Packed/cache/storage/page/stateIO, full/pages
+capture, identity/plugin/policy and29native scenario gates pass. Clang analysis
+is clean; NP1/3/4 production builds pass. No kernel-model bump is needed for these
+byte-identical codec outputs; each new executable has its own recorded hash.
+
+Three-trial compressor-only medians for1280MiB zeros:1.718→0.574s and2632112→
+1316472KiB peak RSS.128MiB random input:0.278→0.289s with similar peak RSS, so no
+uniform speedup is claimed. Raw/frame hashes match before/after. Evidence:
+build/compression-output-buffer/benchmark.json. Two actual201state Go full runs
+now complete business/exit and3x replay (iteration19-admission-gc-full and
+iteration19-runtime-gc-healthy-full); DFS took515.36/516.18s versus prior881.14/
+878.65s. These initial observations have different concurrent host loads and
+include a driver change; they are not a controlled whole-chain speedup estimate.
+The prior900s replay deadline failures remain recorded; retries declare1800s.

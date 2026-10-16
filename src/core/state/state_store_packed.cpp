@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -404,15 +405,16 @@ StateStorePacked::compress(const std::vector<uint8_t> &data)
     return {};
   if (!context.c)
     fail("allocate compression context");
-  std::vector<uint8_t> result(ZSTD_compressBound(data.size()));
+  const size_t capacity = ZSTD_compressBound(data.size());
+  // Only the successful n-byte output is published; spare capacity need not be initialized.
+  auto result = std::make_unique_for_overwrite<uint8_t[]>(capacity);
   size_t n =
-      ZSTD_compressCCtx(context.c, result.data(), result.size(), data.data(),
+      ZSTD_compressCCtx(context.c, result.get(), capacity, data.data(),
                         data.size(), compression_level_.load());
   if (ZSTD_isError(n))
     fail("compression failed");
-  // Cache budgets count encoded bytes. resize() alone retains compressBound
-  // capacity, letting a tiny compressed frame pin an entire raw snapshot.
-  return std::vector<uint8_t>(result.begin(), result.begin() + n);
+  // Cache budgets count encoded bytes, not the bound-sized workspace.
+  return std::vector<uint8_t>(result.get(), result.get() + n);
 }
 std::vector<uint8_t>
 StateStorePacked::decompress(const std::vector<uint8_t> &data, size_t size)

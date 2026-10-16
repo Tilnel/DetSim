@@ -1,6 +1,10 @@
 #include "ncurses_ui.h"
 #include "state_store_packed.h"
 #include <cerrno>
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <zstd.h>
 #include <fcntl.h>
 #include <filesystem>
 #include <iostream>
@@ -10,6 +14,26 @@
 extern "C" detsim::ui::NCursesUI *get_ncurses_ui() { return nullptr; }
 static bool short_io = false, fail_write = false, fail_sync = false;
 static unsigned sync_count = 0;
+static bool poison_arrays = false;
+static size_t poison_expected_size = 0, poison_hits = 0;
+static uint8_t poison_value = 0;
+extern "C" void* __real__Znam(size_t);
+extern "C" void* __wrap__Znam(size_t size)
+{
+  void* result = __real__Znam(size);
+  if (poison_arrays && size == poison_expected_size) {
+    std::memset(result, poison_value, size);
+    ++poison_hits;
+  }
+  return result;
+}
+struct CompressionArrayPoison {
+  explicit CompressionArrayPoison(size_t bound, uint8_t value) {
+    poison_expected_size = bound; poison_value = value; poison_hits = 0;
+    poison_arrays = true;
+  }
+  ~CompressionArrayPoison() { poison_arrays = false; }
+};
 extern "C" ssize_t __real_write(int, const void *, size_t);
 extern "C" ssize_t __real_pread(int, void *, size_t, off_t);
 extern "C" int __real_fsync(int);
@@ -55,6 +79,61 @@ static void rejects(F f, const char *m)
   }
   require(rejected, m);
 }
+static std::vector<uint8_t> zero_filled_reference(const std::vector<uint8_t>& raw, int level)
+{
+  std::vector<uint8_t> output(ZSTD_compressBound(raw.size()), 0);
+  auto* context = ZSTD_createCCtx();
+  require(context != nullptr, "reference compression context");
+  const size_t written = ZSTD_compressCCtx(context, output.data(), output.size(),
+                                         raw.data(), raw.size(), level);
+  ZSTD_freeCCtx(context);
+  require(!ZSTD_isError(written), "reference compression failed");
+  output.resize(written);
+  return output;
+}
+static void compression_output_ignores_initial_array_contents(StateStorePacked& store, int level)
+{
+  std::vector<uint8_t> random(65537);
+  uint32_t generator = 0x31415926;
+  for (auto& byte : random) {
+    generator ^= generator << 13; generator ^= generator >> 17; generator ^= generator << 5;
+    byte = static_cast<uint8_t>(generator);
+  }
+  std::vector<uint8_t> sparse(1024 * 1024, 0);
+  for (size_t position = 0; position < sparse.size(); position += 4096)
+    sparse[position] = static_cast<uint8_t>(position / 4096);
+  const std::array<std::vector<uint8_t>, 5> inputs{
+      std::vector<uint8_t>{0x7f}, std::vector<uint8_t>{0, 1, 2, 3, 0xff, 4, 0, 5},
+      random, std::vector<uint8_t>(1024 * 1024, 0), sparse};
+  unsigned comparisons = 0;
+  for (const auto& input : inputs) {
+    const auto expected = zero_filled_reference(input, level);
+    for (uint8_t poison : {uint8_t(0), uint8_t(0xa5), uint8_t(0x5a)}) {
+      std::vector<uint8_t> compressed;
+      {
+        CompressionArrayPoison scoped(ZSTD_compressBound(input.size()), poison);
+        compressed = store.compress(input);
+      }
+      require(compressed == expected, "poisoned output differs from complete zero-filled ZSTD reference");
+      require(compressed.capacity() == compressed.size(), "poisoned output retains unaccounted capacity");
+      require(store.decompress(compressed, input.size()) == input, "poisoned output lost raw bytes");
+      require(poison_hits == 1, "compression poison did not hit exactly one bound-sized output array allocation");
+      ++comparisons;
+    }
+  }
+  for (uint8_t poison : {uint8_t(0), uint8_t(0xa5), uint8_t(0x5a)}) {
+    std::vector<uint8_t> empty;
+    {
+      CompressionArrayPoison scoped(ZSTD_compressBound(0), poison);
+      empty = store.compress({});
+    }
+    require(empty.empty() && empty.capacity() == 0 && poison_hits == 0,
+            "empty input allocated or published a compression frame");
+    rejects([&] { store.decompress(empty, 0); }, "empty compressed payload unexpectedly decodes");
+  }
+  std::cout << "compression output PASS: " << comparisons
+            << " exact poisoned-array frame/roundtrip/capacity comparisons; 3 empty-input checks\n";
+}
 static void run_child(const char *self, const std::string &dir)
 {
   pid_t p = fork();
@@ -90,6 +169,7 @@ int main(int argc, char **argv)
   try
   {
     s.init(c);
+    compression_output_ignores_initial_array_contents(s, c.compression_level);
     {
       const std::vector<uint8_t> sparse(8 * 1024 * 1024, 0);
       const auto compressed = s.compress(sparse);
