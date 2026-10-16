@@ -15,14 +15,16 @@ import redisraft_full_run as runner
 class Session:
     def __init__(self):
         self.node=0;self.slot=0;self.commands=[];self.edges=0;self.reply="stepped"
-        self.slots={0:[0,1,2],1:[0,1],2:[0],3:[0]}
+        self.slots={0:[0,1,2],1:[0,1],2:[0],3:[0]};self.states={}
 
     def send(self,command):
         self.commands.append(command)
         if command.startswith("sw "): self.node=int(command.split()[1])
         elif command=="thread":
             return "Threads in process %d (pid=98765):\n"%self.node+"".join(
-                "%s [%d] TID %d %s\n"%("*" if slot==self.slot else " ",slot,100+slot,"(main)" if slot==0 else "")
+                "%s [%d] TID %d %s %s\n"%("*" if slot==self.slot else " ",slot,100+slot,
+                    "state="+self.states.get((self.node,slot),"runnable") if self.states.get((self.node,slot),"runnable") else "",
+                    "(main)" if slot==0 else "")
                 for slot in self.slots[self.node])
         elif command.startswith("thread "):
             self.slot=int(command.split()[1]);return "Switched to thread %d (TID=99999)"%self.slot
@@ -53,6 +55,25 @@ class ControllerTest(unittest.TestCase):
         runner.actor_round(session,events,last,observed)
         self.assertEqual([(e["node"],e["thread"]) for e in events[-8:]],
                          [(0,0),(0,1),(0,2),(1,0),(1,1),(2,0),(2,1),(3,0)])
+
+    def test_waiting_and_exited_skip_then_woken_actor_reappears(self):
+        session=Session();session.states={(0,1):"waiting",(0,2):"exited"}
+        events=[]
+        runner.actor_round(session,events,[""]*4,[])
+        self.assertEqual([(e["node"],e["thread"]) for e in events],[(0,0),(1,0),(1,1),(2,0),(3,0)])
+        self.assertNotIn("thread 1",session.commands[:session.commands.index("sw 1")])
+        session.states[(0,1)]="runnable" # A saved Ready/Retry phase is displayed runnable.
+        events=[];session.commands=[]
+        runner.actor_round(session,events,[""]*4,[])
+        self.assertEqual([(e["node"],e["thread"]) for e in events],[(0,0),(0,1),(1,0),(1,1),(2,0),(3,0)])
+        self.assertEqual(session.commands.count("thread"),4)
+
+    def test_missing_or_unknown_slot_status_rejected(self):
+        for status in ("","unknown","ready"):
+            session=Session();session.states[(0,1)]=status
+            with self.subTest(status=status):
+                with self.assertRaisesRegex(RuntimeError,"thread.*state"):
+                    runner.actor_round(session,[],[""]*4,[])
 
     def test_blocked_attempt_is_not_completed_edge(self):
         session=Session();session.reply="Thread 1 is blocked (pending syscall). Cannot step."

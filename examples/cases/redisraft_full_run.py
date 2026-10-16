@@ -222,17 +222,24 @@ def control_step(session,node,slot,events,last,observed):
 
 
 def actor_round(session,events,last,observed):
-    """Step each current logical slot once; refresh births on the next round."""
+    """Refresh saved eligibility each round; step only current runnable slots."""
     for node in range(4):
         session.send("sw "+str(node))
         reply=session.send("thread")
         common.require(re.search(r"Threads in process "+str(node)+r" \(pid=\d+\):",reply),"thread listing unavailable: "+reply)
-        slots=[int(slot) for slot in re.findall(r"^\s*\*?\s*\[(\d+)\] TID \d+[^\n]*$",reply,re.MULTILINE)]
-        if not slots and "(single-threaded, main thread only)" in reply:
-            slots=[None] # The empty-table main actor has no selectable thread slot.
+        rows=[line for line in reply.splitlines() if re.match(r"\s*\*?\s*\[",line)]
+        actors=[]
+        for line in rows:
+            match=re.fullmatch(r"\s*\*?\s*\[(\d+)\] TID \d+ state=(runnable|waiting|exited)(?: \(main\))?\s*",line)
+            common.require(match,"missing/unknown thread state; matching tracer required: "+line)
+            actors.append((int(match[1]),match[2]))
+        if not actors and "(single-threaded, main thread only) state=runnable" in reply:
+            actors=[(None,"runnable")] # The empty-table main actor has no selectable slot.
         else:
-            common.require(slots and slots==list(range(len(slots))),"invalid logical thread slots: "+reply)
-        for slot in slots:
+            common.require(actors and [slot for slot,_ in actors]==list(range(len(actors))),
+                           "invalid logical thread slots/state; matching tracer required: "+reply)
+        for slot,state in actors:
+            if state!="runnable":continue
             control_step(session,node,slot,events,last,observed)
             if observed and observed[-1].get("event")=="before_set":return
 

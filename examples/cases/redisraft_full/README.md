@@ -75,9 +75,17 @@ python3 examples/cases/redisraft_full_run.py \
 original build manifests. Without it, the runner builds new source copies. The
 controller steps each real server main actor to its ready message. Each membership
 pump round reads each process's public CLI `thread` listing and explicitly selects
-every logical thread slot with `thread N` before `si 0`. The `0` is a syscall
+every runnable logical thread slot with `thread N` before `si 0`. The `0` is a syscall
 choice, not a thread selector; RedisRaft background fsync workers therefore receive
-explicit steps. Newly listed slots participate on the next round. Actor identity
+explicit steps. The CLI labels saved actors `state=runnable`, `state=waiting` or
+`state=exited`: dead actors are exited, live actors with pending phase Waiting
+are waiting, and live actors with no pending call or phase Retry/Ready are runnable.
+This display derives from saved semantic state, never physical host task status.
+The controller requires this updated tracer format and rejects unknown/missing
+states. It skips waiting/exited slots and re-reads every process listing each
+round, so newly born or newly runnable actors participate without stale caching.
+A slot awakened after its process was listed participates on the next round.
+Actor identity
 is process index plus logical slot, never host TID. This fixed fair pump does not
 search the startup sequence, exhaust schedules or synthesize timer expiry. Client
 assertion diagnostics immediately fail the case before following the abort path.

@@ -227,12 +227,16 @@ int cmd_thread(char *args) {
         detsim::ui::ui_printf("Threads in process %d (pid=%d):\n",
                               tracee_idx, ptmc_state.pids[tracee_idx]);
         if (threads.empty()) {
-            detsim::ui::ui_printf("  (single-threaded, main thread only)\n");
+            detsim::ui::ui_printf("  (single-threaded, main thread only) state=runnable\n");
         } else {
             for (size_t i = 0; i < threads.size(); i++) {
                 const char* marker = (i == (size_t)current) ? "*" : " ";
-                detsim::ui::ui_printf("%s [%zu] TID %d %s\n",
-                                      marker, i, threads[i].tid,
+                const auto& thread = threads[i];
+                const char* state = !thread.alive ? "exited" :
+                    thread.pending_syscall && thread.pending_syscall->phase == PendingPhase::Waiting
+                        ? "waiting" : "runnable";
+                detsim::ui::ui_printf("%s [%zu] TID %d state=%s %s\n",
+                                      marker, i, thread.tid, state,
                                       threads[i].is_main ? "(main)" : "");
             }
         }

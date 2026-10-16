@@ -797,3 +797,14 @@ their origin rather than reported as a later unsupported abort syscall. Seven
 controller and three native-acceptance tests pass with independent review.
 Fresh native healthy/mutant passes: build/redisraft-full-cases/run-9dhfb55s.
 No claim of full-module search/replay or automatic timeout support follows.
+
+The first fair-thread control run-9hxo68ym times out before completing INIT,
+with clean shutdown. At one recorded sample1645 of1903 post-startup actor
+attempts merely repeated blocked status. Thread listings now expose saved
+runnable/waiting/exited state; the controller refreshes every round and skips
+only current waiting/exited slots, including newly ready/born slots next round.
+Missing or malformed status fails rather than silently dropping actors. This
+changes presentation/control cost only, not snapshot identity or atom policy.
+Nine controller and three native-acceptance regressions,27actual scenarios
+(including full/pages pending/list/restore3x),make check and NP1/NP4 builds pass;
+independent review approves. Full module acceptance remains pending.

@@ -197,6 +197,49 @@ finally:
                 self.assertIn("exit_group(0)", output)
                 self.assertIn("Complete explore all", output)
 
+    def test_thread_listing_tracks_saved_pending_state(self):
+        source = self.root / "pending_list.c"
+        source.write_text(r"""
+#include <time.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+int main(void) {
+    const struct timespec delay = {0, 1000};
+    if (syscall(SYS_nanosleep, &delay, 0)) return 71;
+    return write(1, "TIMER_DONE\n", 11) != 11;
+}
+""")
+        subprocess.run(shlex.split(os.environ.get("CC", "/usr/bin/gcc")) +
+            ["-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie", str(source),
+             "-o", str(self.root / "probe")], check=True)
+        native = subprocess.run([str(self.root / "probe")], check=True,
+                                stdout=subprocess.PIPE, timeout=5)
+        self.assertEqual(native.stdout, b"TIMER_DONE\n")
+
+        def scenario(send):
+            send("sw 0")
+            self.assertIn("state=runnable", send("thread"))
+            pending = send("si")
+            self.assertIn("<pending:waiting>", pending)
+            history = send("info current")
+            edges = re.findall(r"([0-9a-f]{16}) => ([0-9a-f]{16})", history)
+            self.assertEqual(len(edges), 1)
+            predecessor, successor = edges[0]
+            self.assertIn("state=waiting", send("thread"))
+            self.assertEqual(send("info current"), history)
+            for _ in range(3):
+                self.assertIn("Loaded state", send("load " + predecessor))
+                self.assertIn("state=runnable", send("thread"))
+                self.assertIn("<pending:waiting>", send("si"))
+                self.assertIn("state=waiting", send("thread"))
+                self.assertEqual(re.findall(r"=> ([0-9a-f]{16})", send("info current"))[-1], successor)
+
+        for backend in ("full", "pages"):
+            with self.subTest(backend=backend):
+                code, output = self.run_tracer(scenario, name="pending_list_" + backend,
+                    tracee_args=(), extra_env={"DETSIM_SNAPSHOT_BACKEND": backend})
+                self.assertEqual(code, 0, output)
+
     def test_leaf_namespace_search_and_replay(self):
         source = self.root / "leaf.c"
         source.write_text(r"""
