@@ -503,6 +503,9 @@ def guided_search(session,root,driver,variant,max_depth,wall_seconds):
 
 
 def matrix_acceptance(rows,variants,backends,native_only=False):
+    def digest_ok(value,width=64):
+        return type(value) is str and re.fullmatch(r"[0-9a-f]{%d}"%width,value) is not None
+    source_fields={"client.c","checker.cpp","checker_test.cpp","time_choice.cpp","time_choice_test.cpp","common_runner.py"}
     expected={(variant,"native") for variant in variants}
     if not native_only:expected|={(variant,backend) for variant in variants for backend in backends}
     keys=[(row["variant"],row["backend"]) for row in rows];errors=[]
@@ -510,19 +513,26 @@ def matrix_acceptance(rows,variants,backends,native_only=False):
     for row in rows:
         try:
             variant=row["variant"];expected_status="pass" if variant=="healthy" else "violation"
-            common.require(row.get("status")==expected_status and row.get("cleanup")=="pass" and row.get("NP")==4,
+            common.require(row.get("status")==expected_status and row.get("cleanup")=="pass" and
+                           type(row.get("NP")) is int and row["NP"]==4,
                            "row lacks expected outcome/NP4/cleanup")
+            common.require(all(digest_ok(row.get(name)) for name in
+                           ("module_sha256","client_sha256","checker_sha256","server_sha256","runner_sha256","config_sha256")),
+                           "required code/config hash missing or malformed")
+            common.require(isinstance(row.get("sources"),dict) and set(row["sources"])==source_fields and
+                           all(digest_ok(value) for value in row["sources"].values()),"complete six-source hash set required")
             policy=row["time_policy"]
             common.require(all(policy.get(name)==value for name,value in CLOCK_PROFILE.items()) and
-                           all(re.fullmatch(r"[0-9a-f]{64}",policy.get(name,"")) for name in ("plugin_sha256","source_sha256")),
+                           all(digest_ok(policy.get(name)) for name in ("plugin_sha256","source_sha256")),
                            "clock input policy missing or different")
             common.require(policy["source_sha256"]==row["sources"].get("time_choice.cpp"),"clock policy source hash differs")
-            common.require(re.fullmatch(r"[0-9a-f]{64}",row["sources"].get("common_runner.py","")),
-                           "common case driver source hash missing")
             if row["backend"]=="native":
+                common.require(digest_ok(row.get("checker_test_sha256")) and type(row.get("client_exit")) is int and
+                               type(row.get("checker_exit")) is int,"native checker hash/exit evidence missing")
                 native_result(row["observations"],row["client_exit"],variant)
                 common.require(row.get("checker_exit")== (0 if variant=="healthy" else 1) and
-                               row.get("server_exits")==[0,0,0],"native saved checker verdict/cleanup missing")
+                               row.get("server_exits")==[0,0,0] and all(type(code) is int for code in row["server_exits"]),
+                               "native saved checker verdict/cleanup missing")
                 expected_check="NATIVE_CHECK verdict=0 diagnostic=" if variant=="healthy" else \
                     "NATIVE_CHECK verdict=1 diagnostic=acknowledged local value missing at node 3 key alpha"
                 common.require(row.get("checker_output","").strip()==expected_check,"native checker diagnostic differs")
@@ -530,10 +540,14 @@ def matrix_acceptance(rows,variants,backends,native_only=False):
             prerequisite=next(x for x in rows if x["variant"]==variant and x["backend"]=="native")
             for name in ("module_sha256","client_sha256","checker_sha256","server_sha256","runner_sha256","sources","time_policy"):
                 common.require(name in row and row[name]==prerequisite.get(name),"model/native inputs differ: "+name)
-            for name in ("config_sha256","tracer_sha256"):
-                common.require(re.fullmatch(r"[0-9a-f]{64}",row.get(name,"")),"model hash missing: "+name)
+            common.require(digest_ok(row.get("tracer_sha256")),"model tracer hash missing or malformed")
+            owned=row.get("owned_tracee_pids")
+            common.require(isinstance(owned,list) and len(owned)>=4 and all(type(pid) is int and pid>0 for pid in owned) and
+                           len(set(owned))==len(owned),"model owned process inventory missing or invalid")
+            common.require(isinstance(row.get("remaining_owned_pids"),list) and row["remaining_owned_pids"]==[],
+                           "model cleanup lacks explicit empty remaining process inventory")
             search=row["search"];witness=search["witness"];edges=search["edges"]
-            common.require(row.get("tracer_exit")==0 and search["status"]==expected_status and
+            common.require(type(row.get("tracer_exit")) is int and row["tracer_exit"]==0 and search["status"]==expected_status and
                            search.get("branching_observed") is True and search.get("replay_verified") is True and
                            search.get("beam_width")==1 and search.get("partial_last_layer") is False and
                            search.get("expanded_layers",0)>0 and search.get("attempted_edges")==len(edges),"search evidence incomplete")
@@ -542,7 +556,7 @@ def matrix_acceptance(rows,variants,backends,native_only=False):
             common.require(search.get("selection")==GUIDE_POLICY and search.get("normal_choices")==[0,1],
                            "search guide or normal-choice profile differs")
             prefix=row["observations"];root=search["root"];path=search["path"]
-            common.require(re.fullmatch(r"[0-9a-f]{16}",root) and root==row.get("prefix"),"search root differs from saved prefix")
+            common.require(digest_ok(root,16) and root==row.get("prefix"),"search root differs from saved prefix")
             common.require(prefix and prefix[-1].get("event")=="before_set" and prefix[-1].get("key")=="alpha" and
                            not any(item.get("event")=="ack" for item in prefix) and search["root_observations"]==prefix,
                            "search root lacks pre-SET alpha observations without ACKs")
@@ -554,8 +568,9 @@ def matrix_acceptance(rows,variants,backends,native_only=False):
                            type(search["bounds"]["depth"]) is int and 0<len(path)<=search["bounds"]["depth"],
                            "search path is empty/incomplete or exceeds depth")
             source=root;selected=set();observations=copy.deepcopy(prefix);previous=-1
+            source_histories=[];source_exits=[];client_exit=None
             for layer,step in enumerate(path):
-                common.require(step["source"]==source and re.fullmatch(r"[0-9a-f]{16}",step["target"]),"search path is not contiguous")
+                common.require(step["source"]==source and digest_ok(step["target"],16),"search path is not contiguous")
                 index=step["edge_index"]
                 common.require(type(index) is int and previous<index<len(edges),"invalid path edge index")
                 edge=edges[index];action=step["action"]
@@ -565,7 +580,9 @@ def matrix_acceptance(rows,variants,backends,native_only=False):
                                type(edge["layer"]) is int and edge["layer"]==layer and edge["predecessor"]==source and
                                edge["successor"]==step["target"] and [edge["node"],edge["thread"],edge["choice"]]==action,
                                "path does not reference its actual selected candidate")
-                observations.extend(edge["observations"])
+                source_histories.append(observations[:]);source_exits.append(client_exit)
+                common.require(isinstance(edge["observations"],list),"candidate observations must be a list")
+                observations.extend(edge["observations"]);client_exit=edge["client_exit"]
                 source=step["target"];previous=index;selected.add(index)
             common.require({index for index,edge in enumerate(edges) if edge.get("selected")}==selected,
                            "selected candidate is detached from retained path")
@@ -574,16 +591,37 @@ def matrix_acceptance(rows,variants,backends,native_only=False):
                            observations==witness["driver"]["observations"] and
                            edges[last["edge_index"]]["client_exit"]==witness["driver"]["client_exit"],
                            "witness does not end the rooted path with its actual observations/exit")
-            groups={}
-            for edge in edges:
+            groups={};actions_seen={};outcomes={}
+            for index,edge in enumerate(edges):
                 layer=edge["layer"]
                 common.require(type(layer) is int and 0<=layer<len(path) and
-                               edge["predecessor"]==path[layer]["source"] and re.fullmatch(r"[0-9a-f]{16}",edge["successor"]),
+                               edge["predecessor"]==path[layer]["source"] and digest_ok(edge["successor"],16),
                                "candidate is detached from its expanded path source")
-                if edge.get("executed"):groups.setdefault(layer,set()).add(edge["successor"])
+                action=(edge["node"],edge["thread"],edge["choice"])
+                common.require(all(type(value) is int for value in action) and 0<=action[0]<4 and action[1]>=0 and
+                               action[2] in (0,1,-2),"invalid candidate actor/action")
+                common.require(action not in actions_seen.setdefault(layer,set()),"duplicate candidate actor/action")
+                actions_seen[layer].add(action)
+                common.require(edge.get("executed") is True and edge.get("status")=="completed" and
+                               ("selected" not in edge or type(edge["selected"]) is bool),"candidate did not complete")
+                common.require(edge.get("verdict") in ("pass","violation") and type(edge.get("diagnostic")) is str and
+                               (edge["verdict"]!="pass" or edge["diagnostic"]==""),"candidate verdict/diagnostic missing or invalid")
+                common.require(isinstance(edge["observations"],list) and
+                               all(isinstance(item,dict) for item in edge["observations"]) and
+                               (edge["client_exit"] is None or type(edge["client_exit"]) is int),"candidate driver evidence invalid")
+                if edge["node"]!=3 or edge["choice"]==-2:
+                    common.require(not edge["observations"] and edge["client_exit"]==source_exits[layer],
+                                   "non-client action changed client observations/exit")
+                driver={"observations":source_histories[layer]+edge["observations"],"client_exit":edge["client_exit"]}
+                outcome=model_outcome(driver,variant,edge["verdict"],edge["diagnostic"])
+                common.require("outcome" in edge and edge["outcome"]==outcome,"candidate recorded outcome differs from actual verdict")
+                common.require(outcome is None or layer==len(path)-1,"terminal candidate followed by additional retained layers")
+                outcomes[index]=outcome
+                groups.setdefault(layer,set()).add(edge["successor"])
             common.require(any(len(targets)>=2 for targets in groups.values()),"no expanded source has two distinct successors")
-            verdict="violation" if variant=="mutant" else "pass"
-            common.require(model_outcome(witness["driver"],variant,verdict,witness["diagnostic"])==expected_status,
+            terminal=edges[last["edge_index"]];verdict=terminal["verdict"]
+            common.require(outcomes[last["edge_index"]]==expected_status and terminal["diagnostic"]==witness["diagnostic"] and
+                           model_outcome(witness["driver"],variant,verdict,terminal["diagnostic"])==expected_status,
                            "witness business evidence differs")
             replays=search["replays"]
             common.require(len(replays)==3 and all(replay["source"]==witness["source"] and replay["target"]==witness["target"] and

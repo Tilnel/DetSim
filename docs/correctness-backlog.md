@@ -962,3 +962,21 @@ iteration19-runtime-gc-healthy-full); DFS took515.36/516.18s versus prior881.14/
 878.65s. These initial observations have different concurrent host loads and
 include a driver change; they are not a controlled whole-chain speedup estimate.
 The prior900s replay deadline failures remain recorded; retries declare1800s.
+
+### Offline module evidence validation
+
+Independent critic review reproduced41false-green mutations in the matrix
+validator: ignored unavailable/wrong violation verdicts on candidates, equality
+of missing hashes, and contradictory cleanup inventories. Runtime generation
+already checked these, but submitted final evidence also needs independent
+validation. The validator now reconstructs every sibling from its retained
+source history and checks its actual verdict/diagnostic/outcome, including pruned
+siblings; it binds the terminal edge to witness and3replays. It requires complete
+six-source/code/config fingerprints and valid NP4 ownership with explicitly empty
+remaining inventory.47component tests pass; independent317negative mutations
+have no acceptance escapes. No execution or guidance function changed.
+
+Existing expensive jobs retain their actual older runner fingerprint; final
+audit applies the corrected validator and records its hash separately. A live
+driver's earlier passed label alone is insufficient. This changes evidence
+acceptance, not kernel semantics or any current model trajectory.

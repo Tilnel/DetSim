@@ -135,6 +135,15 @@ candidate edges by index, source/action/target and layer, and terminate at the
 witness. Accumulated path observations and virtual exit must equal its business
 evidence. Detached witnesses, broken paths and missing/late wall evidence fail.
 Missing, duplicate, unexpected or incomplete rows fail acceptance.
+Offline acceptance independently rechecks every candidate's recorded verdict,
+diagnostic and outcome, including pruned siblings, using observation histories
+rebuilt from the retained source path. The actual terminal edge binds the witness
+and all three replays; an earlier terminal sibling cannot precede more layers.
+Required code/config hashes and the complete six-source hash set must be lowercase
+64-hex values. Model rows need at least four unique positive owned PIDs and an
+explicit empty remaining-PID list; a cleanup label alone is insufficient.
+Recorded runner hashes identify the original run inputs, while a later offline
+audit records its updated validator separately.
 The full RedisRaft model matrix remains unverified until those actual runs pass.
 
 The prefix pump reads each process's public CLI `thread` listing afresh every

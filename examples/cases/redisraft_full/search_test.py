@@ -245,12 +245,13 @@ class SearchTest(unittest.TestCase):
         self.assertNotIn("send",vars(session))
         self.assertNotIn("current_hash",vars(session))
 
-    def test_valid_two_layer_path_and_internal_chain_break(self):
+    def two_layer_rows(self):
         rows=self.matrix_rows();search=rows[1]["search"];middle="0000000000000003"
         terminal=search["edges"]
         for edge in terminal:edge["predecessor"]=middle;edge["layer"]=1
         first={"predecessor":ROOT,"successor":middle,"node":0,"thread":0,"choice":0,"executed":True,
-               "selected":True,"status":"completed","layer":0,"observations":[],"client_exit":None}
+               "selected":True,"status":"completed","layer":0,"observations":[],"client_exit":None,
+               "verdict":"pass","diagnostic":"","outcome":None}
         sibling=dict(first,successor="0000000000000009",node=1,selected=False)
         search["edges"]=[first,sibling]+terminal
         search["path"][0]["source"]=middle;search["path"][0]["edge_index"]=2
@@ -258,6 +259,10 @@ class SearchTest(unittest.TestCase):
         search["witness"]["source"]=middle
         for replay in search["replays"]:replay["source"]=middle
         search.update(expanded_layers=2,attempted_edges=4);search["bounds"]["depth"]=2
+        return rows
+
+    def test_valid_two_layer_path_and_internal_chain_break(self):
+        rows=self.two_layer_rows();search=rows[1]["search"]
         self.assertTrue(runner.matrix_acceptance(rows,("healthy","mutant"),("full","pages"))["passed"])
         search["path"][1]["source"]="0000000000000099"
         self.assertFalse(runner.matrix_acceptance(rows,("healthy","mutant"),("full","pages"))["passed"])
@@ -285,21 +290,97 @@ class SearchTest(unittest.TestCase):
                     "path":[{"source":ROOT,"target":witness["target"],"action":[3,0,0],"edge_index":0}],
                     "edges":[{"predecessor":ROOT,"successor":"0000000000000001","node":3,"thread":0,"choice":0,
                               "executed":True,"selected":True,"status":"completed","layer":0,
-                              "observations":observed[len(prefix):],"client_exit":witness["driver"]["client_exit"]},
+                              "observations":observed[len(prefix):],"client_exit":witness["driver"]["client_exit"],
+                              "verdict":status,"diagnostic":diagnostic,"outcome":status},
                              {"predecessor":ROOT,"successor":"0000000000000002","executed":True,"status":"completed","layer":0,
-                              "node":3,"thread":1,"choice":0,"observations":[],"client_exit":None}],
+                              "node":3,"thread":1,"choice":0,"observations":[],"client_exit":None,
+                              "verdict":"pass","diagnostic":"","outcome":None}],
                     "replays":[{"source":ROOT,"target":witness["target"],"action":witness["action"],"diagnostic":diagnostic,
                                 "verdict":status,"observations":observed,"client_exit":witness["driver"]["client_exit"]} for _ in range(3)],
                     "termination":"healthy_completion" if variant=="healthy" else "exact_violation"}
             for backend in ("full","pages"):
                 rows.append({"variant":variant,"backend":backend,"status":status,"cleanup":"pass","NP":4,"tracer_exit":0,
-                             "search":copy.deepcopy(search),"prefix":ROOT,"observations":prefix})
+                             "search":copy.deepcopy(search),"prefix":ROOT,"observations":prefix,
+                             "owned_tracee_pids":[101,102,103,104],"remaining_owned_pids":[]})
         for row in rows:
             row.update({name:"0"*64 for name in ("module_sha256","client_sha256","checker_sha256","server_sha256","runner_sha256",
-                                                 "config_sha256","tracer_sha256")})
-            row["sources"]={"checker.cpp":"0"*64,"time_choice.cpp":"0"*64,"common_runner.py":"0"*64}
+                                                 "config_sha256","tracer_sha256","checker_test_sha256")})
+            row["sources"]={name:"0"*64 for name in ("client.c","checker.cpp","checker_test.cpp","time_choice.cpp",
+                                                       "time_choice_test.cpp","common_runner.py")}
             row["time_policy"]=copy.deepcopy(runner.CLOCK_PROFILE)|{"plugin_sha256":"0"*64,"source_sha256":"0"*64}
         return rows
+
+    def test_every_candidate_requires_its_actual_verdict_and_diagnostic(self):
+        mutations=("missing_verdict","missing_diagnostic","unavailable","wrong_violation","wrong_diagnostic","bad_status","bad_actor",
+                   "bad_choice","bad_executed","duplicate_action","missing_outcome")
+        for index in (0,1):
+            for mutation in mutations:
+                rows=self.matrix_rows();edge=rows[1]["search"]["edges"][index]
+                if mutation=="missing_verdict":edge.pop("verdict")
+                elif mutation=="missing_diagnostic":edge.pop("diagnostic")
+                elif mutation=="unavailable":edge["verdict"]="unavailable"
+                elif mutation=="wrong_violation":edge.update(verdict="violation",diagnostic="another property")
+                elif mutation=="wrong_diagnostic":edge["diagnostic"]="wrong diagnostic"
+                elif mutation=="bad_status":edge["status"]="error"
+                elif mutation=="bad_actor":edge["node"]=True
+                elif mutation=="bad_choice":edge["choice"]=99
+                elif mutation=="bad_executed":edge["executed"]="true"
+                elif mutation=="duplicate_action":edge["thread"]=rows[1]["search"]["edges"][1-index]["thread"]
+                elif mutation=="missing_outcome":edge.pop("outcome")
+                with self.subTest(index=index,mutation=mutation):
+                    self.assertFalse(runner.matrix_acceptance(rows,("healthy","mutant"),("full","pages"))["passed"])
+        rows=self.matrix_rows();rows[4]["search"]["edges"][0].update(verdict="pass",diagnostic="")
+        self.assertFalse(runner.matrix_acceptance(rows,("healthy","mutant"),("full","pages"))["passed"])
+
+    def test_earlier_terminal_sibling_cannot_be_followed_by_another_layer(self):
+        rows=self.two_layer_rows();search=rows[1]["search"];edge=search["edges"][1]
+        edge.update(node=3,verdict="pass",diagnostic="",outcome="pass",client_exit=0,
+                    observations=search["witness"]["driver"]["observations"][len(search["root_observations"]):])
+        result=runner.matrix_acceptance(rows,("healthy","mutant"),("full","pages"))
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("terminal candidate followed" in error for error in result["matrix_errors"]))
+
+    def test_required_code_and_source_hashes_cannot_be_matching_nulls(self):
+        shared=("module_sha256","client_sha256","checker_sha256","server_sha256","runner_sha256")
+        for bad in (None,"","A"*64,"0"*63,True):
+            rows=self.matrix_rows()
+            for row in rows:
+                for name in shared:row[name]=bad
+            with self.subTest(shared=bad):
+                self.assertFalse(runner.matrix_acceptance(rows,("healthy","mutant"),("full","pages"))["passed"])
+        for field in ("client.c","checker.cpp","checker_test.cpp","time_choice_test.cpp"):
+            for bad in (None,"missing"):
+                rows=self.matrix_rows()
+                for row in rows:
+                    if bad=="missing":row["sources"].pop(field)
+                    else:row["sources"][field]=bad
+                with self.subTest(source=field,bad=bad):
+                    self.assertFalse(runner.matrix_acceptance(rows,("healthy","mutant"),("full","pages"))["passed"])
+        for index,fields in ((0,("checker_test_sha256","config_sha256")),(1,("tracer_sha256","config_sha256"))):
+            for field in fields:
+                for bad in (None,"missing","F"*64,"0"*63):
+                    rows=self.matrix_rows()
+                    if bad=="missing":rows[index].pop(field)
+                    else:rows[index][field]=bad
+                    with self.subTest(row=index,field=field,bad=bad):
+                        self.assertFalse(runner.matrix_acceptance(rows,("healthy","mutant"),("full","pages"))["passed"])
+        rows=self.matrix_rows()
+        for row in rows:row["sources"]["extra.cpp"]="0"*64
+        self.assertFalse(runner.matrix_acceptance(rows,("healthy","mutant"),("full","pages"))["passed"])
+
+    def test_model_cleanup_requires_explicit_valid_owned_and_remaining_pids(self):
+        for bad in (None,[],[1,2,3],[1,1,2,3],[0,2,3,4],[-1,2,3,4],[True,2,3,4],"missing"):
+            rows=self.matrix_rows()
+            if bad=="missing":rows[1].pop("owned_tracee_pids")
+            else:rows[1]["owned_tracee_pids"]=bad
+            with self.subTest(owned=bad):
+                self.assertFalse(runner.matrix_acceptance(rows,("healthy","mutant"),("full","pages"))["passed"])
+        for bad in (None,[12345],(),"missing"):
+            rows=self.matrix_rows()
+            if bad=="missing":rows[1].pop("remaining_owned_pids")
+            else:rows[1]["remaining_owned_pids"]=bad
+            with self.subTest(remaining=bad):
+                self.assertFalse(runner.matrix_acceptance(rows,("healthy","mutant"),("full","pages"))["passed"])
 
     def test_missing_duplicate_and_partial_matrix_never_model_complete(self):
         rows=self.matrix_rows()
