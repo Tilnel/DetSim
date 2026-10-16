@@ -735,3 +735,22 @@ operation is absent dump.rdb.tmp.recv cleanup (ENOENT). Following INIT also need
 atomic closed meta.tmp→meta rename. Next leaf namespace slice must preserve inode
 identity, saved allocator and implicit executable/proc references; no fabricated
 unlink success or pathname-based inode recomputation after rename.
+
+### Actual RedisRaft module native baseline
+
+The NP4 case owns three dynamic Redis7.4.2 servers and one real RESP client.
+Its public-ABI monitor reads saved client output and saved open log files, checks
+per-file CRC chains and exact committed command bytes, and retains branch-local
+observations. No module globals or VM-private semantic extraction are required.
+The same protocol-property approach applies to interpreted runtime cases; debug
+symbols are optional for execution and public resource observation. Java remains
+an explicitly deferred, non-green target under the user's cost tradeoff.
+
+Native healthy and seeded node3 skipped-apply pairs pass strict six-cell checks:
+healthy client/checker0/0; mutant42/1, only node3 alpha absent with all applied and
+commit thresholds satisfied. Evidence: build/redisraft-full-cases/run-1di_y4_e.
+Independent review verified hashes, real LF command serialization, parser-negative
+tests and exact unique output cells. The controlled model attempt in
+run-xofb6fg3 still rejects unlink87 before business initialization; all owned
+processes were cleaned up. Model full/pages bounded search and threefold replay
+remain unfinished. Native success does not close any snapshot or schedule gap.
