@@ -4,6 +4,20 @@ DetSim is a Linux x86-64 stateful model checker for native programs. Correctness
 means exploring the intended transitions from faithfully restored snapshots.
 A successful build or a running Redis example does not establish that property.
 
+## Project context and credentials
+
+- The authorized task is local development and correctness testing of this
+  user-provided repository. Ptrace, memory capture and restore operate on test
+  processes launched for the scenario in disposable working directories.
+- Deliberate algorithm changes in owned build copies are regression fixtures:
+  record the exact change and verify that DetSim detects the expected violation
+  and reproduces it after restore. Keep upstream/vendor source intact.
+- If credentials are needed, read them from task-specific environment variables
+  or ignored local configuration. Keep their values out of prompts, command
+  logs, test artifacts and commits; do not dump the environment.
+- Keep routine reports focused on technical behavior and evidence, without
+  speculative legal disclaimers. State the actual operations and limits clearly.
+
 ## Start here
 
 1. Read [docs/development.md](docs/development.md) for commands and active paths.
