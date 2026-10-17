@@ -278,9 +278,10 @@ int append_string(void *context,const void *bytes,size_t size) {
     if(size>max_file*4-text.size()) return -1;
     try { text.append(static_cast<const char*>(bytes),size); return 0; } catch(...) { return -1; }
 }
-std::string read_file(const detsim_host_v2 *host,const detsim_state_view *view,unsigned process,int fd,size_t limit) {
+std::string read_file(const detsim_host_v2 *host,const detsim_state_view *view,unsigned process,int fd,size_t limit,
+                      detsim_buffer_kind kind=DETSIM_BUFFER_FILE) {
     need(host->read_buffer,"saved file reader unavailable"); std::string data(limit+1,'\0');size_t copied=0;
-    const detsim_buffer_selector selected{DETSIM_BUFFER_FILE,fd,0,0,0};
+    const detsim_buffer_selector selected{kind,fd,0,0,0};
     need(!host->read_buffer(view,process,&selected,data.data(),data.size(),&copied),"saved file bytes unavailable");
     need(copied<=limit,"saved file exceeds case bound");data.resize(copied);return data;
 }
@@ -288,7 +289,7 @@ void inspect(const detsim_host_v2 *host,const detsim_state_view *view,Json &stat
     need(host->process_count && host->process_count(view)==4 && host->inspect_json,"full module case requires NP4 saved views");
     need(host->configuration,"module checker configuration unavailable"); auto config=Json::parse(host->configuration);
     need(config.at("logs").is_array() && config["logs"].size()==3,"three explicit log paths required");
-    consume(state,read_file(host,view,3,1,max_output)); std::array<Log,3> logs;
+    consume(state,read_file(host,view,3,1,max_output,DETSIM_BUFFER_STDIO)); std::array<Log,3> logs;
     for(unsigned node=0;node<3;node++) {
         std::string metadata; need(!host->inspect_json(view,node,{&metadata,append_string}),"saved open-file metadata unavailable");
         auto files=Json::parse(metadata).at("open_files");need(files.is_array(),"invalid saved open-file metadata");

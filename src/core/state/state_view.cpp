@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstring>
 #include <iterator>
+#include <sys/stat.h>
 namespace detsim {
 StateView::StateView(const sys_state& state) {
   store_generation_=StateStore::instance().snapshot_generation();
@@ -212,7 +213,6 @@ size_t StateView::read_buffer(size_t node, detsim_buffer_kind kind, int fd,
     uint64_t item, uint64_t message, uint64_t offset, void* destination, size_t length) const {
   if (length && !destination) throw std::invalid_argument("Null buffer destination");
   const auto& state=metadata(node);
-  const auto type=state.fd_manager_state.get_fd_type(fd);
   auto check=[](bool valid) { if (!valid) throw std::runtime_error("Unavailable resource buffer selector"); };
   auto copy=[&](const auto& source)->size_t {
     check(offset<=source.size());
@@ -220,6 +220,17 @@ size_t StateView::read_buffer(size_t node, detsim_buffer_kind kind, int fd,
     if (count) std::copy_n(std::next(source.begin(),size_t(offset)),count,static_cast<char*>(destination));
     return count;
   };
+  if (kind==DETSIM_BUFFER_STDIO) {
+    check(fd>=0 && fd<=2 && !item && !message);
+    // These unnameable VFS nodes persist independently of descriptor lifetime.
+    std::string path(1,'\0'); path+="stdio"+std::to_string(fd);
+    const auto data=state.fs_state.filesystem.find(path);
+    check(data!=state.fs_state.filesystem.end());
+    check(S_ISCHR(data->second.metadata.st_mode) && data->second.metadata.st_size>=0 &&
+          static_cast<uint64_t>(data->second.metadata.st_size)==data->second.content.size());
+    return copy(data->second.content);
+  }
+  const auto type=state.fd_manager_state.get_fd_type(fd);
   if (kind==DETSIM_BUFFER_FILE) {
     check(!item && !message && (type==FdType::FILE || type==FdType::STDIO));
     const auto file=state.fs_state.open_files.find(fd); check(file!=state.fs_state.open_files.end());

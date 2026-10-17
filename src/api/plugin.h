@@ -44,11 +44,15 @@ typedef struct detsim_event_v2 {
   uint32_t result_valid;
 } detsim_event_v2;
 /* Read-only payload selectors. item is an endpoint key for TCP_PENDING and zero
- * otherwise; message indexes a TCP chunk/UDP datagram, zero for FILE/PIPE.
- * offset may equal the selected buffer size (EOF), but may not exceed it. */
+ * otherwise; message indexes a TCP chunk/UDP datagram, zero for FILE/PIPE/STDIO.
+ * offset may equal the selected buffer size (EOF), but may not exceed it.
+ * STDIO selects original captured channel fd=0/1/2, independently of its current
+ * descriptor (including close, redirection or virtual exit); item/message are zero.
+ * FILE continues to select an existing open descriptor. Missing/invalid saved
+ * channel data is unavailable, never an assumed empty stream. */
 typedef enum detsim_buffer_kind {
   DETSIM_BUFFER_FILE = 1, DETSIM_BUFFER_PIPE = 2, DETSIM_BUFFER_TCP = 3,
-  DETSIM_BUFFER_UDP = 4, DETSIM_BUFFER_TCP_PENDING = 5
+  DETSIM_BUFFER_UDP = 4, DETSIM_BUFFER_TCP_PENDING = 5, DETSIM_BUFFER_STDIO = 6
 } detsim_buffer_kind;
 typedef struct detsim_buffer_selector {
   uint32_t kind;

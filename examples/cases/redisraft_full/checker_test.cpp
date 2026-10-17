@@ -7,6 +7,7 @@ struct detsim_state_view {
     std::string output;
     std::array<std::string,3> logs;
     bool readable=true;
+    bool output_open=true;
 };
 namespace {
 size_t count(const detsim_state_view*) { return 4; }
@@ -16,10 +17,11 @@ int metadata(const detsim_state_view *view,uint32_t process,detsim_writer writer
     return writer.append(writer.context,text.data(),text.size());
 }
 int saved(const detsim_state_view *view,uint32_t process,const detsim_buffer_selector *selection,void *out,size_t size,size_t *copied) {
-    if(!view->readable || selection->kind!=DETSIM_BUFFER_FILE || selection->offset)return -1;
+    if(!view->readable || selection->offset || selection->item || selection->message)return -1;
     const std::string *text=nullptr;
-    if(process==3 && selection->fd==1)text=&view->output;
-    else if(process<3 && selection->fd==100+static_cast<int>(process))text=&view->logs[process];
+    if(process==3 && selection->fd==1 &&
+       (selection->kind==DETSIM_BUFFER_STDIO || (selection->kind==DETSIM_BUFFER_FILE && view->output_open)))text=&view->output;
+    else if(selection->kind==DETSIM_BUFFER_FILE && process<3 && selection->fd==100+static_cast<int>(process))text=&view->logs[process];
     if(!text)return -1;
     *copied=std::min(size,text->size()); std::memcpy(out,text->data(),*copied);return 0;
 }
@@ -79,6 +81,19 @@ int main(int argc,char **argv) {
         expect(good.logs[0]!=good.logs[1],"node-specific CRC fixture missing");
         Buffer monitor;expect(init(&host,&good,"{}",monitor.writer(),diagnostic)==DETSIM_PASS,"healthy public saved projection failed");
         for(unsigned i=0;i<3;i++) {Buffer next;expect(advance(&host,&good,&good,nullptr,monitor.view(),next.writer(),diagnostic)==DETSIM_PASS && next.bytes==monitor.bytes,"canonical monitor replay failed");}
+        auto terminal=good;terminal.output_open=false;
+        const detsim_buffer_selector closed_file{DETSIM_BUFFER_FILE,1,0,0,0};
+        char byte{};size_t copied=0;
+        expect(saved(&terminal,3,&closed_file,&byte,1,&copied)!=0,"closed FILE selector incorrectly readable");
+        detsim_event_v2 exited{};exited.process=3;exited.syscall_number=SYS_exit_group;
+        exited.phase=DETSIM_THREAD_EXITED;exited.args[0]=0;
+        Buffer completed;
+        expect(advance(&host,&good,&terminal,&exited,monitor.view(),completed.writer(),diagnostic)==DETSIM_PASS,
+               "healthy virtual exit loses saved stdout after fd1 closes");
+        auto unavailable_host=host;unavailable_host.read_buffer=nullptr;
+        Buffer unavailable;
+        expect(advance(&unavailable_host,&good,&terminal,&exited,monitor.view(),unavailable.writer(),diagnostic)==DETSIM_UNAVAILABLE,
+               "missing saved stream reader passed at exit");
         auto check=[&](detsim_state_view view,detsim_verdict expected,const char *message) {Buffer ignored;
             expect(init(&host,&view,"{}",ignored.writer(),diagnostic)==expected,message);};
         const std::string set="*3\n$3\nSET\n$5\nalpha\n$2\n17\n";

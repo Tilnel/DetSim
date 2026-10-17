@@ -1106,3 +1106,29 @@ falls back to full saved writes; unexpected exceptions retain the existing dirty
 contract. Six backend/cache mapping oracles, native regressions and a paired
 finite-search benchmark pass; this optimizes restore, not capture, and does not
 close C08 or certify physical-memory observations. See [scope and measurements](page-snapshots.md).
+
+### Captured output after descriptor lifetime (2026-10-17)
+
+A runtime checker regression reproduces the actual-module healthy terminal
+observation defect: virtual exit closes fd1, but the retained stdout VFS node is
+still saved. FILE correctly rejects that closed descriptor; the checker formerly
+treated this as unavailable before checking its exit event. New generic read-only
+DETSIM_BUFFER_STDIO observes the original captured channel independently of fd
+lifetime, while FILE retains open-descriptor semantics. Missing/corrupt channels
+remain errors; ABI2 layout, kernel24 and formats37/38 are unchanged.
+
+NP2 state-view fixtures cold-reopen both layouts and cover all three binary
+channels, close/exit, fd1 replacement, malformed selectors and missing/type/size
+failures. A real ABI2 ptrace scenario fails on old23 and passes on the new NP1
+tracer in full/pages: close and exit read exact bytes, closed FILE rejects, and
+three restored exit edges reproduce the same hash. All30 native scenarios,
+make check, NP1 storage/page/state-I/O, NP2 state-view/plugins, production NP1/NP4
+builds and targeted StateView Clang analysis pass. The optional startup diagnostic
+reuses the public reader and again completes12 sessions/36 checkpoint replays.
+
+Healthy pages22/full23 were explicitly aborted for this confirmed checker bug;
+partial ledgers/stores, cleanup and source versions remain archived/non-green.
+This is not evidence that either module reached its terminal business result.
+Old mutant/pages continues independently; full module acceptance is still open.
+See [current report](technical-report-2026-10-17.md) and
+`build/captured-stdio-{observation,regression}/`. C03/C08/C25 remain open.

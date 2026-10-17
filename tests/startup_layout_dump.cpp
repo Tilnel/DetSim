@@ -1,8 +1,8 @@
 #include "tools/sstate_reader.h"
 #include "core/state/page_snapshot.h"
 #include "core/state/state_store.h"
+#include "core/state/state_view.h"
 #include "proc_status.h"
-#include <sys/stat.h>
 #include <nlohmann/json.hpp>
 #include <array>
 #include <charconv>
@@ -97,28 +97,29 @@ int main(int argc, char** argv) {
         {"prot", region.prot}, {"flags", std::string(region.flags, strnlen(region.flags, sizeof(region.flags)))},
         {"file", name}});
     }
-    // Process exit closes descriptors, but preserves the captured stream node.
-    // Read its saved bytes; absence is an error, never an assumed empty stream.
-    std::string stdout_key(1, '\0');
-    stdout_key += "stdio1";
-    const auto node = tracee.fs_state.filesystem.find(stdout_key);
-    if (node == tracee.fs_state.filesystem.end() || !S_ISCHR(node->second.metadata.st_mode))
-      throw std::runtime_error("saved captured stdout node missing or invalid");
-    const auto description = tracee.fs_state.open_files.find(1);
-    if (tracee.fd_manager_state.is_allocated(1)) {
-      if (tracee.fd_manager_state.get_fd_type(1) != FdType::STDIO ||
-          description == tracee.fs_state.open_files.end() || description->second.path != stdout_key)
-        throw std::runtime_error("saved stdout descriptor does not name captured stream");
-    } else if (!DISEXITED(state->status[0]) || description != tracee.fs_state.open_files.end()) {
-      throw std::runtime_error("saved stdout descriptor absent before process exit");
+    const bool stdout_open=tracee.fd_manager_state.is_allocated(1);
+    const bool stdout_description=tracee.fs_state.open_files.contains(1);
+    if (stdout_open) {
+      const std::string original_stdout=std::string(1,'\0')+"stdio1";
+      if (tracee.fd_manager_state.get_fd_type(1)!=FdType::STDIO || !stdout_description ||
+          tracee.fs_state.open_files.at(1).path!=original_stdout)
+        throw std::runtime_error("fixture stdout descriptor is not an open captured stream");
+    } else if (!DISEXITED(state->status[0]) || stdout_description) {
+      throw std::runtime_error("fixture stdout descriptor absent before process exit");
     }
-    const auto& standard_output = node->second.content;
-    if (node->second.metadata.st_size < 0 ||
-        uint64_t(node->second.metadata.st_size) != standard_output.size())
-      throw std::runtime_error("saved stdout size mismatch");
-    write_bytes(directory / "stdout.bin", standard_output.data(), standard_output.size());
-    summary["stdout_bytes"] = standard_output.size();
-    summary["stdout_descriptor_open"] = tracee.fd_manager_state.is_allocated(1);
+    const detsim::StateView observation(*state);
+    auto standard_output=output(directory / "stdout.bin");
+    uint64_t offset=0;
+    for (;;) {
+      const size_t length=observation.read_buffer(0,DETSIM_BUFFER_STDIO,1,0,0,offset,
+                                                   buffer.data(),buffer.size());
+      if (!length) break;
+      standard_output.write(reinterpret_cast<const char*>(buffer.data()),length);
+      offset+=length;
+    }
+    standard_output.close();
+    summary["stdout_bytes"]=offset;
+    summary["stdout_descriptor_open"]=stdout_open;
     summary["status"] = state->status[0];
     const std::string json = summary.dump(2) + "\n";
     write_bytes(directory / "summary.json", json.data(), json.size());

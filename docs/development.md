@@ -206,13 +206,19 @@ use `read_into` or owned spans, without checking the encoding. `StateView` group
 these readers by logical process for inspection, independently of the UI cursor.
 It also exposes saved clocks and a read-only expression evaluator. `inspect_json`
 returns schema1 logical-thread/register/resource metadata (no physical IDs or bulk
-payloads); `read_buffer` reads file, pipe, TCP, UDP and pre-accept buffers without
+payloads); `read_buffer` reads file, captured stdio, pipe, TCP, UDP and pre-accept buffers without
 consuming data or moving offsets. Pending endpoint selectors are lossless decimal
 strings. Named lifecycle fields avoid importing private status headers. Metadata
 is decoded once per view, with lifecycle/poison checks retained on cached queries.
 Stopped-live register/futex inspection is explicitly unavailable. Missing bytes
 fail; saved readers never fall back to live memory. The explicit `stopped_live()`
 view is reserved for environment callbacks before capture.
+
+`DETSIM_BUFFER_STDIO` selects the original captured channel 0/1/2, including after
+close, redirection, descriptor reuse or virtual process exit. `DETSIM_BUFFER_FILE`
+continues to require an open descriptor and follows its current file. Missing or
+invalid saved channel data fails explicitly; neither selector falls back to live
+output. This read-only ABI2 extension adds no snapshot fields or format change.
 
 Public plugins include only `src/api/plugin.h` and export
 `detsim_plugin_entry_v2`. Build the `.so` explicitly. Loading legacy `check()` or

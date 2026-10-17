@@ -55,6 +55,33 @@
 
 缺陷副本保存在自有构建目录；没有把 workload 特判加入通用调度、状态存储或恢复代码。性质观察通过插件和保存状态进行，不以无法取得语义字段为理由制造成功。
 
+### 后续运行记录：2026-10-17 06:49 UTC 以后
+
+下面第 2 节的 68 行计量仍保持 06:18 UTC 的原始截面，不把新尝试套进旧数字。后续真实 pages22 两组的实际候选执行都出现 `ack alpha=17,index=7` 及 `before_set beta`；这说明已越过旧记录缺失的第一条提交确认，但候选观察不是完整保留路径/终态验收。
+
+随后启动 healthy/full 的 immutable23 重试：worker 3228026、driver 3228027、tracer 3228125，独立输出 `/mnt/k2/detsim-modelcheck/iteration23-healthy-full/run-y4tcscgq`。模型时限 43,200 秒，搜索请求 36,000 秒，depth 6,000，4 GiB tracer 地址空间。只对此输出树按 20 秒采样检查 96 GiB 文件长度阈值，另保留至少 32 GiB 文件系统空闲；这是软阈值，不是硬 quota。监控异常、截断和不完整清理均非绿色。
+
+这次重试已完成自己的 native 前置并进入控制执行，尚无 model 结果；另外两组 pages22 保持原进程运行。最新选中矩阵因此为 **56 已核验、3 重试在途、1 个尚未替换的旧 full 失败**；被替换的 healthy/full19 失败仍保留在 earlier evidence，绝不改成通过。源文件和监督器的实际哈希、预算、PID incarnation/pidfd 约束、12 项监控故障回归见 `build/case-jobs/iteration23-module-healthy-full/`。
+
+### 后续修复记录：2026-10-17 07:11 UTC
+
+发现并通过运行回归复现一项**检查器观察接口缺口**：虚拟进程退出会关闭 fd1，但已捕获 stdout 的 VFS 节点仍在镜像内。旧 module checker 在检查退出事件之前，用 `DETSIM_BUFFER_FILE` 读取 fd1，因描述符已经关闭而返回 unavailable。它不能因此验收正常退出；这不是 RedisRaft 协议反例，也不是镜像丢失输出。组件 RED 见 `build/captured-stdio-regression/checker-red-proof.json`，实际旧 tracer 的公开插件场景也在 close 后读失败，见 `/tmp/detsim-stdio-scenario-red.log`。
+
+新增通用只读 selector `DETSIM_BUFFER_STDIO=6`：选择原始捕获通道 0/1/2，独立于描述符关闭、重用和重定向。FILE 保留当前打开描述符语义；缺失节点、错误类型、负数或不匹配长度、非法 selector 仍明确拒绝，没有缺失即空、live-memory fallback 或 workload 特判。没有新增保存字段、kernel model 或格式变化：ABI2 布局、kernel24、full37/pages38 保持。module checker 只将客户端 stdout 改为 STDIO，Raft 日志继续通过 FILE 读取。
+
+基于这个已复现缺陷，受控结束旧 healthy/pages22 和 healthy/full23，保留全部文件及非绿色结果；不是观察窗口到了就重启。操作验证了 driver/tracer 的 PPID、start-time、pidfd、工作目录及原有 stdin 管道 inode，再发送一次 CLI `q`。两组 tracer 均退出 0、原 owned tracee inventory 为空，driver/result 仍失败，未伪装成通过。mutant/pages22 可能在进程退出前得到预期反例，保持运行。
+
+| 被中止实验 | 已保存搜索量 | 搜索秒 / 已完成动作速率 | 实际 layers | 关闭后的 store 文件长度 |
+| --- | --- | --- | ---: | --- |
+| healthy/pages22 | attempted 11,478；完成 11,477；逐层不同后继合计 7,884、别名 3,593、剪枝 5,996 | 5,310.414 秒 / 2.161 动作/秒 | 1,887，末层未完整 | memory 690,206,396 B；sstate 20,687,930 B |
+| healthy/full23 | 尚在 INIT/JOIN 控制阶段，无 business search ledger | 不提供搜索速率 | 未进入搜索 | memory 11,832,763,784 B；sstate 1,391,242 B |
+
+这里的完成动作数按 ledger 的不同后继加别名核对，最后一个外部中止动作不计入完成；不同后继是逐层合计，不能当全局互异状态。两行阶段和工具版本不同，不能据此计算 full/page 加速比。原始账本、终止原因和尺寸见 `build/captured-stdio-regression/aborted-experiment-stats.json` 及各 job 的 `abort.json`。中止后选中矩阵为 56 已核验、2 已中止非绿色、1 旧 full 失败、1 pages 注错仍在途；下面的 06:18 截面保持原样。
+
+新增真实 ptrace 回归在 full/pages 中各验证：二进制 stdout 精确字节、close 后 FILE 负例、虚拟退出后的插件观察、同一退出边三次恢复重放及相同 hash、owned tracee 清理。全部 30 个原生场景通过。StateView 组件另有真实 full/page 序列化后重开、三个二进制通道、描述符重定向和损坏负例。startup dumper 复用公开 STDIO reader，删除私有内容提取，但保留 fixture 的 fd1→原 stdout 路径校验；错绑通道的运行 RED/GREEN 同样保留。
+
+可选启动诊断用新接口再次完成 12 个会话、36 次 checkpoint 重放、24 个关闭后镜像导出，仍报告跨启动逐字节不确定；没有将其包装成新的兼容性或搜索保证。证据：`build/captured-stdio-observation/startup-diagnostic/run-_jn7jfaf/results.json`。当前改动通过 `make check`、NP1/NP4 production build、NP2 state-view/plugins、NP1 storage/page/state-I/O 及 targeted Clang StateView 分析；这些回归不替代待重跑的完整 RedisRaft 正常业务验收。
+
 ## 2. 实验数据
 
 <!-- CASE_METRICS_START -->

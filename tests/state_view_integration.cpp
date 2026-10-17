@@ -1,6 +1,7 @@
 #include "state/state_view.h"
 #include "state/page_snapshot.h"
 #include "monitor.h"
+#include "proc_status.h"
 #include "dwarf_info.h"
 #include "cereal/archives/binary.hpp"
 #include <sstream>
@@ -18,6 +19,102 @@ extern "C" detsim::ui::NCursesUI* get_ncurses_ui() { return nullptr; }
 static void require(bool b,const char* m) { if(!b) throw std::runtime_error(m); }
 template<class F> static void rejects(F f) { bool b=false; try { f(); } catch(const std::exception&) { b=true; } require(b,"expected rejection"); }
 static_assert(NP >= 2, "State observation fixture needs two logical nodes");
+// Construct saved observations through both real snapshot layouts, without a live tracee.
+static sys_state save_stdio_fixture(const tracee_state& saved, bool pages) {
+ auto& store=StateStore::instance();
+ std::ostringstream encoded; { cereal::BinaryOutputArchive archive(encoded); archive(saved); }
+ const auto text=encoded.str(); const std::vector<uint8_t> metadata(text.begin(),text.end());
+ RegionInfo region{}; region.start=0x1000; region.end=0x2000; region.prot=PROT_READ;
+ memcpy(region.flags,"r--p",5); const std::vector<uint8_t> memory(4096,0); user_regs_struct regs{};
+ std::vector<uint8_t> bytes;
+ if (pages) {
+  const auto page=store.save(memory.data(),memory.size());
+  bytes=encode_page_manifest({region},metadata,"",regs,{{region.start,4096,page}});
+ } else {
+  StateDataHeader header{}; header.magic=0x4453544D; header.version=FLAT_SNAPSHOT_VERSION; header.num_regions=1;
+  header.tstate_offset=sizeof(header)+sizeof(region); header.tstate_size=metadata.size();
+  header.maps_offset=header.tstate_offset+header.tstate_size;
+  region.offset=header.maps_offset; header.regs_offset=region.offset+memory.size();
+  bytes.resize(header.regs_offset+sizeof(regs));
+  memcpy(bytes.data(),&header,sizeof(header)); memcpy(bytes.data()+sizeof(header),&region,sizeof(region));
+  memcpy(bytes.data()+header.tstate_offset,metadata.data(),metadata.size());
+  memcpy(bytes.data()+region.offset,memory.data(),memory.size()); memcpy(bytes.data()+header.regs_offset,&regs,sizeof(regs));
+ }
+ sys_state machine; machine.ts_hash[0]=store.save(bytes.data(),bytes.size()); return machine;
+}
+static void captured_stdio_observation(StateStore& store, const StateStore::Config& config) {
+ static_assert(DETSIM_BUFFER_STDIO==6 && DETSIM_PLUGIN_ABI_V2==2);
+ const auto captured=DETSIM_BUFFER_STDIO;
+ auto cold=[&](const sys_state& machine) {
+  store.wait_for_completion(); store.shutdown(); store.init(config); return detsim::StateView(machine);
+ };
+ for (bool pages:{false,true}) {
+  tracee_state saved;
+  {
+   auto empty_view=cold(save_stdio_fixture(saved,pages)); char untouched='?';
+   for(int channel=0;channel<3;++channel)
+    require(empty_view.read_buffer(0,captured,channel,0,0,0,&untouched,1)==0 && untouched=='?',"existing empty captured stream is valid EOF");
+  }
+  std::array<std::string,3> keys;
+  for(int channel=0;channel<3;++channel) {
+   keys[channel]=saved.fs_state.open_files.at(channel).path;
+   auto& node=saved.fs_state.filesystem.at(keys[channel]);
+   node.content={static_cast<char>('0'+channel),'\0','x'}; node.metadata.st_size=3;
+  }
+  auto machine=save_stdio_fixture(saved,pages);
+  auto view=cold(machine); char result[16];
+  for(int channel=0;channel<3;++channel) {
+   memset(result,'?',sizeof(result));
+   require(view.read_buffer(0,captured,channel,0,0,0,result,sizeof(result))==3 &&
+           result[0]=='0'+channel && result[1]=='\0' && result[2]=='x' && result[3]=='?',"captured channel exact binary bytes");
+   require(view.read_buffer(0,captured,channel,0,0,1,result,1)==1 && result[0]=='\0',"captured channel offset and bound");
+   require(view.read_buffer(0,captured,channel,0,0,3,nullptr,0)==0,"captured channel EOF");
+  }
+  for(int channel:{-1,3,999}) rejects([&]{view.read_buffer(0,captured,channel,0,0,0,result,1);});
+  rejects([&]{view.read_buffer(0,captured,1,1,0,0,result,1);});
+  rejects([&]{view.read_buffer(0,captured,1,0,1,0,result,1);});
+  rejects([&]{view.read_buffer(0,captured,1,0,0,4,result,0);});
+  rejects([&]{view.read_buffer(0,captured,1,0,0,UINT64_MAX,result,1);});
+  rejects([&]{view.read_buffer(0,captured,1,0,0,0,nullptr,1);});
+  rejects([&]{view.read_buffer(NP,captured,1,0,0,0,result,1);});
+  tracee_state closed=saved;
+  auto descriptors=std::make_shared<FdManager>(closed.fd_manager_state); closed.fs_state.set_fd_manager(descriptors);
+  for(int channel=0;channel<3;++channel) require(closed.fs_state.do_close(channel)==0,"close captured descriptor");
+  closed.fd_manager_state=*descriptors;
+  machine=save_stdio_fixture(closed,pages);
+  for(bool exited:{false,true}) {
+   machine.status[0]=exited?dstatus_exit(0):0;
+   auto closed_view=cold(machine);
+   for(int channel=0;channel<3;++channel) {
+    require(closed_view.read_buffer(0,captured,channel,0,0,0,result,sizeof(result))==3 && result[0]=='0'+channel,"captured channel remains after close/exit");
+    rejects([&]{closed_view.read_buffer(0,DETSIM_BUFFER_FILE,channel,0,0,0,result,1);});
+   }
+  }
+  tracee_state redirected=saved;
+  descriptors=std::make_shared<FdManager>(redirected.fd_manager_state); redirected.fs_state.set_fd_manager(descriptors);
+  require(redirected.fs_state.do_close(1)==0,"close stdout before redirection");
+  require(redirected.fs_state.do_open("/replacement",O_CREAT|O_RDWR,0600)==1,"reuse stdout descriptor");
+  require(redirected.fs_state.do_write(1,"replacement",11)==11,"redirected file bytes");
+  redirected.fd_manager_state=*descriptors;
+  auto redirected_view=cold(save_stdio_fixture(redirected,pages));
+  require(redirected_view.read_buffer(0,DETSIM_BUFFER_FILE,1,0,0,0,result,sizeof(result))==11 && std::string(result,11)=="replacement","FILE follows current fd");
+  require(redirected_view.read_buffer(0,captured,1,0,0,0,result,sizeof(result))==3 && result[0]=='1' && result[1]=='\0',"captured channel independent of redirected fd");
+  for(int corruption=0;corruption<4;++corruption) {
+   tracee_state bad=closed;
+   if(corruption==0) bad.fs_state.filesystem.erase(keys[1]);
+   else if(corruption==1) bad.fs_state.filesystem.at(keys[1]).metadata.st_mode=S_IFREG|0600;
+   else bad.fs_state.filesystem.at(keys[1]).metadata.st_size=corruption==2?-1:4;
+   auto bad_view=cold(save_stdio_fixture(bad,pages));
+   memset(result,'?',sizeof(result));
+   rejects([&]{bad_view.read_buffer(0,captured,1,0,0,0,result,sizeof(result));});
+   rejects([&]{bad_view.read_buffer(0,captured,1,0,0,0,nullptr,0);});
+   require(result[0]=='?',"invalid captured channel must not copy fabricated bytes");
+  }
+  sys_state absent; auto absent_view=cold(absent);
+  rejects([&]{absent_view.read_buffer(0,captured,1,0,0,0,result,1);});
+ }
+ puts("PASS captured stdio full/pages cold observation: close/exit, binary bytes, redirection, missing/type/size/selectors");
+}
 int main(int argc, char** argv) {
  require(argc==4,"expected two distinct DWARF binaries and changed-layout fixture");
  char directory[]="/tmp/detsim-view-XXXXXX";
@@ -25,6 +122,7 @@ int main(int argc, char** argv) {
  try {
   StateStore::Config cfg; cfg.packed_storage_path=std::string(directory)+"/packed"; cfg.hot_cache_size=1; cfg.warm_cache_size=1; cfg.prefetch_threads=0;
   auto& store=StateStore::instance(); store.init(cfg);
+  captured_stdio_observation(store,cfg);
   RegionInfo r{}; r.start=0x1000; r.end=0x2000; r.prot=PROT_READ|PROT_WRITE; memcpy(r.flags,"rw-p",5);
   std::vector<uint8_t> bytes(4096); long value=123; memcpy(bytes.data(),&value,sizeof(value));
   auto page=store.save(bytes.data(),bytes.size());

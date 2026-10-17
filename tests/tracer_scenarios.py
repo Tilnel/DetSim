@@ -838,6 +838,85 @@ int main(int argc, char **argv) {
         self.assertIn("has exited with status 0", output)
         self.assertEqual(code, 0, output)
 
+    def test_plugin_reads_captured_stdout_after_close_and_exit(self):
+        source = self.root / "stdio_probe.c"
+        source.write_text(
+            '#include <unistd.h>\n'
+            'int main(void) { const char bytes[]={0,120,(char)255};\n'
+            '  if(write(1,bytes,3)!=3 || close(1)) return 2;\n'
+            '  getpid(); return 0; }\n'
+        )
+        subprocess.run(shlex.split(os.environ.get("CC", "/usr/bin/gcc")) +
+                       ["-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie",
+                        str(source), "-o", str(self.root / "probe")], check=True)
+        plugin_source = self.root / "stdio_plugin.cpp"
+        plugin_source.write_text(r'''
+#include "api/plugin.h"
+#include <cstdio>
+#include <cstring>
+#include <sys/syscall.h>
+namespace {
+detsim_verdict check(const detsim_host_v2* host, const detsim_state_view*,
+    const detsim_state_view* after, const detsim_event_v2* event, detsim_diagnostic diagnostic) {
+  const bool closed=event->syscall_number==SYS_close && event->args[0]==1;
+  const bool exited=event->phase==DETSIM_THREAD_EXITED;
+  if (!closed && !exited) return DETSIM_PASS;
+  const unsigned char expected[]={0,120,255}; unsigned char bytes[4]{}; size_t copied=0;
+  detsim_buffer_selector stream{DETSIM_BUFFER_STDIO,1,0,0,0};
+  bool okay=host->read_buffer &&
+    !host->read_buffer(after,event->process,&stream,bytes,sizeof bytes,&copied) &&
+    copied==sizeof expected && !std::memcmp(bytes,expected,sizeof expected);
+  stream.kind=DETSIM_BUFFER_FILE;
+  okay=okay && host->read_buffer(after,event->process,&stream,bytes,sizeof bytes,&copied)!=0;
+  if (!okay) {
+    if (diagnostic.capacity) std::snprintf(diagnostic.data,diagnostic.capacity,
+        "captured binary stdout unavailable or closed FILE readable");
+    return DETSIM_UNAVAILABLE;
+  }
+  std::fprintf(stderr,"%s\n",exited?"STDIO_EXIT_VERIFIED":"STDIO_CLOSE_VERIFIED");
+  return DETSIM_PASS;
+}
+const detsim_plugin_v2 plugin{DETSIM_PLUGIN_ABI_V2,sizeof(detsim_plugin_v2),
+  "test.captured-stdio",0,nullptr,check,nullptr,nullptr,nullptr,nullptr};
+}
+extern "C" const detsim_plugin_v2* detsim_plugin_entry_v2() { return &plugin; }
+''')
+        plugin = self.root / "stdio.so"
+        subprocess.run(shlex.split(os.environ.get("CXX", "/usr/bin/g++")) +
+                       ["-std=c++20", "-shared", "-fPIC", "-Wall", "-Wextra", "-Werror",
+                        "-I" + str(ROOT / "src"), str(plugin_source), "-o", str(plugin)], check=True)
+
+        def scenario(send):
+            send("sw 0")
+            previous = None
+            for _ in range(20):
+                current = re.findall(r"=> ([0-9a-f]{16})", send("info current"))
+                if current:
+                    previous = current[-1]
+                reply = send("si")
+                self.assertNotIn("DetSim state/execution error", reply)
+                if "STDIO_EXIT_VERIFIED" in reply:
+                    self.assertIsNotNone(previous)
+                    terminal = re.findall(r"=> ([0-9a-f]{16})", send("info current"))[-1]
+                    self.assertIn("has exited with status 0", send("si"))
+                    break
+            else:
+                self.fail("binary stdout fixture did not exit")
+            for _ in range(3):
+                self.assertIn("Loaded state", send("load " + previous))
+                reply = send("si")
+                self.assertIn("STDIO_EXIT_VERIFIED", reply)
+                self.assertIn("has exited with status 0", send("si"))
+                self.assertEqual(re.findall(r"=> ([0-9a-f]{16})", send("info current"))[-1], terminal)
+
+        for backend in ("full", "pages"):
+            code, output = self.run_tracer(scenario, name="stdio_" + backend,
+                plugins=[str(plugin)], extra_env={"DETSIM_SNAPSHOT_BACKEND": backend},
+                verify_failure_cleanup=True)
+            self.assertEqual(code, 0, output)
+            self.assertEqual(output.count("STDIO_CLOSE_VERIFIED"), 1, output)
+            self.assertEqual(output.count("STDIO_EXIT_VERIFIED"), 4, output)
+
     def pending_plugin(self):
         plugin = self.root / "pending.so"
         subprocess.run(shlex.split(os.environ.get("CXX", "/usr/bin/g++")) +
