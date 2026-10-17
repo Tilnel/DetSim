@@ -383,6 +383,26 @@ full 的命令最大 RSS 减少约 192 MiB，pages 基本不变。GNU time 的�
 
 当前在途真实 module 仍使用原 immutable22/24，不能把本优化或合成提速归因给它们。新工具为 immutable25。接下来优先修实际 native CLI 的线程/timeout 后继枚举，使 DFS/BFS 留在 tracer 内；Python 的逐候选往返只是此前 C03 缺口下的临时案例策略，不应成为框架的主要探索流水线。
 
+### 3.6 真实 pages 搜索的 CPU 样本与 native CLI 优先级
+
+07:44 UTC，对仍在运行的 mutant/pages22 的**业务 beam 搜索**补采 driver 与 tracer 两个进程：10 秒、99 Hz task-clock、DWARF，962 个样本，record 没有丢样提示。它使用原有 immutable22 和旧 driver，不包含上面的25优化，也不是 full backend。互斥分类如下：
+
+| 阶段 | 样本 | 所采两个进程 CPU 样本占比 |
+| --- | ---: | ---: |
+| tracer capture | 777 | 80.77% |
+| tracer restore | 90 | 9.36% |
+| tracer 其他 main | 56 | 5.82% |
+| Python controller | 19 | 1.98% |
+| tracer property/monitor | 14 | 1.46% |
+| tracer saved state load | 5 | 0.52% |
+| tracer IO worker | 1 | 0.10% |
+
+另一个5秒 CPU tick 窗口中，同一 incarnation 的 tracer 消耗4.78 CPU秒，driver0.13 CPU秒；不是两者总墙钟耗时的拆分。CPU 样本不计入睡眠及等待，两个窗口也不是同一时刻，不能直接推出每次命令往返的精确成本。结论限于这段 pages 搜索：主要忙 CPU 在捕获，恢复和外部控制也有成本；不能把初始化样本或这个结果代替 full 搜索的 profile。原始 perf、PID/start-time 绑定、分类定义及 tick 数据见 `build/case-jobs/iteration22-module-mutant-pages/search-profile-20261017/`。
+
+程序始终有非 TUI 的 `-n` 和批处理 `-b`。多数小案例已经让 C++ DFS/BFS 完成一次搜索；真实 module 等案例的 Python beam 则逐候选发送 `load/thread/si`，临时绕开 native 搜索未枚举所有线程及 timeout 的缺口。它既不是 TUI 的要求，也不应成为永久架构。后续实际 CLI BFS/DFS 将直接传递保存状态中的 actor/action，Python 保留编译、启动和报告验收；批处理脚本可用 `tracer -n -c config.json -b commands`。当前这项 C03 修复尚在实施，不能先宣称已经覆盖。完整枚举后状态空间可能更大，有限深度和中止仍需如实报告。
+
+路径前缀分工的多 worker 搜索与上述修改是两件事。跨启动 raw hash 不同并不自动禁止按路径分工，但必须先证明相关初始输入及后续决策重放的一致性；目前 loader RDTSC/CPUID 等可观察差异尚未受控，不能随意 mask 成已解决，也不能仅凭几个相同输出推出通用状态等价。
+
 ## 4. 一次转换、捕获与恢复的详细流程
 
 ### 4.1 实际转换入口
