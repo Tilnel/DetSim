@@ -87,6 +87,7 @@ class Session:
             except BrokenPipeError:
                 pass
         deadline = self.started + self.timeout
+        poll_delay = .0001
         while time.monotonic() < deadline:
             with self.log.open("rb") as transcript:
                 transcript.seek(self.offset)
@@ -99,7 +100,8 @@ class Session:
                 return reply
             if self.proc.poll() is not None:
                 raise CaseFailure(reply[-4000:] or f"tracer exited {self.proc.returncode}")
-            time.sleep(.005)
+            time.sleep(poll_delay)
+            poll_delay = min(poll_delay * 2, .005)
         raise TimeoutError(f"command deadline: {text}")
 
     def close(self, timeout=5):

@@ -19,6 +19,7 @@ class Clock:
         self.log = log
         self.chunks = list(chunks)
         self.sleeps = 0
+        self.delays = []
 
     def monotonic(self):
         return self.now
@@ -26,6 +27,7 @@ class Clock:
     def sleep(self, seconds):
         self.now += seconds
         self.sleeps += 1
+        self.delays.append(seconds)
         if self.chunks:
             with self.log.open("ab") as output:
                 output.write(self.chunks.pop(0))
@@ -60,6 +62,18 @@ class SessionFixture(unittest.TestCase):
 
 
 class SessionFunctionalTests(SessionFixture):
+    def test_wait_backoff_starts_short_is_capped_and_preserves_timeout(self):
+        clock = Clock(self.session.log)
+        with mock.patch.object(runner.time, "monotonic", clock.monotonic), \
+             mock.patch.object(runner.time, "sleep", clock.sleep):
+            with self.assertRaisesRegex(TimeoutError, "command deadline: p missing"):
+                self.session.send("p missing")
+        self.assertEqual(clock.delays[:4], [.0001, .0002, .0004, .0008])
+        self.assertTrue(all(0 < delay <= .005 for delay in clock.delays))
+        self.assertIn(.005, clock.delays)
+        self.assertGreaterEqual(clock.now, self.session.timeout)
+        self.assertLess(clock.now, self.session.timeout + .0051)
+
     def test_locale_decoder_and_byte_offsets_preserve_non_utf8_replies(self):
         self.append(b"caf\xe9\r\n(ptmc) ")
         with mock.patch.object(runner.locale, "getpreferredencoding", return_value="latin-1") as encoding:
