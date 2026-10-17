@@ -164,8 +164,12 @@ completes the pending call without executing subsequent guest instructions.
 It rejects untimed waits, Ready/Retry calls and existing I/O readiness. Ordinary
 `si` then resumes user code. The timeout edge retains the original syscall and
 records choice `DETSIM_CHOICE_TIMEOUT` in plugin events and history. This is manual
-control: builtin BFS/DFS/RAND do not enumerate timeout actions or advance time
-automatically. It is not complete exploration of timeout/readiness races.
+control. Actual CLI BFS and iterative DFS also enumerate each eligible finite
+timeout alongside all saved runnable/Ready/Retry logical threads. Each action
+selects its actor after restore and owns its syscall-choice enumeration. This
+does not certify all futex/message outcomes or instruction-level interleavings.
+RAND, the legacy recursive implementation and the unused scheduler path do not
+have this coverage guarantee.
 
 Run the NP=1 and NP=2 gates in separate make invocations. The Redis gate requires
 the existing `examples/redis/redis/src/redis-server`; it downloads nothing and
@@ -196,6 +200,39 @@ writes and non-routable sockets explicitly reject. This does not implement TCP
 backpressure, partial-fault writes or blocked vector calls; retries would need
 saved imported vectors rather than rereading guest memory. `readv` remains
 unsupported. The kernel-model fingerprint is v24; no archive field was added.
+
+## Native search and completion evidence
+
+Use `tracer -n -c config.json -b commands` for non-TUI batch execution; a script
+can contain `dfs 100 --quiet` or `bfs --quiet`, followed by `q`. Exploration runs
+inside the C++ command. Python case helpers prepare workloads, launch the command
+and verify results; the historical full-module beam driver remains a separately
+identified case-side workaround.
+
+BFS and iterative DFS may finish with the UI cursor on another branch. On normal
+return they emit at most one `SEARCH_EXITED` schema1 JSON receipt for an actual
+all-exited successor observed during that search. It contains source/target,
+process, zero-based thread slot, choice/action and all exit codes. It preserves
+the actual incoming edge rather than guessing from the first TSS parent. The
+receipt neither moves current nor asserts exit0 or exhaustive coverage; none is
+published on failure/interruption. Case acceptance loads the reported state and
+replays its explicit incoming actor/action three times. No-terminal bounded
+searches, malformed receipts, nonzero exits and replay errors stay non-green.
+
+Optional focused gates with an already built immutable NP1 tracer:
+
+```sh
+make -f tests/native_search_actors.mk check-native-search-actors NATIVE_SEARCH_TRACER=/absolute/path/to/tracer
+make -f tests/native_search_actors.mk NP=2 check-native-search-policy CC=/usr/bin/gcc CXX=/usr/bin/g++
+python3 tests/case_session_test.py
+```
+
+The finite actor gate verifies actual callbacks from the search response before
+manual reference edges are created. It covers two actors, multiple deadlines,
+choice cardinality and pending completion. It does not use old TSS edges as
+proof of this search. Cross-command `state_set` reuse and hash-only DFS visited
+across different remaining depths are still open; a depth-bounded return is not
+a proof that every state at that depth was covered.
 
 ## Framework and plugin boundary
 

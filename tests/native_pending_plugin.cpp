@@ -31,6 +31,7 @@ detsim_verdict advance(const detsim_host_v2* host,const detsim_state_view* befor
       if(event->result_valid || event->result || b.at("pending_syscall").is_null())
         throw std::runtime_error("blocked event exposed a syscall return");
       ++counts.blocked;
+      std::fprintf(stderr,"PENDING_BLOCKED\n");
     } else if(event->phase==DETSIM_SYSCALL_COMPLETED) {
       if(!event->result_valid || !b.at("pending_syscall").is_null())
         throw std::runtime_error("completion event retained unfinished call");
@@ -39,6 +40,7 @@ detsim_verdict advance(const detsim_host_v2* host,const detsim_state_view* befor
            a.at("registers").at("rip")!=b.at("registers").at("rip"))
           throw std::runtime_error("pending completion executed user instructions");
         ++counts.completed;
+        std::fprintf(stderr,"PENDING_COMPLETED\n");
       }
     } else if(event->phase==DETSIM_EXECUTION_STOPPED) {
       if(event->result_valid || event->result || event->syscall_number!=-1)
@@ -47,8 +49,12 @@ detsim_verdict advance(const detsim_host_v2* host,const detsim_state_view* befor
       if(event->result_valid || event->result || b.at("alive")!=false)
         throw std::runtime_error("thread exit invented a syscall return");
     } else throw std::runtime_error("unknown event phase");
-    if(event->syscall_number==SYS_exit_group && (!counts.blocked || !counts.completed))
-      throw std::runtime_error("fixture never exercised blocking and completion");
+    if(event->syscall_number==SYS_exit_group) {
+      if(event->phase!=DETSIM_THREAD_EXITED || event->args[0]!=0)
+        throw std::runtime_error("pending fixture did not exit successfully");
+      std::fprintf(stderr,"PENDING_EXIT blocked=%llu completed=%llu\n",
+          static_cast<unsigned long long>(counts.blocked),static_cast<unsigned long long>(counts.completed));
+    }
     return out.append(out.context,&counts,sizeof counts)?DETSIM_ERROR:DETSIM_PASS;
   } catch(const std::exception& error) {
     if(diagnostic.capacity)std::snprintf(diagnostic.data,diagnostic.capacity,"%s",error.what());

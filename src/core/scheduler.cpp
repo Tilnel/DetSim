@@ -1,4 +1,5 @@
 #include "scheduler.h"
+#include "api/plugin.h"
 #include "scheduler/scheduler.h"
 #include "debug.h"
 #include "net/emu.h"
@@ -26,6 +27,7 @@
 // 外部声明：get_ncurses_ui 定义在 main.cpp
 extern "C" detsim::ui::NCursesUI *get_ncurses_ui();
 
+#include <array>
 #include <assert.h>
 #include <atomic>
 #include <chrono>
@@ -34,6 +36,7 @@ extern "C" detsim::ui::NCursesUI *get_ncurses_ui();
 #include <cstdlib>
 #include <fcntl.h>
 #include <optional>
+#include <nlohmann/json.hpp>
 #include <random>
 #include <readline/readline.h>
 #include <signal.h>
@@ -553,6 +556,81 @@ static bool model_budget_exhausted()
   return ptmc_state.error_bound <= 0;
 }
 
+// Search UI selection need not end at an exited state. Keep only the first
+// actual incoming edge to an all-exited result, without retaining its snapshot.
+struct SearchExitedReceipt
+{
+  hash_type source;
+  hash_type target;
+  int process;
+  int thread;
+  int choice;
+  TransitionAction action;
+  std::array<int, NP> exit_codes;
+};
+
+static void remember_search_exited(std::optional<SearchExitedReceipt>& receipt,
+                                   hash_type source,const ActorAction& actor,
+                                   const TransitionResult& result)
+{
+  if (receipt || result.code==CKPT_DISCARD || result.property_violation ||
+      result.new_state.property_failed)
+    return;
+  for (int process=0;process<NP;++process)
+    if (!DISEXITED(result.new_state.status[process]))
+      return;
+  SearchExitedReceipt incoming{source,result.new_state.ss_hash,actor.process,
+      actor.thread,actor.action==TransitionAction::Timeout ? DETSIM_CHOICE_TIMEOUT :
+          (ptmc_state.n_choose ? ptmc_state.choose : -1),actor.action,{}};
+  for (int process=0;process<NP;++process)
+    incoming.exit_codes[process]=DEXITSTATUS(result.new_state.status[process]);
+  receipt=incoming;
+}
+
+static void report_search_exited(const std::optional<SearchExitedReceipt>& receipt)
+{
+  if (!receipt || sigint_received)
+    return;
+  char source[17],target[17];
+  snprintf(source,sizeof(source),HASH_FORMAT,receipt->source);
+  snprintf(target,sizeof(target),HASH_FORMAT,receipt->target);
+  const nlohmann::json value={
+      {"schema",1},{"source",source},{"target",target},
+      {"process",receipt->process},{"thread",receipt->thread},
+      {"choice",receipt->choice},
+      {"action",receipt->action==TransitionAction::Timeout ? "timeout" : "normal"},
+      {"exit_codes",receipt->exit_codes}};
+  detsim::ui::ui_printf("SEARCH_EXITED %s\n",value.dump().c_str());
+}
+
+// Discover alternatives separately for every source x logical actor x action.
+// Restoring the source never carries a previous actor's choice cardinality.
+static TransitionResult search_actor_choice(const sys_state& source,const ActorAction& actor,
+                                           int preset,int& cardinality,std::vector<int>& remaining)
+{
+  ptmc_state.n_choose=0;
+  ptmc_state.choose=preset;
+  TransitionResult result;
+  try { result=state_transition(source,actor.process,actor.thread,actor.action); }
+  catch (const ActionRejected& error) {
+    throw std::runtime_error(std::string("Enumerated actor action was rejected: ")+error.what());
+  }
+  if (result.code==CKPT_DISCARD)
+    throw std::runtime_error("Enumerated actor action did not execute");
+  const int discovered=ptmc_state.n_choose;
+  const int selected=ptmc_state.choose;
+  if (discovered<0 || (discovered && (selected<0 || selected>=discovered)))
+    throw std::runtime_error("Invalid syscall choice discovery");
+  if (cardinality<0) {
+    cardinality=discovered;
+    for (int choice=0;choice<discovered;++choice)
+      if (choice!=selected) remaining.push_back(choice);
+  } else if (discovered!=cardinality || !discovered || selected!=preset) {
+    throw std::runtime_error("Syscall choice cardinality/preset changed for the same saved actor action");
+  }
+  return result;
+}
+
 /* auto mode: */
 /**
  * @brief Execute Breadth-First Search (BFS) state space exploration
@@ -572,6 +650,7 @@ static bool model_budget_exhausted()
  */
 int exec_bfs()
 {
+  std::optional<SearchExitedReceipt> exited_receipt;
   ptmc_state.mode = PTMC_STATE::MODE_BFS;
   start_time = gettime();
   srand(time(NULL));
@@ -631,19 +710,14 @@ int exec_bfs()
                 states_searched_this_run);
       break;
     }
-    std::vector<int> indexes;
-    for (int k = 0; k < NP; k++)
-      indexes.push_back(k);
-    shuffle(indexes.begin(), indexes.end(), std::default_random_engine(rand()));
-
-    for (auto &i : indexes)
+    const auto actions=enabled_actor_actions(state_fetched.value());
+    for (const auto& actor:actions)
     {
-    again:
+      int cardinality=-1;
+      std::vector<int> choices;
+      do
+      {
       s = state_fetched.value();
-
-      if (DISDEAD(s.status[i]))
-        continue;
-
       for (int j = 0; j < NP; j++)
         ptmc_state.status[j] = s.status[j];
 
@@ -653,7 +727,9 @@ int exec_bfs()
                    "happen if the state is properly saved.",
                    j);
 
-      TransitionResult result = state_transition(s, i);
+      int preset=0;
+      if (cardinality>=0) { preset=choices.back(); choices.pop_back(); }
+      TransitionResult result=search_actor_choice(s,actor,preset,cardinality,choices);
       poll_status_monitor();
       g_save_time_us += result.save_time.count();
       g_restore_time_us += result.restore_time.count();
@@ -676,6 +752,8 @@ int exec_bfs()
         return 1;
       }
 
+      remember_search_exited(exited_receipt,s.ss_hash,actor,result);
+
       if (result.code != CKPT_DISCARD &&
           !model_budget_exhausted())
       {
@@ -689,16 +767,7 @@ int exec_bfs()
         }
       }
 
-      if (ptmc_state.n_choose)
-      {
-        if (ptmc_state.mode == PTMC_STATE::MODE_BFS)
-        {
-          ptmc_state.choose++;
-          if (ptmc_state.choose < ptmc_state.n_choose)
-            goto again;
-          ptmc_state.choose = 0;
-        }
-      }
+      } while (!choices.empty());
     }
 
     /* Update global statistics for monitor */
@@ -744,6 +813,7 @@ int exec_bfs()
   detsim::ui::ui_printf("Time elapsed: %lfs, speed = %lf states/s\n", time_used,
                         states_searched_this_run / time_used);
   StateStore::instance().print_stats();
+  report_search_exited(exited_receipt);
   return 0;
 }
 
@@ -752,25 +822,14 @@ static int states_new_this_run = 0;
 
 struct DFSFrame
 {
-  hash_type ss_hash;
-  int depth;
-  int i;
-  int state;
+  hash_type ss_hash=0;
+  int depth=0;
+  int state=0;
   std::optional<sys_state> s;
-  std::vector<int> indexes;
-  size_t index_pos;
+  std::vector<ActorAction> actors;
+  size_t actor_pos=0;
   std::vector<int> choices;
-  int n_choose;
-  int choosed;
-  int ptmc_n_choose;
-  int ptmc_choose;
-  struct syscall_info si_arr[NP];
-
-  DFSFrame()
-      : ss_hash(0), depth(0), i(0), state(0), index_pos(0), n_choose(-1),
-        choosed(0), ptmc_n_choose(0), ptmc_choose(-1)
-  {
-  }
+  int cardinality=-1;
 };
 
 /**
@@ -924,7 +983,8 @@ int do_dfs(hash_type ss_hash, int depth)
   return 0;
 }
 
-int do_dfs_iterative(hash_type initial_ss_hash, int initial_depth)
+int do_dfs_iterative(hash_type initial_ss_hash, int initial_depth,
+                     std::optional<SearchExitedReceipt>& exited_receipt)
 {
   std::vector<DFSFrame> stack;
   stack.reserve(1024);
@@ -932,9 +992,8 @@ int do_dfs_iterative(hash_type initial_ss_hash, int initial_depth)
   DFSFrame root;
   root.ss_hash = initial_ss_hash;
   root.depth = initial_depth;
-  root.i = 0;
   root.state = 0;
-  root.index_pos = 0;
+  root.actor_pos = 0;
   stack.push_back(std::move(root));
 
   while (!stack.empty())
@@ -960,59 +1019,29 @@ int do_dfs_iterative(hash_type initial_ss_hash, int initial_depth)
       }
 
       frame.s.emplace(frame.ss_hash);
-      for (int j = 0; j < NP; j++)
-      {
-        ptmc_state.status[j] = frame.s->status[j];
-        frame.indexes.push_back(j);
-        if (frame.s->ts_hash[j] == 0)
-        {
-          LOG_CRIT(
-              "Child state hash is 0 for tracee %d. This should not happen if "
-              "the state is properly saved.",
-              j);
-          print_call_stack();
-        }
-      }
-      shuffle(frame.indexes.begin(), frame.indexes.end(),
-              std::default_random_engine(rand()));
+      frame.actors=enabled_actor_actions(*frame.s);
 
       frame.state = 1;
-      frame.index_pos = 0;
+      frame.actor_pos = 0;
     }
 
     if (frame.state == 1)
     {
-      if (frame.index_pos >= frame.indexes.size())
+      if (frame.actor_pos >= frame.actors.size())
       {
         stack.pop_back();
         continue;
       }
 
-      int i = frame.indexes[frame.index_pos];
-      frame.i = i;
-
-      if (!frame.s)
-        frame.s.emplace(frame.ss_hash);
-      if (DISDEAD(frame.s->status[i]))
-      {
-        frame.index_pos++;
-        continue;
-      }
-
       frame.choices.clear();
-      frame.n_choose = -1;
-      frame.choosed = 0;
-      ptmc_state.n_choose = 0;
-      ptmc_state.choose = -1;
-      frame.ptmc_n_choose = 0;
-      frame.ptmc_choose = -1;
+      frame.cardinality=-1;
 
       frame.state = 2;
     }
 
     if (frame.state == 2)
     {
-      int i = frame.i;
+      const auto actor=frame.actors[frame.actor_pos];
       if (!frame.s)
         frame.s.emplace(frame.ss_hash);
 
@@ -1025,29 +1054,12 @@ int do_dfs_iterative(hash_type initial_ss_hash, int initial_depth)
       g_states_new = states_new_this_run;
       g_queue_size = 0;
 
-      if (frame.choosed)
-      {
-        ptmc_state.n_choose = frame.ptmc_n_choose;
-        ptmc_state.choose = frame.choices.back();
-        frame.choices.pop_back();
-      }
-
-      TransitionResult result = state_transition(*frame.s, i);
+      int preset=-1;
+      if (frame.cardinality>=0) { preset=frame.choices.back(); frame.choices.pop_back(); }
+      TransitionResult result=search_actor_choice(*frame.s,actor,preset,frame.cardinality,frame.choices);
       poll_status_monitor();
       g_save_time_us += result.save_time.count();
       g_restore_time_us += result.restore_time.count();
-
-      frame.ptmc_n_choose = ptmc_state.n_choose;
-
-      if (!frame.choosed && frame.choices.empty() && frame.ptmc_n_choose > 1)
-      {
-        frame.choosed = 1;
-        for (int c = 0; c < ptmc_state.n_choose; c++)
-          if (c != ptmc_state.choose)
-            frame.choices.push_back(c);
-        shuffle(frame.choices.begin(), frame.choices.end(),
-                std::default_random_engine(rand()));
-      }
 
       g_save_count++;
       if (result.property_violation != 0)
@@ -1064,11 +1076,13 @@ int do_dfs_iterative(hash_type initial_ss_hash, int initial_depth)
         return 1;
       }
 
+      remember_search_exited(exited_receipt,frame.ss_hash,actor,result);
+
       if (result.code != CKPT_DISCARD &&
           !model_budget_exhausted())
       {
         LOG_DEBUG("DFS depth %d, tracee %d, choose %d, hash %016lx",
-                  frame.depth, i, ptmc_state.choose, result.new_state.ss_hash);
+                  frame.depth, actor.process, ptmc_state.choose, result.new_state.ss_hash);
 
         if (!frame.choices.empty())
         {
@@ -1076,16 +1090,15 @@ int do_dfs_iterative(hash_type initial_ss_hash, int initial_depth)
         }
         else
         {
-          frame.index_pos++;
+          frame.actor_pos++;
           frame.state = 1;
         }
 
         DFSFrame new_frame;
         new_frame.ss_hash = result.new_state.ss_hash;
         new_frame.depth = frame.depth - 1;
-        new_frame.i = 0;
         new_frame.state = 0;
-        new_frame.index_pos = 0;
+        new_frame.actor_pos = 0;
         // Ancestors need only their identity and pending search choices while
         // descendants run. Reopen persisted state when backtracking needs it.
         frame.s.reset();
@@ -1095,7 +1108,7 @@ int do_dfs_iterative(hash_type initial_ss_hash, int initial_depth)
 
       if (frame.choices.empty())
       {
-        frame.index_pos++;
+        frame.actor_pos++;
         frame.state = 1;
       }
     }
@@ -1130,7 +1143,7 @@ int do_dfs_iterative(hash_type initial_ss_hash, int initial_depth)
 
       if (frame.choices.empty())
       {
-        frame.index_pos++;
+        frame.actor_pos++;
         frame.state = 1;
       }
       else
@@ -1162,7 +1175,8 @@ int exec_dfs(int depth)
   StateStore::instance().queue_clear();
   start_time = gettime();
 
-  const int stopped = do_dfs_iterative(ptmc_state.running_state.ss_hash, depth);
+  std::optional<SearchExitedReceipt> exited_receipt;
+  const int stopped = do_dfs_iterative(ptmc_state.running_state.ss_hash, depth,exited_receipt);
   if (stopped) {
     stop_status_monitor();
     return stopped;
@@ -1195,6 +1209,7 @@ int exec_dfs(int depth)
     experiment->report();
   if (page_capture_enabled()) report_page_capture_stats();
   detsim::page_restore::report();
+  report_search_exited(exited_receipt);
 
   return 0;
 }

@@ -403,6 +403,20 @@ full 的命令最大 RSS 减少约 192 MiB，pages 基本不变。GNU time 的�
 
 路径前缀分工的多 worker 搜索与上述修改是两件事。跨启动 raw hash 不同并不自动禁止按路径分工，但必须先证明相关初始输入及后续决策重放的一致性；目前 loader RDTSC/CPUID 等可观察差异尚未受控，不能随意 mask 成已解决，也不能仅凭几个相同输出推出通用状态等价。
 
+### 3.7 收尾验证：实际 native CLI 的 actor、timeout 与搜索结果
+
+工具26/26b已把受支持的动作接入**实际 CLI BFS 和迭代 DFS**，不再需要 Python 为它们逐候选发命令。纯保存状态枚举器产生每个活的 runnable/Ready/Retry 线程，以及每个通过保存资源 readiness 检查的有限 Waiting timeout；不是只选 main 或全局最早 deadline。执行时 restore 之后再显式选择 actor，各 source×actor×action 分别发现和重试 syscall choices，并检查基数不漂移。DFS 下潜仍释放祖先资源图，只保留 hash 和标量动作。
+
+旧工具25与新工具26使用相同 fixture ELF／观察插件的 matched negative 有8行旧工具 runtime RED；最终26b **28行全绿**（7种情况×full/pages×DFS/BFS），有980条实际搜索 callback、76条根动作、228次对应的同源恢复重放。情况包括两 runnable actor、三选择输入、仅非main有限 timeout、waker与timeout、两个deadline、choice后接timeout、choice后接Ready完成。BFS还核对真实退出 callback、exit0、完整输出及预期终态投影集合；不是只看已有历史边。独立的纯policy门检查保存资源 readiness、无文件/状态库副作用与坏图拒绝。证据：`build/native-search-actors-26b/run-5yn2bjja/results.json`。
+
+同时修正了验收 helper 的错误假设：DFS 最后 current 不一定是完成状态。真实 healthy pthread 的旧验收曾返回 bounded，但已关闭 journal 在两后端各确有两个 exit0 终态。现在 C++ 搜索正常返回时可以输出一个局部标量 `SEARCH_EXITED` schema1 receipt，记录**本次实际执行的** all-exited 后继及真实 incoming source/process/thread/choice/action、exit codes。它不恢复 UI、不保留 snapshot、不把退出当成功或穷尽，也不在错误、性质失败或 interrupt 时发布。
+
+Python只验收这份搜索结果：严格解析、加载该终点、显式选择真实 actor/action、三次重放并核对 hash。会话/协议测试合计22项，包含非法 receipt、非零退出、错误、重复 receipt、初始无前驱 source 和非main重放。真实额外4行还验证了初始 source 的首步退出，以及 main已退出、仍选中dead main时由worker完成最后退出，均在full/pages下通过三次重放。证据：`build/native-search-exited-receipt/actual/`。
+
+最终26b的8个输入及4个pthread案例全部重新搜索并通过验收；30个原生场景、8次DFS/BFS驻留搜索、NP2 pending/timeout/IO/观察与插件门、NP1/NP4 production build、make check和targeted Clang均通过。三轮robust/TLS/condition大fixture现在明确是有界单路径功能控制门；有限actor fixture单独验证原生搜索集合。pipe门也覆盖合法“不曾等待”的成功路径，同时保持每事件pending/result/RIP检查，未靠剪掉合法actor来保旧测试。
+
+这仍不是完整调度证明：RAND、旧递归搜索和未接入CLI的另一份scheduler未整合；跨命令state_set、DFS仅按hash去重而不区分剩余深度的问题仍开放。完整futex唤醒/消息结果、共享内存指令交织、任意native执行有界性也未解决。格式37/38与kernel24保持，因为本次枚举的是已存在的显式转换，receipt只是宿主搜索报告。当前四组真实module仍运行22/24历史版本；新的控制能力不能追溯归因给那些实验。
+
 ## 4. 一次转换、捕获与恢复的详细流程
 
 ### 4.1 实际转换入口
@@ -636,16 +650,16 @@ custom signal handler 的实际交付仍拒绝；保存 disposition/mask 不代�
 
 | 项目 | 已落实 | 尚未取得的保证 |
 | --- | --- | --- |
-| C03 / actor | API 和 CLI 可指定线程，逻辑线程可恢复 | 默认 BFS/DFS 枚举所有 runnable 线程及 deadline 动作 |
+| C03 / actor | 实际CLI BFS/迭代DFS枚举受支持的保存线程、有限timeout及配置choices | RAND/其他实现整合、跨命令与depth-aware visited、完整结果与指令交织 |
 | C08 / restore 与 identity | 严格 reader、owner binding、恢复次序、cold/故障回归 | 任意 workload、cache policy、跨启动/跨机器的完整语义等价 |
 | C25 / atom | syscall 边界、pending completion、显式 timeout | 任意共享内存指令交织、纯用户循环抢占、任意 native 调用有界 |
 | 信号/运行时 | mask、部分 disposition、注册与显式拒绝 | custom handler frame/sigreturn、完整 Go SIGURG 异步抢占、完整 JVM |
 | 映射 | 支持范围内的内容/权限/匿名重建 | EOF/SIGBUS backing、任意 shared/file-backed 变化与冷重建 |
 | 分布式案例 | 两种库及补充 quorum/repair 的有界反例 | 完整 module 业务终点/反例重放；任意成员变化、crash、compaction |
 
-当前 CLI 的 BFS/DFS 按进程调用 `state_transition(s,i)`，引擎选一个线程，而不是在该层枚举每个线程与 timeout。另一份 `scheduler/exploration.cpp` 先改运行时线程再调用未传 requested_thread 的转换，可能被恢复与 sync 覆盖；它不能证明默认搜索已修复线程枚举。`PTRACE_SYSCALL` 之后直接等待下一 stop，不能自动切开纯用户态共享内存操作。源码：`commands.cpp:359`；`scheduler.cpp:634,656,991,1035`；`exec_engine.cpp:59,135,194`；`scheduler/exploration.cpp:160`。
+06:18截面时，实际CLI只按进程调用转换；后续26b已改为保存状态的actor/action枚举及显式转换，见3.7。另一份 `scheduler/exploration.cpp` 仍先改运行时线程再调用未传requested_thread的转换，未作为本次CLI证据；RAND和旧递归路径也不在新保证内。`PTRACE_SYSCALL` 后等待下一stop仍不能切开纯用户态共享内存操作。DFS的depth-aware去重与跨命令visited也未由这次动作覆盖修复。
 
-优先次序是：完成真实 module 的当前业务搜索并核验原始路径；继续用可执行案例补齐明确的控制/恢复缺口；把线程和 timeout 后继枚举接入实际 CLI 搜索；为将来的报告补统一、定义明确的 guest syscall/有效 choice/最大实际深度计数。任何新计数都应作为宿主统计，不凭方便混入语义 identity。
+本轮已完成实际CLI的动作枚举。尚需完成真实module的业务搜索并核验原始路径，继续补明确的控制/恢复缺口、depth-aware与跨命令搜索问题，以及统一且定义明确的guest syscall/有效choice/最大实际深度计数。任何新计数都应作为宿主统计，不混入语义identity。用户要求暂时收尾后，自主改造暂停；已有有界后台实验保留其预算、监督器和非绿色状态。
 
 ## 10. 复现与证据入口
 
@@ -660,3 +674,24 @@ python3 tests/startup_layout_diagnostic.py --tracer build/case-tools/tracer-iter
 `NP` 必须和目标节点数一致；各自有独立 object 目录，root `tracer` 的重链接仍需串行。在途实验使用不可变 `build/case-tools/tracer-iteration*-np*`，不能原地覆盖。ptrace 场景使用自有临时目录和进程组，不关闭主机 ASLR，不清除已有 snapshot stores。
 
 主要入口：[开发约定](development.md)、[正确性 backlog](correctness-backlog.md)、[page 快照与旧同条件基准](page-snapshots.md)、[Raft benchmark 与 profile](redisraft-benchmark.md)。历史文档中的旧缺口描述不能替代当前源码；本报告把已经修复的状态路径与仍开放的探索覆盖分别列出。
+
+## 11. 收尾后可以成立的 claim
+
+可以使用下面这段定位：
+
+> DetSim 是面向 Linux x86-64 原生二进制的、以系统调用边界为基础的有界模型检验框架原型。在明确支持的运行配置内，它能控制逻辑线程及阻塞/超时动作，保存和恢复进程与虚拟 I/O 状态，执行原生 CLI BFS/DFS、检查用户性质，并验证保存状态上的转换重放。能力已在选定的多语言程序及真实 Raft 库案例中取得可复查证据。
+
+其中每个词都有边界：
+
+| 可以声明的能力 | 本轮及既有证据 | 不能扩张成 |
+| --- | --- | --- |
+| 能直接控制和探索选定原生程序 | C/C++、Rust、CPython、gc Go和gccgo的版本化准入、并发及注错案例 | 完整支持这些语言的全部运行时；JVM已经支持 |
+| 保存/恢复受支持状态，并验证同生命周期重放 | full/pages、线程寄存器/TLS/XSTATE及模型内资源和pending状态；多种cold/失败/隔离/三次重放门 | 任意进程、跨启动或跨机器的完整状态等价；进程已物理死亡后的任意冷重建 |
+| 实际CLI搜索能枚举展开状态里的受支持actor/action | 28行native BFS/DFS、76根动作、228重放、明确的timeout/choice交互 | 完整深度覆盖、完整futex/message结果、指令级共享内存交织、所有搜索实现都已一致 |
+| 能在明确模型和有界案例中检测受控注入缺陷 | overdraft、lost notification、exact-once缺项/重复、Raft quorum/日志修复等反例及重放 | 已经证明目标系统正确；发现了未注入的RedisRaft协议缺陷 |
+| full/pages共用保存观察接口，数据缺失明确失败 | SnapshotView/StateView、通用捕获流、raw metadata缓存及损坏/poison回归 | 每次warm命中都重扫物理磁盘；pages默认使用了脏页追踪 |
+| 特定负载的全链路开销已有实测改善 | 192MiB、前后资源观察的正式配对：full23.25→11.14秒；pages差异很小 | 真实Redis同样加速52%，或所有负载都获益 |
+
+尚不能声明的核心事项是：**通用 Linux 语义的 soundness/completeness、任意 native 程序都可运行、任意状态完整恢复、跨启动路径强一致及可直接跨worker去重、完整Go异步抢占/完整pthread或JVM支持，以及真实RedisRaft完整model-checking验收成功。** 89个接纳syscall路由也只代表各自明确的参数/模型范围，不代表89个Linux调用的全部语义。
+
+截至收尾清点 **2026-10-17 08:41 UTC**，原60行验收矩阵是56行已有版本化核验、4组真实module尝试仍在运行；另8个协议案例与28行native控制门单列，不混入60行。新12行输入/pthread已用26b复验，其余历史结果保留实际执行版本。四组长任务受既定时间/资源预算约束，尚未提供终态，不能计为通过。用户请求暂时收尾后，不再自主开启新改造；已经启动的有界后台实验保留运行和落盘记录，待恢复工作时再验收结果。

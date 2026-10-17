@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Session reply semantics and measured transcript read cost; no tracer needed."""
 import io
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -216,6 +217,131 @@ class SessionReadBoundTests(SessionFixture):
         self.assertGreater(sum(reads), 0, "read instrumentation did not observe transcript bytes")
         self.assertLessEqual(sum(reads), 3 * len(reply.encode()),
                              f"polling consumed {sum(reads)} bytes for {len(reply.encode())}-byte reply; reads={reads}")
+
+
+class CompletedSearchProtocolTests(unittest.TestCase):
+    source, target, other, first_parent = (letter * 16 for letter in "abcd")
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="ds-search-receipt-")
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        self.receipt = {"schema": 1, "source": self.source, "target": self.target,
+                        "process": 0, "thread": 1, "choice": -1,
+                        "action": "normal", "exit_codes": [0]}
+        self.footers = [self.receipt]
+        self.search_error = ""
+        self.replay_error = False
+        self.sessions = []
+
+    def execute(self):
+        owner = self
+        current_hash = runner.Session.current_hash
+
+        class FakeSession:
+            def __init__(self, *_args, **_kwargs):
+                self.commands = []
+                self.state = owner.source
+                self.actor = 0
+                self.log = owner.directory / "transcript.log"
+                self.log.write_text("")
+                owner.sessions.append(self)
+
+            def send(self, text=None):
+                if text is None:
+                    return "(ptmc) "
+                self.commands.append(text)
+                if text.startswith("dfs "):
+                    self.state = owner.other
+                    return ("Complete explore all 7 sys_states (new: 7)\n" +
+                            "".join("SEARCH_EXITED " + json.dumps(item) + "\n" for item in owner.footers) +
+                            owner.search_error + "(ptmc) ")
+                if text == "info current":
+                    if self.state == owner.source:
+                        return "Current state " + owner.source + " (no predecessor).\n(ptmc) "
+                    if self.state == owner.target:
+                        # TSS may retain another first incoming edge. The
+                        # receipt identifies the edge executed by this search.
+                        return (owner.first_parent + " => " + owner.target +
+                                "\n Tracee 0: [TID:2] exit(0)\n(ptmc) ")
+                    return (owner.source + " => " + owner.other +
+                            "\n Tracee 0: [TID:1] futex(0, 0) = 0\n(ptmc) ")
+                if text.startswith("load "):
+                    self.state = text.split()[1]
+                    self.actor = 0  # predecessor's saved selection is main.
+                    return "Loaded state " + self.state + "\n(ptmc) "
+                if text == "sw 0":
+                    return "Switched to process 0 (pid=123)\n(ptmc) "
+                if text.startswith("thread "):
+                    self.actor = int(text.split()[1])
+                    return f"Switched to thread {self.actor} (TID={self.actor + 1}) in process 0\n(ptmc) "
+                if text == "si 0":
+                    if self.state == owner.target:
+                        return "Tracee #0 has exited with status 0.\n(ptmc) "
+                    if self.state != owner.source or self.actor != 1:
+                        raise runner.CaseFailure("completion replay selected wrong source/actor")
+                    self.state = owner.target
+                    if owner.replay_error:
+                        return "DetSim state/execution error: injected failure\n(ptmc) "
+                    return "exit(0) = ?\n(ptmc) "
+                raise AssertionError("unexpected command: " + text)
+
+            def current_hash(self):
+                return current_hash(self)
+
+            def close(self):
+                return 0
+
+        with mock.patch.object(runner, "Session", FakeSession):
+            return runner.search(Path("/unused/tracer"), ["fixture"], "checker",
+                                 self.directory, "full", 10, depth=100)
+
+    def test_receipt_selects_searched_terminal_and_replays_explicit_nonmain_actor(self):
+        result = self.execute()
+        self.assertEqual(result["status"], "pass", result)
+        self.assertEqual(result["predecessor"], self.source)
+        self.assertEqual(result["completion"], self.target)
+        self.assertEqual(result["replay"], "same_process_hash_match_3x")
+        commands = self.sessions[0].commands
+        self.assertIn("load " + self.target, commands)
+        self.assertEqual(commands.count("load " + self.source), 3)
+        self.assertEqual(commands.count("thread 1"), 3)
+        self.assertNotIn("load " + self.first_parent, commands)
+
+    def test_no_receipt_keeps_nonterminal_depth_bound_non_green(self):
+        self.footers = []
+        result = self.execute()
+        self.assertEqual(result["status"], "bounded", result)
+        self.assertIsNone(result["guest_exit"])
+
+    def test_invalid_receipts_fail_without_current_cursor_fallback(self):
+        mutations = [("schema", True), ("schema", 2), ("source", "0" * 16),
+                     ("target", self.source), ("source", "bad"), ("process", True),
+                     ("process", 1), ("thread", -1), ("thread", 64), ("thread", True),
+                     ("choice", -3), ("choice", 1.5), ("choice", True),
+                     ("action", "unknown"), ("action", "timeout"),
+                     ("choice", -2), ("exit_codes", [7]), ("exit_codes", []),
+                     ("exit_codes", [False])]
+        original = dict(self.receipt)
+        for key, value in mutations:
+            with self.subTest(field=key, value=value):
+                changed = dict(original)
+                changed[key] = value
+                self.footers = [changed]
+                result = self.execute()
+                self.assertNotIn(result["status"], ("pass", "violation", "bounded"), result)
+
+    def test_duplicate_receipts_cannot_select_a_successful_alternative(self):
+        bad = dict(self.receipt, exit_codes=[7])
+        self.footers = [bad, self.receipt]
+        self.assertNotIn(self.execute()["status"], ("pass", "violation", "bounded"))
+
+    def test_search_and_replay_execution_errors_remain_non_green(self):
+        self.search_error = "DetSim state/execution error: injected failure\n"
+        self.assertNotEqual(self.execute()["status"], "pass")
+        self.search_error = ""
+        self.replay_error = True
+        self.assertNotEqual(self.execute()["status"], "pass")
 
 
 if __name__ == "__main__":

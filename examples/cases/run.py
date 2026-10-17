@@ -119,8 +119,12 @@ class Session:
         return self.proc.returncode
 
     def current_hash(self):
-        edges = re.findall(r"([0-9a-f]{16}) => ([0-9a-f]{16})", self.send("info current"))
-        return edges[-1][1] if edges else None
+        reply = self.send("info current")
+        edges = re.findall(r"([0-9a-f]{16}) => ([0-9a-f]{16})", reply)
+        if edges:
+            return edges[-1][1]
+        initial = re.search(r"Current state ([0-9a-f]{16}) \(no predecessor\)", reply)
+        return initial[1] if initial else None
 
 
 def classify_error(error, log=None):
@@ -193,6 +197,61 @@ def manual_path(tracer, binary, plugin, directory, backend, bits, expected_bug, 
             row.update(status="failed", diagnostic="tracer cleanup failed")
 
 
+def search_exit_receipt(reply):
+    lines = re.findall(r"(?m)^SEARCH_EXITED ([^\n]+)$", reply)
+    if not lines:
+        return None
+    require(len(lines) == 1, "search returned multiple completion receipts")
+    edge = json.loads(lines[0])
+    require(isinstance(edge, dict) and set(edge) ==
+            {"schema", "source", "target", "process", "thread", "choice", "action", "exit_codes"},
+            "invalid search completion receipt fields")
+    require(type(edge["schema"]) is int and edge["schema"] == 1, "unsupported search receipt schema")
+    for key in ("source", "target"):
+        require(isinstance(edge[key], str) and re.fullmatch(r"[0-9a-f]{16}", edge[key]) and
+                int(edge[key], 16) != 0, "invalid search receipt identity")
+    require(edge["source"] != edge["target"], "completion receipt lacks an actual transition")
+    # This helper starts one process. Other runners own their own NP contracts.
+    require(type(edge["process"]) is int and edge["process"] == 0 and
+            type(edge["thread"]) is int and 0 <= edge["thread"] < 64, "invalid search receipt actor")
+    require(type(edge["choice"]) is int and -2 <= edge["choice"] <= 2147483647 and
+            ((edge["action"] == "normal" and edge["choice"] >= -1) or
+             (edge["action"] == "timeout" and edge["choice"] == -2)), "invalid search receipt action")
+    require(isinstance(edge["exit_codes"], list) and len(edge["exit_codes"]) == 1 and
+            all(type(code) is int and code == 0 for code in edge["exit_codes"]),
+            "searched execution did not exit successfully")
+    return edge
+
+
+def current_search_edge(history):
+    edges = re.findall(r"([0-9a-f]{16}) => ([0-9a-f]{16})", history)
+    actor = re.search(r"(?m)^ Tracee (\d+)(?: \((choose (\d+)|timeout)\))?: "
+                      r"(?:\[TID:(\d+)\] )?([^\n]+)$", history)
+    require(len(edges) == 1 and actor, "search result lacks a saved incoming actor edge")
+    require(int(actor[1]) == 0, "case search requires a single process")
+    require(actor[4] or not actor[5].startswith("<fatal signal"), "fatal-stop actor unavailable")
+    thread = int(actor[4]) - 1 if actor[4] else 0
+    require(0 <= thread < 64, "invalid saved incoming thread")
+    return {"source": edges[0][0], "target": edges[0][1], "process": 0, "thread": thread,
+            "choice": -2 if actor[2] == "timeout" else int(actor[3]) if actor[3] else -1,
+            "action": "timeout" if actor[2] == "timeout" else "normal", "operation": actor[5]}
+
+
+def replay_search_edge(session, edge):
+    require("Loaded state " + edge["source"] in session.send("load " + edge["source"]),
+            "search edge predecessor unavailable")
+    require(session.current_hash() == edge["source"], "search edge predecessor identity mismatch")
+    require("Switched to process " + str(edge["process"]) in session.send("sw " + str(edge["process"])),
+            "search replay process selection failed")
+    require("Switched to thread " + str(edge["thread"]) + " " in session.send("thread " + str(edge["thread"])),
+            "search replay thread selection failed")
+    action = "si timeout" if edge["action"] == "timeout" else "si " + str(max(0, edge["choice"]))
+    reply = session.send(action)
+    require("DetSim state/execution error:" not in reply, reply[-4000:])
+    require(session.current_hash() == edge["target"], "search replay successor identity drift")
+    return reply, action
+
+
 def search(tracer, argv, plugin, directory, backend, timeout, *, bug=False, depth=None, fsmap=(), expected_diagnostic="account overdraft", runtime_profile=None):
     row = {"artifacts": str(directory), "startup": "not_started", "search": "not_started"}
     session = Session(tracer, argv, plugin, directory, backend, timeout, choices=depth is None, fsmap=fsmap, runtime_profile=runtime_profile)
@@ -201,49 +260,53 @@ def search(tracer, argv, plugin, directory, backend, timeout, *, bug=False, dept
         session.send("sw 0")
         row["search"] = "started"
         reply = session.send("bfs --quiet" if depth is None else f"dfs {depth} --quiet")
+        require("DetSim state/execution error:" not in reply, reply[-4000:])
         numbers = re.search(r"(?:all |Searched for )(\d+) sys_states(?: \(new: (\d+)\))?", reply)
         if numbers:
             row["visited"] = int(numbers[1])
             if numbers[2]: row["new"] = int(numbers[2])
         if "Stopped for illegal state" in reply:
             require(bug and expected_diagnostic in session.log.read_text(), "unexpected property violation")
-            edges=re.findall(r"([0-9a-f]{16}) => ([0-9a-f]{16})",session.send("info current"))
-            require(edges,"violation lacks predecessor edge")
-            predecessor,witness=edges[-1]
+            edge = current_search_edge(session.send("info current"))
+            predecessor,witness=edge["source"],edge["target"]
             recipe=list(session.commands)
             for _ in range(3):
-                require("Loaded state" in session.send("load "+predecessor),"search witness predecessor unavailable")
-                require("Reach illegal state" in session.send("si 0"),"search witness failed replay")
-                require(session.current_hash()==witness,"search witness identity drift")
+                replay, action = replay_search_edge(session, edge)
+                require("Reach illegal state" in replay,"search witness failed replay")
             row.update(status="violation",search="violation_found",replay="same_process_hash_match_3x",
                        predecessor=predecessor,witness=witness)
             (directory/"witness.json").write_text(json.dumps({"commands":recipe,"predecessor":predecessor,
-                "successor":witness,"replay_action":"si 0","diagnostic":expected_diagnostic},indent=2))
+                "successor":witness,"replay_action":action,"actor":edge,"diagnostic":expected_diagnostic},indent=2))
         else:
             require("Complete explore all" in reply and not bug, "expected search result absent")
-            history = session.send("info current")
-            operations = re.findall(r"(?m)^ Tracee \d+: (.+)$", history)
-            terminal_candidate = bool(operations and "exit_group(" in operations[-1])
+            receipt = search_exit_receipt(reply)
+            if receipt:
+                require("Loaded state " + receipt["target"] in session.send("load " + receipt["target"]),
+                        "searched completion state unavailable")
+                require(session.current_hash() == receipt["target"], "searched completion identity mismatch")
+                edge = receipt
+                terminal_candidate = True
+                row["completion_receipt"] = receipt
+            else:
+                edge = current_search_edge(session.send("info current"))
+                terminal_candidate = "exit_group(" in edge["operation"]
             if depth is not None and not terminal_candidate:
                 row.update(status="bounded",search="bounded_no_violation",guest_exit=None)
             else:
                 terminal = session.send("si 0")
                 require("has exited with status 0" in terminal,"search finished but guest success not established")
-                edges = re.findall(r"([0-9a-f]{16}) => ([0-9a-f]{16})", history)
-                require(edges, "checked completion lacks predecessor edge")
-                predecessor, successor = edges[-1]
+                predecessor, successor = edge["source"], edge["target"]
                 recipe = list(session.commands)
                 for _ in range(3):
-                    require("Loaded state" in session.send("load " + predecessor), "completion predecessor unavailable")
-                    replay = session.send("si 0")
-                    require("Reach illegal state" not in replay and session.current_hash() == successor,
+                    replay, action = replay_search_edge(session, edge)
+                    require("Reach illegal state" not in replay,
                             "completion replay changed outcome or identity")
                     require("has exited with status 0" in session.send("si 0"), "completion replay did not exit zero")
                 row.update(status="pass",guest_exit=0,replay="same_process_hash_match_3x",
                            predecessor=predecessor,completion=successor,
                            search="finite_fixture_exhausted" if depth is None else "bounded_guest_completed")
                 (directory / "completion.json").write_text(json.dumps({"commands": recipe,
-                    "predecessor": predecessor, "successor": successor, "replay_action": "si 0",
+                    "predecessor": predecessor, "successor": successor, "replay_action": action, "actor": edge,
                     "scope": "same tracee lifecycle; checked output/zero exit preserved"}, indent=2))
         return row
     except Exception as error:

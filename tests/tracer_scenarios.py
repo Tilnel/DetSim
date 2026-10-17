@@ -968,8 +968,12 @@ int main(void) {
             code, output = self.run_tracer("sw 0\nbfs\np counter\nsi\nq\n",
                 name="pipe_"+backend, plugins=[plugin], extra_env={"DETSIM_SNAPSHOT_BACKEND":backend})
             self.assertEqual(code,0,output)
+            self.assertIn("Complete explore all",output)
+            self.assertNotIn("DetSim state/execution error:",output)
             self.assertIn("counter = 3",output)
-            self.assertIn("<pending:waiting>",output)
+            self.assertIn("PENDING_BLOCKED",output)
+            self.assertIn("PENDING_COMPLETED",output)
+            self.assertIn("PENDING_EXIT blocked=0 completed=0",output)
             self.assertIn("has exited with status 0",output)
             self.assertNotIn("Stopped for illegal state",output)
 
@@ -1029,7 +1033,21 @@ int main(void) {
                     owned_tasks = []
                     def scenario(send):
                         send("sw 0")
-                        self.assertIn("Complete explore all", send("bfs"))
+                        # Functional lifecycle control, preserving all three
+                        # robust/TLS births. Exhaustive actor search is covered
+                        # separately by the finite native-search fixtures.
+                        for _ in range(256):
+                            listing = send("thread")
+                            runnable = re.findall(r"\[(\d+)\] TID \d+ state=runnable", listing)
+                            self.assertTrue(runnable, "pthread fixture has no runnable actor: " + listing)
+                            send("thread " + runnable[0])
+                            reply = send("si")
+                            self.assertNotIn("DetSim state/execution error:", reply)
+                            self.assertNotIn("Reach illegal state", reply)
+                            if "exit_group(" in reply:
+                                break
+                        else:
+                            self.fail("pthread lifecycle did not complete within 256 syscall steps")
                         self.assertIn("counter = 4", send("p counter"))
                         self.assertIn("recoveries = 3", send("p recoveries"))
                         self.assertIn("has exited with status 0", send("si"))
@@ -1046,6 +1064,8 @@ int main(void) {
                     code, output = self.run_tracer(scenario, name=name, plugins=[plugin],
                         extra_env={"DETSIM_SNAPSHOT_BACKEND": backend})
                     self.assertEqual(code, 128 + signal.SIGTERM if terminate else 0, output)
+                    self.assertIn("PENDING_BLOCKED", output)
+                    self.assertIn("PENDING_COMPLETED", output)
                     self.assertTrue(owned_tasks)
                     self.assertFalse(any(Path(f"/proc/{tid}").exists() for tid in owned_tasks), output)
 

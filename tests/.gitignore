@@ -151,3 +151,9 @@
 !startup_layout_dump.cpp
 !startup_layout_diagnostic.py
 !startup_layout.mk
+
+!native_search_actors.c
+!native_search_plugin.cpp
+!native_search_actors.py
+!native_search_actors.mk
+!native_search_actors.cpp

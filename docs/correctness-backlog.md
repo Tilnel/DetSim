@@ -10,7 +10,7 @@ relationship to the native-binary model-checking goal.
 | --- | --- | --- | --- |
 | C01 | Fixed (unchanged live thread set) | Futex queues are branch-owned, captured and archived; restore reconstructs blocked state, including same-hash restores. | `check-futex-snapshot` exercises capture/copy/assignment/archive, persisted reload and repeated ptrace restore/wake. Raw lifecycle/carrier restore has separate C02 tests; combined lifecycle and futex waiting still needs wider coverage. |
 | C02 | P0 / partial | Capture preserves virtual slots and creation records; raw clone/exit now restore logical contexts over retained carriers; unexpected physical death or untracked creation rejects. Physical TIDs now stay in transient bindings; explicit liveness and logical parent IDs enter archives. Guest-visible physical IDs in register/memory contents are not normalized. | Create A/B, exit A, create C, repeatedly restore with correct logical identity and TLS/stop phases. `check-thread-lifecycle` now covers that sequence, TLS, persisted replay, main-first exit and actual carrier reuse. TID writeback/clear-tid now have join and replay coverage; ordinary pthread TLS/join/condition and non-PI robust owner-death have scoped coverage; full pthread, PI and rseq critical sections remain unsupported. |
-| C03 | P0 | New BFS sets a selected thread before `state_transition`; recovery and `execute_step` synchronization can overwrite that selection. Two exploration implementations remain compiled; CLI uses the old one. | A two-thread finite program exposes both successor transitions from one snapshot. Trace all callers, compare BFS/DFS results, then consolidate to one path. |
+| C03 | Partial: actual CLI actors fixed | Actual CLI BFS and iterative DFS enumerate saved runnable/Ready/Retry threads and each eligible finite timeout, with explicit post-restore actors and per-action choices. RAND, legacy recursive and unused scheduler paths are not covered; cross-command visited and depth-sensitive deduplication remain separate gaps. | Native actor gate:28 full/pages rows,76 direct root actions,228 same-source replays and actual BFS terminal projections; pure saved-policy/readiness tests and DFS residency pass. Consolidation and complete outcome/atom coverage remain open. |
 | C04 | Partial | Ordered system metadata identity includes status/budget; storage now compares duplicate bytes in cache, packed records and metadata instead of trusting hashes alone. | Identity and all storage gates cover ordering and duplicate conflicts. Logical thread identity and equivalence of differently encoded semantic states remain open. |
 | C05 | Fixed (scoped) | Removed filename heuristics; corrected libelf string-table index in Go-section detection. | Native `test_probe` starts at the same boundary as `probe`; ordinary/Go-section ELF fixtures and two existing gc Go binaries classified correctly. gccgo and actual Go runtime execution remain unverified. |
 | C06 | Fixed (framework boundary) | Removed Raft fields, implicit role pruning, message inference and example parser from the production link. Versioned plugins inspect explicit snapshots; branch-owned opaque monitors enter product identity before successor publication. | `check-state-view`, `check-plugins`, `check-identity` and native counter-plugin restore/violation scenarios cover readonly inspection, ABI failures, history isolation, terminal witnesses and decoder noninterference. Raft examples have separate projection/history contracts; this does not certify every Raft property. |
@@ -30,7 +30,7 @@ relationship to the native-binary model-checking goal.
 | C22 | Fixed (snapshot I/O) | Exact read/write counts and archive bounds required; failures propagate, without zero-fill or live fallback. | `check-state-io` fault-injects short/failed process_vm I/O and corrupt/missing/old archives. Failed restore is fatal; no successor may execute afterward. |
 | C23 | P0 / partial | TCP source ports now derive from saved socket state, independent of search RNG; clocks/getrandom now use saved virtual state; per-task masks now persist; custom signal delivery and asynchronous kernel inputs remain unsupported. | `check-port` covers replay, RNG independence, source addresses, uniqueness and exhaustion. Closed syscall policy and process-model regressions cover rejection, deterministic replay and archives; this does not close general asynchronous inputs. |
 | C24 | Fixed | Populate current syscall number/arguments before the entry handler. | `check-exec` exercises real ptrace FUTEX_WAKE suppression using current arguments. |
-| C25 | P0 / partial | Auto execution returns after each syscall boundary or explicit pending completion, including CKPT_NO. Runnable threads/outcomes are still not exhaustively enumerated; pure user loops and blocking kernel calls are not bounded. | `check-exec` verifies empty receive, sleep and getpid loops return control. Futex waiting successors are now preserved; enabled actor enumeration and shared-memory atom boundaries remain open. |
+| C25 | P0 / partial | Auto execution returns after each syscall boundary or explicit pending completion, including CKPT_NO. Actual CLI BFS/iterative DFS now enumerate supported saved actors/timeouts; all futex/message outcomes, instruction-level shared-memory interleavings and bounded native execution remain unproven. | `check-exec`, native actor/timeout and pending gates cover those scoped actions. Pure user loops, blocking native calls, depth-aware visited and cross-command search bookkeeping still need separate evidence. |
 | C26 | Fixed | Pending accounting covers queued and executing work; completion waits and synchronizes packed data/index. Async and sync errors poison subsequent operations. | `check-store-cache` holds a worker at compression, proves barrier stays blocked, then opens a fresh read-only process while writer remains alive. Sync failure and shutdown/reinit also covered. |
 
 | C27 | Fixed | Non-owning shared cache buffers and eviction mutations caused wrong bytes and crashes under pressure. Immutable owned buffers replace mutable cross-thread entries; cache and pending budgets are explicit. | `check-store-cache` covers pointer lifetime, zero/tiny caches, concurrent dedup, multiworker and prefetch. Fixed-data constrained-cache benchmark passes every byte comparison. |
@@ -1155,3 +1155,35 @@ pages2.864→2.839s;18visited and3replays everyrow. These are not Redis speedups
 See [report](technical-report-2026-10-17.md) and build/compact-snapshot-metadata/.
 C03/C08/C25 remain open; nextpriority is actual CLI BFS/DFS actor+timeout coverage,
 not extending the Python workaround. Existing immutable22/24jobs retain versions.
+
+### Actual native CLI actor/action coverage and receipts (2026-10-17)
+
+Actual BFS/iterativeDFS now enumerate saved logical runnable/Ready/Retry threads
+and each admissible finite timeout, install explicit actors after restore, and
+discover choices independently for each source/actor/action. Shared timeout
+admission reads only saved resource graphs. Normal search completion may report
+one scalar SEARCH_EXITED receipt for an actual all-exited transition, including
+its incoming edge and unmodified exit codes; it does not restore UI or imply
+success/exhaustion. The case verifier strictly loads/replays that exact actor.
+
+Samefixture/observer matched8oldRED proves missing actor/timeout/Ready successors.
+Final immutable26b gate28rows observes980native callbacks/76rootactions and228
+explicit same-source replays, exact BFS terminal projection sets and cleanup.
+22session/protocol tests cover initial(no predecessor) parsing, nonmain replay,
+malformed/nonzero/duplicate receipts and failures. Four actual receipt fixtures
+add12replays for first-step exit and last-worker exit. Final12input/pthread cases
+pass44sessions/48replays;30native scenarios,8DFS/BFSresidency searches, purepolicy,
+NP2pending/timeout/IO/framework, productionNP1/4,makecheck and targeted Clang pass.
+Sources, rawlogs and version boundaries are retained under build/native-search-*.
+
+The old pipe checker wrongly required every valid exit to have blocked; the new
+BFS covers both blocking and producer-first zero-wait success. Per-event validity
+checks remain. Large3cycle pthread control is explicitly a bounded functional
+path; finite raw-thread fixtures verify native BFS/DFS successor sets separately.
+
+This fixes the actual CLI actor dimension, not all of C03/C25: RAND/recursive and
+unused scheduler implementations remain separate, global visited survives some
+commands, DFS hash-only visited ignores different remaining depths, and all
+futex/message outcomes plus instruction atoms are not established. Snapshot37/38
+and kernel24 remain unchanged. Four existing actual module attempts still use
+immutable22/24, and no terminal acceptance is inferred from these new tests.

@@ -176,6 +176,47 @@ static bool check_assertions(const sys_state& state, unsigned actor)
   return violated;
 }
 
+timeval timeout_action_clock(const sys_state& source,int process,int thread) {
+  if (process<0 || process>=NP) throw std::runtime_error("Timeout process index out of range");
+  if (DISDEAD(source.status[process]) || source.property_failed)
+    throw ActionRejected("actor belongs to a terminal state");
+  const auto& child=source.child[process];
+  validate_pending_syscalls(child);
+  if (thread<0 || thread>=static_cast<int>(child.threads.size()))
+    throw ActionRejected("thread index out of range");
+  const auto& actor=child.threads[thread];
+  if (!actor.alive || !actor.pending_syscall || actor.pending_syscall->phase!=PendingPhase::Waiting || !actor.pending_syscall->deadline)
+    throw ActionRejected("actor requires a waiting syscall with a finite deadline");
+  const auto& pending=*actor.pending_syscall;
+  syscall_info call{};call.nr=pending.nr;
+  std::copy(std::begin(pending.args),std::end(pending.args),call.args);
+  if (pending.reason==PendingReason::Io && io_retry_ready(child,call))
+    throw ActionRejected("I/O is already ready");
+  return pending_timeout_clock(child.tv,*pending.deadline);
+}
+
+std::vector<ActorAction> enabled_actor_actions(const sys_state& source) {
+  std::vector<ActorAction> result;
+  if (source.property_failed) return result;
+  for (int process=0;process<NP;++process) {
+    if (DISDEAD(source.status[process])) continue;
+    const auto& child=source.child[process];
+    child.validate_io_state();
+    for (size_t thread=0;thread<child.threads.size();++thread) {
+      const auto& actor=child.threads[thread];
+      if (!actor.alive) continue;
+      if (!actor.pending_syscall || actor.pending_syscall->phase!=PendingPhase::Waiting) {
+        result.push_back({process,static_cast<int>(thread),TransitionAction::Normal});
+      } else if (actor.pending_syscall->deadline) {
+        try { (void)timeout_action_clock(source,process,thread); }
+        catch (const ActionRejected&) { continue; }
+        result.push_back({process,static_cast<int>(thread),TransitionAction::Timeout});
+      }
+    }
+  }
+  return result;
+}
+
 TransitionResult state_transition(const sys_state &source_state,
                                   int process_index, int requested_thread, TransitionAction action)
 {
@@ -187,25 +228,9 @@ TransitionResult state_transition(const sys_state &source_state,
     throw std::runtime_error("Transition process index out of range");
   if (action != TransitionAction::Normal && action != TransitionAction::Timeout)
     throw std::runtime_error("Invalid transition action");
-  const auto preflight_timeout = [&](const tracee_state& child) {
-    if (DISDEAD(source_state.status[process_index]) || source_state.property_failed)
-      throw ActionRejected("actor belongs to a terminal state");
-    validate_pending_syscalls(child);
-    if (requested_thread < 0 || requested_thread >= static_cast<int>(child.threads.size()))
-      throw ActionRejected("thread index out of range");
-    const auto& actor = child.threads[requested_thread];
-    if (!actor.alive || !actor.pending_syscall || actor.pending_syscall->phase != PendingPhase::Waiting || !actor.pending_syscall->deadline)
-      throw ActionRejected("actor requires a waiting syscall with a finite deadline");
-    const auto& pending = *actor.pending_syscall;
-    syscall_info call{}; call.nr = pending.nr;
-    std::copy(std::begin(pending.args), std::end(pending.args), call.args);
-    if (pending.reason == PendingReason::Io && io_retry_ready(child, call))
-      throw ActionRejected("I/O is already ready");
-    return pending_timeout_clock(child.tv, *pending.deadline);
-  };
   if (action == TransitionAction::Timeout) {
     if (requested_thread == -1) requested_thread = source_state.child[process_index].current_thread_idx;
-    (void)preflight_timeout(source_state.child[process_index]);
+    (void)timeout_action_clock(source_state,process_index,requested_thread);
   }
   if (DISDEAD(source_state.status[process_index]))
     throw std::runtime_error("Cannot execute a terminated process; load a predecessor state first");
@@ -242,8 +267,16 @@ TransitionResult state_transition(const sys_state &source_state,
   int thread_idx = ptmc_state.current_thread_idx[process_index];
   syscall_info executed = new_syscalls[process_index][thread_idx];
   int ckpt;
+  // A pending completion/timeout does not pass through syscall choice discovery.
+  // Every action starts without the previous actor's cardinality, while an
+  // explicit preset remains available to this action's actual syscall handler.
+  ptmc_state.n_choose=0;
   if (action == TransitionAction::Timeout) {
-    const auto target = preflight_timeout(ptmc_state.running_state.child[process_index]);
+    timeval target;
+    try { target=timeout_action_clock(ptmc_state.running_state,process_index,thread_idx); }
+    catch (const ActionRejected& error) {
+      throw std::runtime_error(std::string("Admitted timeout became ineligible after restore: ")+error.what());
+    }
     const auto& actor = ptmc_state.running_state.child[process_index].threads.at(thread_idx);
     const auto logical_tid = actor.tid;
     const auto physical_tid = actor.physical_tid;
@@ -261,6 +294,8 @@ TransitionResult state_transition(const sys_state &source_state,
   // Automatic execution may skip a blocked/exited thread. Attribute the
   // completed syscall to the actor that actually ran, preserving other slots.
   thread_idx = ptmc_state.current_thread_idx[process_index];
+  if (requested_thread>=0 && thread_idx!=requested_thread)
+    throw std::runtime_error("Explicit transition actor changed during execution");
   new_syscalls[process_index][thread_idx] = executed;
   // A modeled clone publishes a stopped logical child during this transition.
   // Carry its initial child-side syscall result into the candidate snapshot.
