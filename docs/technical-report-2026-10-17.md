@@ -709,3 +709,8 @@ python3 tests/startup_layout_diagnostic.py --tracer build/case-tools/tracer-iter
 其整个目录保留。结果是 `incomplete/depth_cutoff`，24,335次尝试转换、
 16,776个独特后继、搜索11,949.05秒，未完成反例验收/重放；tracer退出0、
 cleanup通过不等于模型检验通过。其余三组24实验仍运行，原先的能力claim不变。
+
+用户随后明确要求继续回收已结束案例的原始镜像，已取消前次对验收矩阵和
+最终回归状态库的保留，另回收约21.64 GiB，`build/`降至约3.4 GiB。结果、
+日志、反例路径、配置与版本归属仍保留；这些已结束案例的镜像不再可直接读取，
+需要重跑。外置盘在途实验及共享模块未清理，能力claim没有因此扩大或缩减。
