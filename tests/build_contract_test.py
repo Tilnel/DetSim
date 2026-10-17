@@ -122,6 +122,51 @@ class BuildContractTest(unittest.TestCase):
         self.assertTrue((self.root / "memory/snapshot").exists())
         self.assertTrue((self.root / "sstate/snapshot").exists())
 
+    def test_clean_preserves_experiments_and_toolchains_inside_build(self):
+        retained = ("build/cases/run-one/memory/snapshot",
+                    "build/case-jobs/worker/status.json",
+                    "build/case-tools/tracer-versioned",
+                    "build/toolchains/compiler", "build/custom-experiment/result.json")
+        disposable = ("build/release/np1/cache.o", "build/debug/np2/cache.o",
+                      "build/tests/component-test")
+        for name in retained + disposable:
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(name + "\n")
+        self.make("clean")
+        for name in retained:
+            self.assertTrue((self.root / name).is_file(), name)
+            self.assertEqual((self.root / name).read_text(), name + "\n")
+        for name in disposable:
+            self.assertFalse((self.root / name).exists(), name)
+
+    def test_storage_tools_are_configuration_scoped_without_source_outputs(self):
+        for name in ("sstate_query", "verify_sstate"):
+            for directory in ("tools", "tools/storage"):
+                source = self.root / directory / (name + ".cpp")
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text("/* fixture */\n")
+        self.make("NP=1", "tools")
+        self.make("NP=2", "tools/sstate_query")
+        for name in ("sstate_query", "verify_sstate"):
+            self.assertTrue((self.root / "build/release/np1/bin" / name).is_file())
+            self.assertFalse((self.root / "tools" / name).exists())
+        self.assertTrue((self.root / "build/release/np2/bin/sstate_query").is_file())
+        self.make("NP=1", "tools", "LDFLAGS=-Wl,fixture")
+        self.assertIn("'-Wl,fixture'", (self.root / "calls").read_text().splitlines()[-1])
+        self.make("NP=1", "debug", "tools")
+        self.assertTrue((self.root / "build/debug/np1/bin/verify_sstate").is_file())
+
+    def test_benchmarks_are_configuration_scoped_without_root_outputs(self):
+        for name in ("state_store_benchmark", "sysstate_store_benchmark", "xxhash_benchmark"):
+            source = self.root / "perf" / (name + ".cpp")
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text("/* fixture */\n")
+        self.make("NP=1", "benchmark")
+        for name in ("ss_bench", "sys_bench", "xxh_bench"):
+            self.assertTrue((self.root / "build/release/np1/bin" / name).is_file())
+            self.assertFalse((self.root / name).exists())
+
     def test_xxhash_benchmark_links_its_library(self):
         source = self.root / "perf/xxhash_benchmark.cpp"
         source.parent.mkdir(parents=True, exist_ok=True)

@@ -3,9 +3,9 @@
 
 !FlameGraph/
 
-!*.cpp
 !*.py
 
-
-!sstate_reader.h
+!storage/
+!storage/*.cpp
+!storage/*.h
 !.gitignore

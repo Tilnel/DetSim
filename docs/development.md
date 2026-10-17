@@ -89,14 +89,22 @@ NP/mode reuses its own objects and relinks `tracer`. Compiler binaries replaced 
 the same path are not detected; rebuild with a fresh build directory in that case.
 Do not run two independent make processes targeting the same output concurrently.
 
-`make clean` removes ordinary build output, not tracked parser sources or runtime
-snapshots. `make clear` deliberately deletes `memory/` and `sstate/`; it is not a
-verification step. PGO uses `make NP=N pgo-generate`, workload execution, then
+`make clean` removes `build/release/`, `build/debug/`, `build/tests/` and legacy
+fixed-location executables. It preserves experiment directories, versioned case
+tools, toolchains and runtime snapshots, including those inside `build/`.
+Custom test build directories require explicit separate cleanup. `make clear`
+deliberately deletes root `memory/` and `sstate/`; it is not a verification step.
+PGO uses `make NP=N pgo-generate`, workload execution, then
 `make NP=N pgo-use` in separate invocations. Profiles and PGO objects are separated
 by NP. Build tests check phase switching, not profile quality or optimized behavior.
 
 Optional `make NP=N benchmark` and `make NP=N tools` compile performance/query
-utilities; they are not part of the component correctness gate.
+utilities; they are not part of the component correctness gate. Their executables
+live in `build/release/npN/bin/` (or `build/debug/npN/bin/` when selecting `debug`).
+For example, use `build/release/np1/bin/sstate_query --help` after `make NP=1 tools`.
+The former `make ss_bench` and `make tools/sstate_query` targets remain build aliases,
+but no longer create executables at the old root/source paths. Storage tool sources
+are under `tools/storage/`. See [directory boundaries and submodule audit](repository-layout.md).
 
 ## Active code paths
 

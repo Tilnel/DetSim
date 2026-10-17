@@ -43,6 +43,10 @@ Flex/Bison 用于重新生成表达式解析器。
 - `perf/`、`tools/`：性能测量和状态查询工具。
 - `docs/`：设计、使用参考及当前维护记录。
 
+目录职责、生成文件清理边界及子模块处理建议见[仓库结构说明](docs/repository-layout.md)。
+工具和 benchmark 可执行文件输出到 `build/<mode>/np<N>/bin/`，普通 `make clean`
+保留实验记录与工具链；原始探索镜像按独立清单回收。
+
 ## 设计与使用参考
 
 - [设计原理](docs/index.md)

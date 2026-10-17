@@ -16,5 +16,5 @@ $(BUILD_DIR)/tests/storage_benchmark: $(BUILD_DIR)/tests/storage_benchmark.o $(T
 
 .PHONY: check-store-tools
 check-store-tools: tools
-	python3 tests/store_metadata_tools.py ./tools/sstate_query ./tools/verify_sstate $(NP)
+	python3 tests/store_metadata_tools.py $(BIN_DIR)/sstate_query $(BIN_DIR)/verify_sstate $(NP)
 check-storage: check-store-tools

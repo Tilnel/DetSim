@@ -33,6 +33,7 @@ $(error Select debug or release in separate make invocations)
 endif
 endif
 BUILD_DIR = build/$(MODE)/np$(NP)
+BIN_DIR = $(BUILD_DIR)/bin
 INCLUDES = -I. -Isrc -Isrc/core -Isrc/core/engine -Isrc/core/syscall -Isrc/core/scheduler -Isrc/core/state -Isrc/subsys -Isrc/subsys/fs -Isrc/subsys/net -Isrc/subsys/sync -Isrc/utils -Isrc/ui -Isrc/ui/cli -Ithird_party -Ithird_party/cereal/include
 PROJECT_CPPFLAGS = $(INCLUDES) -DNP=$(NP)
 CXXFLAGS ?= -std=gnu++20 -fno-stack-protector -O3 -msse4.2 -mavx2 -mbmi -mbmi2 $(if $(filter debug,$(MODE)),-g,)
@@ -93,20 +94,33 @@ $(YACC_SRC) $(YACC_HDR) &: src/utils/expr_parser.y
 -include $(OBJS:.o=.d) $(BUILD_DIR)/nr2call.d
 
 TRACER_OBJS_NO_MAIN = $(filter-out $(BUILD_DIR)/src/main.o,$(OBJS))
-benchmark: ss_bench sys_bench xxh_bench
+benchmark: $(BIN_DIR)/ss_bench $(BIN_DIR)/sys_bench $(BIN_DIR)/xxh_bench
 .PHONY: ss_bench sys_bench xxh_bench tools/sstate_query tools/verify_sstate
-ss_bench: $(BUILD_DIR)/perf/state_store_benchmark.o $(TRACER_OBJS_NO_MAIN) $(BUILD_DIR)/nr2call.o
+# Preserve unconditional relinking: link flags are not part of the object stamp.
+.PHONY: $(BIN_DIR)/ss_bench $(BIN_DIR)/sys_bench $(BIN_DIR)/xxh_bench \
+        $(BIN_DIR)/sstate_query $(BIN_DIR)/verify_sstate
+ss_bench: $(BIN_DIR)/ss_bench
+sys_bench: $(BIN_DIR)/sys_bench
+xxh_bench: $(BIN_DIR)/xxh_bench
+tools/sstate_query: $(BIN_DIR)/sstate_query
+tools/verify_sstate: $(BIN_DIR)/verify_sstate
+$(BIN_DIR)/ss_bench: $(BUILD_DIR)/perf/state_store_benchmark.o $(TRACER_OBJS_NO_MAIN) $(BUILD_DIR)/nr2call.o
+	@mkdir -p $(@D)
 	$(LD) $^ $(LDFLAGS) $(LDLIBS) -o $@
-sys_bench: $(BUILD_DIR)/perf/sysstate_store_benchmark.o $(TRACER_OBJS_NO_MAIN) $(BUILD_DIR)/nr2call.o
+$(BIN_DIR)/sys_bench: $(BUILD_DIR)/perf/sysstate_store_benchmark.o $(TRACER_OBJS_NO_MAIN) $(BUILD_DIR)/nr2call.o
+	@mkdir -p $(@D)
 	$(LD) $^ $(LDFLAGS) $(LDLIBS) -o $@
-xxh_bench: $(BUILD_DIR)/perf/xxhash_benchmark.o $(BUILD_DIR)/nr2call.o
+$(BIN_DIR)/xxh_bench: $(BUILD_DIR)/perf/xxhash_benchmark.o $(BUILD_DIR)/nr2call.o
+	@mkdir -p $(@D)
 	$(LD) $^ $(LDFLAGS) -lxxhash -o $@
-tools: tools/sstate_query tools/verify_sstate
-tools/sstate_query: $(BUILD_DIR)/tools/sstate_query.o $(TRACER_OBJS_NO_MAIN) $(BUILD_DIR)/nr2call.o
+tools: $(BIN_DIR)/sstate_query $(BIN_DIR)/verify_sstate
+$(BIN_DIR)/sstate_query: $(BUILD_DIR)/tools/storage/sstate_query.o $(TRACER_OBJS_NO_MAIN) $(BUILD_DIR)/nr2call.o
+	@mkdir -p $(@D)
 	$(LD) $^ $(LDFLAGS) $(LDLIBS) -o $@
-tools/verify_sstate: $(BUILD_DIR)/tools/verify_sstate.o $(TRACER_OBJS_NO_MAIN) $(BUILD_DIR)/nr2call.o
+$(BIN_DIR)/verify_sstate: $(BUILD_DIR)/tools/storage/verify_sstate.o $(TRACER_OBJS_NO_MAIN) $(BUILD_DIR)/nr2call.o
+	@mkdir -p $(@D)
 	$(LD) $^ $(LDFLAGS) $(LDLIBS) -o $@
--include $(wildcard $(BUILD_DIR)/perf/*.d $(BUILD_DIR)/tools/*.d)
+-include $(wildcard $(BUILD_DIR)/perf/*.d $(BUILD_DIR)/tools/storage/*.d)
 
 test:
 	$(MAKE) -f tests/Makefile test CC="$(CC)" CXX="$(CXX)"
@@ -175,7 +189,8 @@ help:
 	@echo 'make check-port             NP=2 deterministic virtual TCP ports regression'
 	@echo 'make benchmark-redisraft    NP=3 bounded Raft replication and DFS benchmark'
 	@echo 'make check-redis            NP=2 Redis SET/GET (requires existing Redis binary and ptrace)'
-	@echo 'make NP=N benchmark|tools   Build optional utilities'
+	@echo 'make NP=N benchmark|tools   Build utilities in build/<mode>/npN/bin/'
+	@echo 'make clean                  Remove compile outputs; preserve experiments/toolchains'
 	@echo 'make NP=N pgo-generate     Instrument; run workload; then make NP=N pgo-use'
 	@echo 'Compiler overrides: CC=/usr/bin/gcc CXX=/usr/bin/g++'
 
@@ -188,7 +203,7 @@ clear:
 	mkdir -p memory sstate
 
 clean:
-	rm -rf build
+	rm -rf build/release build/debug build/tests
 	rm -f tracer ss_bench sys_bench xxh_bench tools/sstate_query tools/verify_sstate
 
 # Both PGO phases use the same paths for GCC profile lookup. A phase stamp

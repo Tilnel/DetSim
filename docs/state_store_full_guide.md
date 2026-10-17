@@ -103,8 +103,11 @@ packed 默认独占写入者；`Config.read_only=true` 明确选择只读打开�
 
 当前 store 无删除或覆盖 API；旧 compact 会冒险重写活数据，已移除其破坏性实现。
 保留的维护接口执行验证/同步，不承诺回收文件空间。没有自动修复损坏文件的功能。
-`tools/sstate_query` 和 `tools/verify_sstate` 共用只读记录扫描与语义身份验证，
+`tools/storage/` 中的 `sstate_query` 和 `verify_sstate` 共用只读记录扫描与语义身份验证，
 无需 idx/inc，遇到坏记录失败，不修改被检查文件。
+运行 `make NP=1 tools` 后，可执行文件在 `build/release/np1/bin/`；其他NP或debug
+有独立路径，检查现存状态库时必须使用匹配的NP。旧 `make tools/sstate_query`
+构建目标仍可用，但旧 `./tools/sstate_query` 可执行路径已不再生成。
 
 ## 验证和基准
 

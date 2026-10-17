@@ -51,7 +51,8 @@ Redis 子模块未修改。下面保留最初失败证据，最后一节记录�
 
 ## 本次产物
 
-本机运行产物位于 `build/redis-probe/`，未纳入版本控制，`make clean` 会删除：
+当时本机运行产物位于 `build/redis-probe/`，未纳入版本控制。当前 `make clean`
+保留实验目录；历史镜像是否仍在，以后续[清理清单](cleanup-2026-10-17.md)为准：
 
 - `native-result.json`、`native/redis.log`：原生控制组。
 - `detsim/result.json`、`detsim/transcript.log`：原始启动失败。
