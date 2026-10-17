@@ -147,3 +147,7 @@
 !redisraft_quorum_runner_test.py
 !redisraft_repair_runner_test.py
 !zero_guard_benchmark.py
+
+!startup_layout_dump.cpp
+!startup_layout_diagnostic.py
+!startup_layout.mk
