@@ -82,6 +82,12 @@
 
 可选启动诊断用新接口再次完成 12 个会话、36 次 checkpoint 重放、24 个关闭后镜像导出，仍报告跨启动逐字节不确定；没有将其包装成新的兼容性或搜索保证。证据：`build/captured-stdio-observation/startup-diagnostic/run-_jn7jfaf/results.json`。当前改动通过 `make check`、NP1/NP4 production build、NP2 state-view/plugins、NP1 storage/page/state-I/O 及 targeted Clang StateView 分析；这些回归不替代待重跑的完整 RedisRaft 正常业务验收。
 
+### 新版重试：2026-10-17 07:14 UTC
+
+上述修复经独立源码审阅后提交为 `35c9ee4`。healthy/pages24 与 healthy/full24 同时启动，使用固定的 immutable24/NP4 tracer 和新 checker；两组均已完成自己的 native 前置（client exit0）并进入真实 model 控制初始化，尚无业务搜索结果。pages 请求总计 21,600 秒、搜索 18,000 秒；full 保留总计 43,200 秒、搜索 36,000 秒；均 depth6,000、控制步12,000、4 GiB tracer 地址空间。截止或资源监控故障仍非绿色。
+
+新输出分别为 `/mnt/k2/detsim-modelcheck/iteration24-healthy-pages/run-wgoqt31e` 和 `iteration24-healthy-full/run-ew6f3cmk`，监督器、不可变源码档案与实际 PID incarnation 见 `build/case-jobs/iteration24-module-healthy-{pages,full}/`。只对此次各自输出树应用已测试的 96 GiB 软上限及 32 GiB 空闲保留；不删除旧镜像。最新选中矩阵恢复为 **56 已核验、3 在途、1 旧 full 注错失败**，中止的两个正常旧实验保留在 earlier evidence。旧 mutant/pages22 原进程继续运行，不能将新接口或自适应 driver 的性能归因给它。
+
 ## 2. 实验数据
 
 <!-- CASE_METRICS_START -->
