@@ -123,3 +123,7 @@ examples/**/*.pyc
 
 # Retired source location; optional local bridge for pre-migration live jobs.
 /examples/cases
+
+# Keep editor recovery files local, including beneath allowed example directories.
+*.swp
+*.swo
