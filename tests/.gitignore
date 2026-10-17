@@ -14,7 +14,6 @@
 !elf.mk
 !accept_integration.cpp
 !accept.mk
-!redis_scenario.py
 !dwarf_class.cpp
 !xstate_integration.cpp
 !xstate.mk
@@ -45,19 +44,14 @@
 !store_metadata*
 !storage_benchmark.py
 
-!redisraft_benchmark.py
-!redisraft_profile_summary.py
 !soft_dirty_integration.cpp
 !soft_dirty.mk
-!soft_dirty_benchmark.py
 !page_snapshot.mk
 !page_snapshot_integration.cpp
-!page_snapshot_benchmark.py
 !io_boundary.mk
 !io_boundary_integration.cpp
 !fs_boundary_extra.cpp
 !network_boundary_extra.cpp
-!redisraft.mk
 
 !capture.mk
 !capture_integration.cpp
@@ -74,7 +68,6 @@
 
 !state_view_layout.c
 
-!fixture_profile.py
 !process_state_integration.cpp
 !process_state.mk
 
@@ -146,7 +139,6 @@
 !redisraft_quorum_checker_unit.cpp
 !redisraft_quorum_runner_test.py
 !redisraft_repair_runner_test.py
-!zero_guard_benchmark.py
 
 !startup_layout_dump.cpp
 !startup_layout_diagnostic.py
@@ -157,3 +149,4 @@
 !native_search_actors.py
 !native_search_actors.mk
 !native_search_actors.cpp
+!example_layout_test.py

@@ -9,8 +9,8 @@ import sys
 import tempfile
 
 ROOT=Path(__file__).resolve().parents[1]
-sys.path.insert(0,str(ROOT/"examples/cases"))
-import redisraft_full_run as case
+sys.path.insert(0,str(ROOT/"examples"))
+from redisraft_module import run as case
 
 FIXTURE=r'''
 #include <sys/syscall.h>

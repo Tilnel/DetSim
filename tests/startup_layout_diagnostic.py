@@ -18,8 +18,8 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "examples/cases"))
-import run as cases
+sys.path.insert(0, str(ROOT / "examples"))
+from _support import session as cases
 
 ENVIRONMENT = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C",
                "PYTHONHASHSEED": "0", "CC": "/usr/bin/gcc", "CXX": "/usr/bin/g++"}
@@ -282,7 +282,7 @@ def main():
                       product_diff_sha256=hashlib.sha256(checked(["git", "diff", "--", "src"], ROOT).encode()).hexdigest(),
                       host_aslr_before=Path("/proc/sys/kernel/randomize_va_space").read_text().strip())
         artifacts = {"source": source, "binary": binary, "wrapper": wrapper, "tracer": tracer, "dump_helper": helper,
-                     "runner": Path(__file__).resolve(), "common_session": ROOT / "examples/cases/run.py",
+                     "runner": Path(__file__).resolve(), "common_session": ROOT / "examples/_support/session.py",
                      "reader_source": ROOT / "tests/startup_layout_dump.cpp", "reader_makefile": ROOT / "tests/startup_layout.mk",
                      "compiler": Path("/usr/bin/gcc").resolve(), "setarch": Path("/usr/bin/setarch"), "shell": Path("/bin/sh").resolve()}
         report["artifacts"] = {name: {"path": str(path), "sha256": cases.digest(path)} for name, path in artifacts.items()}

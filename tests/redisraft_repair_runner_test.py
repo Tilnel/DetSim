@@ -3,9 +3,9 @@ import copy
 from pathlib import Path
 import sys
 import unittest
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'examples/cases'))
-import redisraft_repair_run as repair
-import run as common
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'examples'))
+from redisraft import repair
+from _support import session as common
 
 
 def nodes(root=False, mutant=False):

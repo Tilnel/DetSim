@@ -100,7 +100,7 @@ make check-redis CC=/usr/bin/gcc CXX=/usr/bin/g++
 也可以针对已构建的 NP=2 tracer 运行：
 
 ```sh
-python3 tests/redis_scenario.py --tracer ./tracer
+python3 examples/redis/run.py --tracer ./tracer
 ```
 
 脚本每次创建独立 `build/redis-check/run-*` 目录，保存配置、完整轨迹、命令
@@ -125,7 +125,7 @@ core dump；测试结束清理所属进程组。测试客户端强制启用 asse
 2. `sockstate.cpp` 使用 checked process_vm 访问 guest sockaddr/addrlen，处理
    截断、实际长度回写及 EFAULT/EINVAL；匹配进程局部 FD 对应的对端地址，
    初始化 sockaddr padding。确定失效的队首出队，不再堵住下一条有效连接。
-3. `tests/redis_scenario.py` 保留固定手控路径，验证实际响应和退出状态。
+3. `examples/redis/run.py` 保留固定手控路径，验证实际响应和退出状态。
 
 仍需保留的边界：
 

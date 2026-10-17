@@ -10,8 +10,8 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "examples/cases"))
-import run as runner
+sys.path.insert(0, str(ROOT / "examples"))
+from _support import session as runner
 
 
 class Clock:

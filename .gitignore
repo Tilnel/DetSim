@@ -120,3 +120,6 @@ examples/**/*.pyc
 # Public plugin ABI; no generated artifacts.
 !src/api/
 !src/api/plugin.h
+
+# Retired source location; optional local bridge for pre-migration live jobs.
+/examples/cases

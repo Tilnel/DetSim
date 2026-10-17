@@ -12,8 +12,8 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "examples/cases"))
-import concurrency_run as runner
+sys.path.insert(0, str(ROOT / "examples"))
+from exact_once import run as runner
 
 
 class ConcurrencyReportTests(unittest.TestCase):

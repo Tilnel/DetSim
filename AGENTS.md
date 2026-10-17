@@ -54,6 +54,11 @@ Use source call sites and repeatable tests to settle contradictions.
 
 - `src/` is product code; `tests/` is automated verification; `examples/` contains
   workloads/plugins and external projects. Do not treat their tests as DetSim tests.
+- Keep each actual model-checking case under `examples/<case>/`, owning its target
+  or library, driver, choice/property plugins, configuration and launch scripts.
+  Do not collect them into `examples/cases/` or split them into test fixture and
+  integration directories. Only generic host helpers belong in `examples/_support/`;
+  target-specific decoding/search and benchmarks stay with their case.
 - No workload-specific names or invariants in generic scheduling or persistence.
   Existing Raft coupling is debt, not a pattern to copy.
 - Serialize semantic state. Host PIDs/TIDs, cache state, UI selection, statistics,

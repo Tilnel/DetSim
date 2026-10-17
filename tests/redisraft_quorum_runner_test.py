@@ -3,9 +3,9 @@ import copy
 from pathlib import Path
 import sys
 import unittest
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'examples/cases'))
-import redisraft_quorum_run as quorum
-import run as common
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'examples'))
+from redisraft import quorum
+from _support import session as common
 
 class QuorumAcceptance(unittest.TestCase):
     def setUp(self):

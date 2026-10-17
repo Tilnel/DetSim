@@ -190,7 +190,7 @@ server readiness. See [Redis evidence and model limits](redis-smoke.md).
 For the three-node Raft-library workload, reproducible timings and measurement
 limits are documented in [redisraft-benchmark.md](redisraft-benchmark.md).
 The benchmark's `--perf PATH --perf-sudo` options record DFS-only CPU call stacks;
-`tests/redisraft_profile_summary.py` groups exported stacks into disjoint phases.
+`examples/redisraft/profile_summary.py` groups exported stacks into disjoint phases.
 CPU sampling proportions and full-command wall time answer different questions.
 The soft-dirty experiment is disabled by default. See the measured costs and
 explicit support limits in [the Raft benchmark](redisraft-benchmark.md).
@@ -711,8 +711,13 @@ This change establishes execution/control states, not exhaustive scheduling.
 
 ## Case-driven development
 
-The active work queue is now the [case corpus](../examples/cases/README.md), with
-an explicit [target catalog](../examples/cases/catalog.json). Feature additions
+The active work queue is the [case index](../examples/README.md), with
+an explicit [target catalog](../examples/catalog.json). Every `examples/<case>/`
+owns its target/library, driver, plugins, configuration policy and launch script.
+Exact generated configurations are stored with each run's output; there is no
+separate source corpus under `examples/cases/`. Shared host execution/session
+helpers live in `examples/_support/`; target-specific search stays in its case.
+Feature additions
 should name a failing case, its expected native behavior and the property or
 admission boundary they enable. Healthy/mutant pairs and counterexample replay
 are separate from compiler success or initialization smoke tests.
@@ -723,6 +728,13 @@ C, C++, Rust std, the actually installed Go compiler, CPython and OpenJDK, repor
 native/control/replay/search stages separately. A bounded DFS completion string
 is never promoted to a safety proof or a successful guest exit. Current unsupported
 runtime cases intentionally keep this audit non-green.
+
+The direct NP=1 entry points are `examples/two_debits/run.py`,
+`examples/lost_notification/run.py` and `examples/runtime_admission/run.py`.
+There is no shared `--mode` multiplexer. The default `make check` also checks the
+source layout and each launcher's `--help` from an unrelated directory; this
+does not execute model checking. Legacy paths retained in dated reports describe
+their original execution version, not current entry points.
 
 ## Shared VFS payloads
 

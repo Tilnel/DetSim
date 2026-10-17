@@ -3,8 +3,8 @@ import copy
 from pathlib import Path
 import sys
 import unittest
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'examples/cases'))
-import redisraft_run
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'examples'))
+from redisraft import run as redisraft_run
 
 class DeniedActualVote(unittest.TestCase):
     def setUp(self):

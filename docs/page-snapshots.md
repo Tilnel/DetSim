@@ -104,7 +104,7 @@ DETSIM_SNAPSHOT_BACKEND=verify-pages make NP=2 check-capture \
   CC=/usr/bin/gcc CXX=/usr/bin/g++
 # 若前一步另外构建了NP2 tracer，先重新选择NP3：
 make NP=3 CC=/usr/bin/gcc CXX=/usr/bin/g++ tracer
-python3 tests/page_snapshot_benchmark.py --repeats 3 --depth 12
+python3 examples/redisraft/page_snapshot_benchmark.py --repeats 3 --depth 12
 ```
 
 `--before-tracer PATH` 追加原版NP3对照；`--soft-dirty` 追加显式实验组合。
@@ -151,7 +151,7 @@ python3 tests/page_snapshot_benchmark.py --repeats 3 --depth 12
 
 ### 合成有限探索的全链路测量
 
-可重跑的 `tests/zero_guard_benchmark.py` 在已有two-debits有限程序上增加192MiB
+可重跑的 `examples/two_debits/zero_guard_benchmark.py` 在已有two-debits有限程序上增加192MiB
 全零私有匿名PROT_NONE映射，保留真实两次时间选择及独立输出检查。先验证四种
 native输入，再用同一NP1二进制、每次fresh store，按交替顺序各后端跑3对write/
 discard。12轮均18个访问/新增状态、正常退出及3次相同hash终边重放。
@@ -177,7 +177,7 @@ discard。12轮均18个访问/新增状态、正常退出及3次相同hash终边
 
 ```sh
 make NP=1 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4
-python3 tests/zero_guard_benchmark.py --tracer ./tracer --size-mb 192 --repeats 3
+python3 examples/two_debits/zero_guard_benchmark.py --tracer ./tracer --size-mb 192 --repeats 3
 make NP=1 check-mappings CC=/usr/bin/gcc CXX=/usr/bin/g++
 ```
 

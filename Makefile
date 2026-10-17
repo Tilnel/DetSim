@@ -127,10 +127,14 @@ test:
 check-build-contracts:
 	python3 tests/build_contract_test.py
 # Component/build checks only; does not assert ptrace/exploration correctness.
-check: test check-build-contracts
+check: test check-build-contracts check-example-layout
+
+.PHONY: check-example-layout
+check-example-layout:
+	python3 tests/example_layout_test.py
 
 # Optional fragments are absent in the disposable build-contract fixtures.
--include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk tests/futex_snapshot.mk tests/futex.mk tests/storage.mk tests/store_cache.mk tests/store_packed.mk tests/redisraft.mk tests/capture.mk tests/soft_dirty.mk tests/page_snapshot.mk tests/io_boundary.mk tests/framework.mk tests/runtime_profile.mk tests/syscall_policy.mk tests/process_state.mk tests/thread_control.mk tests/thread_identity.mk tests/thread_carrier.mk tests/thread_lifecycle.mk tests/thread_tid.mk tests/thread_signal_mask.mk tests/thread_robust.mk tests/pending_syscall.mk tests/pending_timeout.mk tests/pending_io.mk tests/pending_io_snapshot.mk tests/vfs_content.mk tests/thread_altstack.mk tests/getdents.mk tests/history_presentation.mk
+-include tests/dwarf.mk tests/elf.mk tests/accept.mk tests/xstate.mk tests/exec.mk tests/state_io.mk tests/port.mk tests/identity.mk tests/mapping.mk tests/futex_snapshot.mk tests/futex.mk tests/storage.mk tests/store_cache.mk tests/store_packed.mk examples/redisraft/benchmark.mk tests/capture.mk tests/soft_dirty.mk tests/page_snapshot.mk tests/io_boundary.mk tests/framework.mk tests/runtime_profile.mk tests/syscall_policy.mk tests/process_state.mk tests/thread_control.mk tests/thread_identity.mk tests/thread_carrier.mk tests/thread_lifecycle.mk tests/thread_tid.mk tests/thread_signal_mask.mk tests/thread_robust.mk tests/pending_syscall.mk tests/pending_timeout.mk tests/pending_io.mk tests/pending_io_snapshot.mk tests/vfs_content.mk tests/thread_altstack.mk tests/getdents.mk tests/history_presentation.mk
 -include tests/writev.mk
 check-integration: check-dwarf check-elf
 
@@ -143,12 +147,13 @@ check-dfs-residency: tracer
 .PHONY: check-cases audit-runtimes
 check-cases: tracer
 	@test "$(NP)" = 1 || { echo 'check-cases requires NP=1' >&2; exit 1; }
-	CC="$(CC)" CXX="$(CXX)" python3 examples/cases/run.py --tracer ./tracer --mode checks
+	CC="$(CC)" CXX="$(CXX)" python3 examples/two_debits/run.py --tracer ./tracer
+	CC="$(CC)" CXX="$(CXX)" python3 examples/lost_notification/run.py --tracer ./tracer
 	CC="$(CC)" CXX="$(CXX)" python3 tests/case_runner_integration.py --tracer ./tracer
 
 audit-runtimes: tracer
 	@test "$(NP)" = 1 || { echo 'audit-runtimes requires NP=1' >&2; exit 1; }
-	CC="$(CC)" CXX="$(CXX)" python3 examples/cases/run.py --tracer ./tracer --mode runtimes
+	CC="$(CC)" CXX="$(CXX)" python3 examples/runtime_admission/run.py --tracer ./tracer
 
 # This gate executes native programs via ptrace; keep it separate from make check.
 check-scenarios: tracer
@@ -157,7 +162,7 @@ check-scenarios: tracer
 
 check-redis: tracer
 	@test "$(NP)" = 2 || { echo 'check-redis requires NP=2' >&2; exit 1; }
-	CC="$(CC)" python3 tests/redis_scenario.py --tracer "$(abspath tracer)"
+	CC="$(CC)" python3 examples/redis/run.py --tracer "$(abspath tracer)"
 
 help:
 	@echo 'make NP=N [release|debug]   Build tracer for N processes'

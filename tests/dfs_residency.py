@@ -10,8 +10,8 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "examples" / "cases"))
-from run import Session, build_plugin, command, require
+sys.path.insert(0, str(ROOT / "examples"))
+from _support.session import Session, build_plugin, command, require
 
 GUEST = r'''
 #include <fcntl.h>

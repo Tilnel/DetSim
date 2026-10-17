@@ -12,8 +12,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--tracer", type=Path, required=True)
 args = parser.parse_args()
 with tempfile.TemporaryDirectory(prefix="ds-case-runner-") as directory:
-    base = [sys.executable, str(ROOT / "examples/cases/run.py"), "--tracer", str(args.tracer.resolve()),
-            "--mode", "runtimes", "--backend", "full", "--output", directory]
+    base = [sys.executable, str(ROOT / "examples/runtime_admission/run.py"), "--tracer", str(args.tracer.resolve()),
+            "--backend", "full", "--output", directory]
     bounded = subprocess.run(base + ["--languages", "c", "--depth", "1"],
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=40)
     assert bounded.returncode == 1, bounded.stdout

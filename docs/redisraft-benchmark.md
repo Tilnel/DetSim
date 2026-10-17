@@ -1,5 +1,9 @@
 # Redis Raft 示例效率实测
 
+当前案例已按目录归属整理，运行入口见[案例索引](../examples/README.md)：
+Raft C库在 `examples/redisraft/`，完整module在 `examples/redisraft_module/`。
+下文保留的 `examples/cases/` 源路径属于历史执行版本，不是新运行入口。
+
 后续 `experiment/page-snapshots` 分支的页格式、页级恢复及完整探索对照见
 [页快照实现与测量](page-snapshots.md)，没有将下面的soft-dirty实验启为默认。
 
@@ -101,7 +105,7 @@ make benchmark-redisraft CC=/usr/bin/gcc CXX=/usr/bin/g++ \
 ```
 
 默认 NP=3、开启两个插件、固定种子1、300次手动转换后 DFS深度8。
-也可以直接运行 `tests/redisraft_benchmark.py --help` 查看参数；直接运行时
+也可以直接运行 `examples/redisraft/benchmark.py --help` 查看参数；直接运行时
 需传入对应的 `--choose`、`--check`、`--seed-shim` 以复现正式配置。
 
 产物在 `build/redisraft-benchmark/run-*/`，正式汇总为 `final-summary.json`
@@ -232,7 +236,7 @@ DFS把刚捕获的状态只以hash交给子帧，之后又从存储反序列化�
 ### 复现profile
 
 ```sh
-python3 tests/redisraft_benchmark.py \
+python3 examples/redisraft/benchmark.py \
   --choose build/release/np3/tests/redisraft_choose.so \
   --check build/release/np3/tests/redisraft_check.so \
   --seed-shim build/release/np3/tests/redisraft_seed.so \
@@ -242,7 +246,7 @@ python3 tests/redisraft_benchmark.py \
 # 使用上一命令输出的workdir替换下面RUN：
 sudo -n /usr/lib/linux-tools-6.8.0-138/perf script \
   -i RUN/perf.data -F comm,pid,tid,time,event,ip,sym,dso > RUN/stacks.txt
-python3 tests/redisraft_profile_summary.py RUN/result.json RUN/stacks.txt
+python3 examples/redisraft/profile_summary.py RUN/result.json RUN/stacks.txt
 ```
 
 采样产物和未采样基线保留在 `build/exploration-profile/`；正式大缓存
@@ -327,7 +331,7 @@ make NP=3 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4 tracer \
 make check-soft-dirty CC=/usr/bin/gcc CXX=/usr/bin/g++
 DETSIM_SOFT_DIRTY_EXPERIMENT=verify make NP=2 check-capture \
   CC=/usr/bin/gcc CXX=/usr/bin/g++
-python3 tests/soft_dirty_benchmark.py --repeats 3 --depth 12
+python3 examples/redisraft/soft_dirty_benchmark.py --repeats 3 --depth 12
 ```
 
 Raft verify可在前述benchmark命令前加`DETSIM_SOFT_DIRTY_EXPERIMENT=verify`。
@@ -355,7 +359,7 @@ I/O语义，不能直接用两组墙钟说明优化/退化；这里仅比较本�
 `build/io-boundary-benchmark-quiet/{results,summary}.json`。命令：
 
 ```sh
-python3 tests/page_snapshot_benchmark.py --repeats 1 --depth 12 --output build/io-boundary-benchmark-quiet
+python3 examples/redisraft/page_snapshot_benchmark.py --repeats 1 --depth 12 --output build/io-boundary-benchmark-quiet
 ```
 
 ## 通用框架与统一读取接口复核（2026-10-15）
@@ -389,8 +393,8 @@ CPU为全部tracer线程，tracee另行计数。测量仍是有限、静态链�
 每个目录保存逐次日志、JSON结果与汇总；旧二进制/插件保留在build/generic-framework-before。
 
 ```sh
-python3 tests/page_snapshot_benchmark.py --tracer build/generic-framework-before/tracer --plugin-dir build/generic-framework-before --repeats 3 --depth 8 --output build/generic-framework-before/benchmark-final
-python3 tests/page_snapshot_benchmark.py --repeats 3 --depth 8 --output build/generic-framework-final
+python3 examples/redisraft/page_snapshot_benchmark.py --tracer build/generic-framework-before/tracer --plugin-dir build/generic-framework-before --repeats 3 --depth 8 --output build/generic-framework-before/benchmark-final
+python3 examples/redisraft/page_snapshot_benchmark.py --repeats 3 --depth 8 --output build/generic-framework-final
 ```
 
 较深的独立交叉检查：pages、32/64MiB、深度12，新旧均5593 visits/2867 new states，
@@ -534,7 +538,7 @@ healthy manifest记录其hash，mutant manifest记录读取文件时的收紧版
 
 ```sh
 make NP=3 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4
-python3 examples/cases/redisraft_quorum_run.py --tracer ./tracer --depth 72 --timeout 600
+python3 examples/redisraft/quorum.py --tracer ./tracer --depth 72 --timeout 600
 make NP=2 check-plugins CC=/usr/bin/gcc CXX=/usr/bin/g++
 ```
 
@@ -634,7 +638,7 @@ transcript离线重放全部CLI命令，确认444个旧候选的ledger、计数�
 
 ```sh
 make NP=3 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4
-python3 examples/cases/redisraft_repair_run.py --tracer ./tracer --depth 96 --timeout 600
+python3 examples/redisraft/repair.py --tracer ./tracer --depth 96 --timeout 600
 ```
 
 原有60行汇总仍是56通过、4项完整模块timeout。新增协议案例补充了提交前搜索和

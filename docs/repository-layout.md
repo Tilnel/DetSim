@@ -19,8 +19,8 @@
 | --- | --- | --- |
 | `src/` | 通用框架实现及公开插件 ABI | 不加入目标系统特判 |
 | `tests/` | DetSim 自动验证、fixture 与对应 make 片段 | 不能把 workload 自测当框架验证 |
-| `examples/cases/` | 可版本化 workload、插件、案例运行器 | 结果及镜像写入生成目录 |
-| `examples/<target>/` | 历史示例与外部被测目标 | 逐案例迁移，不移动在途实验依赖 |
+| `examples/<case>/` | 每个案例的目标/外部依赖、驱动、插件、配置和运行入口 | 实际model check相关源文件归案例；生成物写入build/output |
+| `examples/_support/` | 共享宿主会话、编译、配置写出与转换重放工具 | 唯一明确标识的非案例基础设施；不含目标状态提取或专用搜索 |
 | `third_party/` | 编译依赖 | 固定版本，按需初始化 |
 | `tools/storage/` | 保存状态的只读诊断工具源码 | 可执行文件位于配置构建目录 |
 | `tools/`、`scripts/`、`perf/` | 其他离线工具、诊断脚本及 microbenchmark | 后续逐项核验调用关系，避免只搬目录 |
@@ -112,3 +112,63 @@ checkout、拉取或修改任何子模块，也没有更改本地排除规则来
 机器清单与原始构建日志位于 `build/repository-layout-audit/`（不入库），包括
 子模块状态/未跟踪文件hash、旧工具回收、RED/GREEN及真实构建失败记录。
 本轮没有执行实际仓库的 `make clean`；其数据保留行为在隔离fixture中验证。
+
+## 后续修订：案例按目录自包含
+
+用户明确原始设计：所有实际模型检验相关文件均属于 `examples/`，每个案例
+拥有目标源码/库、运行驱动、选择点/性质插件及配置；目标与驱动可以合并。
+因此没有采用将这些文件拆入 `tests/fixtures` 或 `tests/integration` 的方案。
+
+原 `examples/cases/` 已拆为 `two_debits`、`lost_notification`、`runtime_admission`、
+`exact_once`，Raft相关驱动归入已有 `raft`/`redisraft`，完整module独立为
+`redisraft_module`。案例专属的三节点搜索与状态投影归 `redisraft/search.py`，
+共享 `_support/session.py` 只保留宿主工具。三个单进程案例不再经由一个
+`--mode` 总入口调度；各自 `run.py` 拥有配置策略及验收流程。不同语言/变体
+配置由驱动生成，精确 `config.json` 与本轮结果一同保存，避免失效路径模板。
+
+根目录散落的hello源码收拢到 `examples/hello/`，预编译ELF退出版本控制，
+编译输出到 `build/examples/hello/`。宿主回归留在 `tests/`，案例README、
+实际目标、插件、配置和入口不因此移出案例目录。索引为 `examples/README.md`
+和 `examples/catalog.json`。
+
+三个在途module driver仍持有原路径。迁移前对41个旧源文件做逐字节冻结并
+记录inode/进程实例，用已在隔离目录验证的Linux `RENAME_EXCHANGE` 将旧目录
+原子交换为指向 `build/legacy-cases` 的本地忽略链接；旧原目录也保存在
+`build/original-case-tree`。交换前后41个源文件hash不变，三组driver仍为原实例。
+新入口完全不依赖该链接，新clone没有 `cases` 源码或兼容目录。待这三组旧任务
+结束后可回收链接和两个旧副本；不要在它们仍运行时递归清理这两个兼容目录。
+
+本轮的RED/GREEN、宿主回归、真实案例结果及兼容桥清单位于
+`build/example-layout-audit/`。历史报告中的旧源路径保持原样，以免改写执行归属；
+复现时应选择匹配的历史commit，当前运行入口以案例索引为准。
+
+同一规则还应用于原来散落在 `tests/` 的实际案例运行工具：Redis手控驱动归
+`examples/redis/run.py`，Raft的benchmark、profiling汇总、page/soft-dirty实验和
+seed插件归 `examples/redisraft/`，zero-guard实验归 `examples/two_debits/`。
+对应 `benchmark.mk` 也归案例，插件产物在 `build/<mode>/npN/examples/redisraft/`。
+框架内部的actor/恢复/存储回归仍留在 `tests/`，不把它们伪装为实际系统案例。
+
+本轮验证：
+
+- 迁移前后9组宿主回归，合计103项通过；独立审查复验通过。
+- `make check CC=/usr/bin/gcc CXX=/usr/bin/g++`：9项组件案例、14项构建契约及
+  5项目录/入口检查通过。后者核验14个实际运行入口与profile入口的help、源码
+  归属、目录外启动、catalog和make路由，不启动被测进程。
+- `make NP=1 check-cases CC=/usr/bin/gcc CXX=/usr/bin/g++`：本轮生产NP1的
+  C/C++扣款8行及pthread通知4行full/pages真实搜索、终点/反例三次重放通过；
+  runtime-admission实际C探针的bounded/成功/缺少工具回归通过。
+- Willemt及Redis维护Raft库各4行正常/注错full/pages实际搜索和三次重放通过。
+  为避免替换在途工具及无关重编译，这8行明确使用已有不可变
+  `tracer-iteration23-np3`，不声称是新C03实现的NP3验证。
+- 案例新路径上的NP3选择/性质/seed插件真实编译通过；hello从源编译并打印
+  `Hello`。新增搬迁的历史benchmark只做入口、路径和编译检查，没有重跑完整
+  性能矩阵，也没有重启或重新验收完整RedisRaft module。
+
+本轮小案例结束后，其生成的原始状态库按独立清单回收，仅保留配置、结果、
+源码版本、日志及重放记录；不因目录调整再次长期堆积探索镜像。三个在途任务
+及旧源兼容桥不在该回收范围。
+
+另将待提交文件导出到无兼容链接、无已初始化子模块的独立目录，5项目录/入口/
+构建路由检查全部通过，避免本机残留文件掩盖漏提交或旧路径依赖。清理实际
+回收104个验证状态库约998.3MiB，220个结果/日志文件hash不变。迁移机器记录与
+执行版本边界已在独立审查中核验；这些验证不扩大原有框架正确性claim。

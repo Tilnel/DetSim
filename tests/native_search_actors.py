@@ -10,8 +10,8 @@ import sys
 import tempfile
 
 ROOT=Path(__file__).resolve().parents[1]
-sys.path.insert(0,str(ROOT/'examples/cases'))
-from run import Session,command,digest,require
+sys.path.insert(0,str(ROOT/'examples'))
+from _support.session import Session,command,digest,require
 
 MODES={'actors':'a','choices':'c','waiting':'w','race':'r','deadlines':'d','mixed':'m','pending':'p'}
 
@@ -172,7 +172,7 @@ def main():
         for build in [['/usr/bin/gcc','-std=gnu11','-O0','-g','-gdwarf-4','-fno-pie','-no-pie','-Wall','-Wextra','-Werror',ROOT/'tests/native_search_actors.c','-o',binary],
                       ['/usr/bin/g++','-std=gnu++20','-shared','-fPIC','-Wall','-Wextra','-Werror','-I'+str(ROOT/'src'),'-I'+str(ROOT/'third_party'),ROOT/'tests/native_search_plugin.cpp','-o',plugin]]:
             result=command(build,ROOT);require(result.returncode==0,result.stdout)
-        sources=[Path(__file__).resolve(),ROOT/'tests/native_search_actors.c',ROOT/'tests/native_search_plugin.cpp',ROOT/'examples/cases/run.py']
+        sources=[Path(__file__).resolve(),ROOT/'tests/native_search_actors.c',ROOT/'tests/native_search_plugin.cpp',ROOT/'examples/_support/session.py']
         archive=work/'source-archive';archive.mkdir()
         frozen={}
         for path in sources:
