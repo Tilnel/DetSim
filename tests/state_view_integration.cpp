@@ -1,5 +1,9 @@
 #include "state/state_view.h"
 #include "state/page_snapshot.h"
+#include "state_store_packed.h"
+#include <fstream>
+#include <thread>
+#include <barrier>
 #include "monitor.h"
 #include "proc_status.h"
 #include "dwarf_info.h"
@@ -20,16 +24,17 @@ static void require(bool b,const char* m) { if(!b) throw std::runtime_error(m); 
 template<class F> static void rejects(F f) { bool b=false; try { f(); } catch(const std::exception&) { b=true; } require(b,"expected rejection"); }
 static_assert(NP >= 2, "State observation fixture needs two logical nodes");
 // Construct saved observations through both real snapshot layouts, without a live tracee.
-static sys_state save_stdio_fixture(const tracee_state& saved, bool pages) {
+static sys_state save_serialized_fixture(const std::vector<uint8_t>& metadata, bool pages, size_t memory_size=4096) {
  auto& store=StateStore::instance();
- std::ostringstream encoded; { cereal::BinaryOutputArchive archive(encoded); archive(saved); }
- const auto text=encoded.str(); const std::vector<uint8_t> metadata(text.begin(),text.end());
- RegionInfo region{}; region.start=0x1000; region.end=0x2000; region.prot=PROT_READ;
- memcpy(region.flags,"r--p",5); const std::vector<uint8_t> memory(4096,0); user_regs_struct regs{};
+ RegionInfo region{}; region.start=0x1000; region.end=region.start+memory_size; region.prot=PROT_READ;
+ memcpy(region.flags,"r--p",5); const std::vector<uint8_t> memory(memory_size,0); user_regs_struct regs{};
  std::vector<uint8_t> bytes;
  if (pages) {
-  const auto page=store.save(memory.data(),memory.size());
-  bytes=encode_page_manifest({region},metadata,"",regs,{{region.start,4096,page}});
+  require(memory_size && memory_size%4096==0,"fixture memory must span complete pages");
+  const auto page=store.save(memory.data(),4096);
+  std::vector<PageRef> pages;
+  for(size_t offset=0;offset<memory_size;offset+=4096) pages.push_back({region.start+offset,4096,page});
+  bytes=encode_page_manifest({region},metadata,"",regs,pages);
  } else {
   StateDataHeader header{}; header.magic=0x4453544D; header.version=FLAT_SNAPSHOT_VERSION; header.num_regions=1;
   header.tstate_offset=sizeof(header)+sizeof(region); header.tstate_size=metadata.size();
@@ -41,6 +46,13 @@ static sys_state save_stdio_fixture(const tracee_state& saved, bool pages) {
   memcpy(bytes.data()+region.offset,memory.data(),memory.size()); memcpy(bytes.data()+header.regs_offset,&regs,sizeof(regs));
  }
  sys_state machine; machine.ts_hash[0]=store.save(bytes.data(),bytes.size()); return machine;
+}
+static std::vector<uint8_t> serialize_fixture(const tracee_state& saved) {
+ std::ostringstream encoded; { cereal::BinaryOutputArchive archive(encoded); archive(saved); }
+ const auto text=encoded.str(); return {text.begin(),text.end()};
+}
+static sys_state save_stdio_fixture(const tracee_state& saved,bool pages,size_t memory_size=4096) {
+ return save_serialized_fixture(serialize_fixture(saved),pages,memory_size);
 }
 static void captured_stdio_observation(StateStore& store, const StateStore::Config& config) {
  static_assert(DETSIM_BUFFER_STDIO==6 && DETSIM_PLUGIN_ABI_V2==2);
@@ -115,6 +127,105 @@ static void captured_stdio_observation(StateStore& store, const StateStore::Conf
  }
  puts("PASS captured stdio full/pages cold observation: close/exit, binary bytes, redirection, missing/type/size/selectors");
 }
+static void compact_metadata_constructor(StateStore& store,const StateStore::Config& config) {
+ constexpr size_t image_size=5*1024*1024;
+ tracee_state saved; saved.tv={123,456}; const auto expected=serialize_fixture(saved);
+ auto reopen=[&](size_t budget=0) {
+  store.wait_for_completion(); store.shutdown(); auto cold=config;
+  cold.hot_cache_size=budget; cold.warm_cache_size=budget; store.init(cold); store.reset_stats();
+ };
+ for(bool pages:{false,true}) {
+  const auto machine=save_stdio_fixture(saved,pages,image_size); const auto hash=machine.ts_hash[0];
+  for(size_t budget:{size_t(0),size_t(1)}) {
+   reopen(budget);
+   tracee_state first(hash); first.tv={999,1}; first.fd_manager_state.release_fd(1);
+   first.fs_state.filesystem.at(first.fs_state.open_files.at(1).path).content={'x'};
+   const tracee_state second(hash); const auto reads=store.get_stats().disk_reads;
+   fprintf(stderr,"compact metadata constructor pages=%d budget=%zu root_reads=%lu\n",pages,budget,reads);
+   require(second.tv.tv_sec==123 && second.tv.tv_usec==456 && second.fd_manager_state.is_allocated(1) &&
+           second.fs_state.filesystem.at(second.fs_state.open_files.at(1).path).content.empty(),"metadata branches decode independently");
+   require(reads==1,"large flat metadata queries repeatedly decode discarded full roots");
+   require(*SnapshotView::load_metadata(hash)==expected,"owned metadata bytes equal complete snapshot bytes");
+   auto view=SnapshotView::open(hash);
+   require(view!=nullptr && view->main_regs().rax==0,"metadata entry must not masquerade as memory view");
+   uint8_t value=0xff; view->read_into(0x1000,&value,1); require(value==0,"metadata-first memory access");
+   const auto after_memory=store.get_stats().disk_reads;
+   require(after_memory==2,"memory view/page requires the independent full-root or page read");
+   require(tracee_state(hash).tv.tv_sec==123 && store.get_stats().disk_reads==after_memory,"memory open preserves cached metadata");
+   store.shutdown(); rejects([&]{SnapshotView::load_metadata(hash);}); rejects([&]{tracee_state state(hash);});
+   auto cold=config; cold.hot_cache_size=0; cold.warm_cache_size=0; store.init(cold); store.reset_stats();
+   require(tracee_state(hash).tv.tv_sec==123 && store.get_stats().disk_reads==1,"metadata cache epoch after close/reopen");
+  }
+  auto small=save_stdio_fixture(saved,pages); reopen();
+  const auto view=SnapshotView::open(small.ts_hash[0]);
+  require(*SnapshotView::load_metadata(small.ts_hash[0])==expected && SnapshotView::open(small.ts_hash[0])==view,"metadata lookup must retain a small cached view");
+  // Structurally valid roots may still contain invalid serialized metadata.
+  auto trailing=expected; trailing.push_back(0xff);
+  tracee_state invalid_io=saved; invalid_io.fd_manager_state.release_fd(1);
+  for(const auto& invalid:{std::vector<uint8_t>{0},trailing,serialize_fixture(invalid_io)}) {
+   const auto bad=save_serialized_fixture(invalid,pages,image_size); reopen();
+   for(int attempt=0;attempt<2;++attempt) rejects([&]{tracee_state state(bad.ts_hash[0]);});
+   require(store.get_stats().disk_reads==1,"cached raw bytes still require repeated archive/trailing/I-O validation");
+  }
+  std::vector<hash_type> large_metadata;
+  tracee_state large=saved; const auto path=large.fs_state.open_files.at(1).path;
+  large.fs_state.filesystem.at(path).content.assign(1536*1024,'m');
+  large.fs_state.filesystem.at(path).metadata.st_size=1536*1024;
+  for(int i=0;i<3;++i) {large.tv.tv_usec=i;large_metadata.push_back(save_stdio_fixture(large,pages,image_size).ts_hash[0]);}
+  reopen();
+  for(size_t i=0;i<2;++i) SnapshotView::load_metadata(large_metadata[i]);
+  for(size_t i=0;i<2;++i) SnapshotView::load_metadata(large_metadata[i]);
+  require(store.get_stats().disk_reads==2,"two metadata/view entries fit combined 4MiB budget");
+  SnapshotView::load_metadata(large_metadata.back());
+  require(store.get_stats().disk_reads==3,"three cold byte-budget metadata roots");
+  SnapshotView::load_metadata(large_metadata.back());
+  require(store.get_stats().disk_reads==3,"most recent metadata survives byte pressure");
+  SnapshotView::load_metadata(large_metadata.front());
+  require(store.get_stats().disk_reads==4,"combined 4MiB budget evicts oldest metadata/view");
+  large.fs_state.filesystem.at(path).content.assign(4*1024*1024+1024,'b');
+  large.fs_state.filesystem.at(path).metadata.st_size=4*1024*1024+1024;
+  const auto oversized=save_stdio_fixture(large,pages,image_size); reopen();
+  for(int i=0;i<2;++i) require(tracee_state(oversized.ts_hash[0]).tv.tv_sec==123,"oversized metadata remains valid");
+  require(store.get_stats().disk_reads==2,"oversized metadata bypasses bounded cache");
+ }
+ // Concurrent misses publish one owned slice, not duplicate LRU keys.
+ const auto shared=save_stdio_fixture(saved,false,image_size).ts_hash[0]; reopen();
+ std::array<std::shared_ptr<const std::vector<uint8_t>>,8> owners;
+ std::array<std::exception_ptr,8> errors; std::barrier start(8); std::vector<std::thread> threads;
+ for(size_t i=0;i<owners.size();++i) threads.emplace_back([&,i] {
+  start.arrive_and_wait(); try {owners[i]=SnapshotView::load_metadata(shared);} catch(...) {errors[i]=std::current_exception();}
+ });
+ for(auto& thread:threads) thread.join();
+ for(size_t i=0;i<owners.size();++i) {if(errors[i]) std::rethrow_exception(errors[i]);require(owners[i]==owners[0] && *owners[i]==expected,"same-key metadata misses share one immutable slice");}
+ std::vector<hash_type> keys;
+ for(int i=0;i<257;++i) {auto entry=saved;entry.tv.tv_usec=i;keys.push_back(save_stdio_fixture(entry,false,image_size).ts_hash[0]);}
+ reopen();
+ for(size_t i=0;i<256;++i) SnapshotView::load_metadata(keys[i]);
+ SnapshotView::load_metadata(keys.front());
+ require(store.get_stats().disk_reads==256,"256 small compact entries fit existing entry cap");
+ SnapshotView::load_metadata(keys.back()); require(store.get_stats().disk_reads==257,"257th cold entry");
+ SnapshotView::load_metadata(keys.back()); require(store.get_stats().disk_reads==257,"entry-cap most recent survives");
+ SnapshotView::load_metadata(keys[1]); require(store.get_stats().disk_reads==258,"256-entry cap evicts oldest untouched compact entry");
+ // keys[2] is now evicted. A warm slice remains valid, but a miss cannot use
+ // that retained data or a live image when the actual root is missing/corrupt.
+ std::ifstream index(config.packed_storage_path+"/global.idx",std::ios::binary); index.exceptions(std::ios::badbit|std::ios::failbit);
+ uint32_t magic,version; uint64_t count; index.read(reinterpret_cast<char*>(&magic),4);index.read(reinterpret_cast<char*>(&version),4);index.read(reinterpret_cast<char*>(&count),8);
+ require(magic==0x53544149 && version==1,"fixture packed index"); PackedIndexEntry entry{}; bool found=false;
+ for(uint64_t i=0;i<count;++i) {hash_type key;PackedIndexEntry candidate;index.read(reinterpret_cast<char*>(&key),8);index.read(reinterpret_cast<char*>(&candidate),sizeof(candidate));if(key==keys[2]) {entry=candidate;found=true;break;}}
+ require(found,"evicted fixture root indexed"); index.close();
+ const auto segment=config.packed_storage_path+"/segments/"+std::to_string(entry.segment_id)+".dat";
+ std::filesystem::rename(segment,segment+".held");
+ require(!SnapshotView::load_metadata(keys.front())->empty(),"warm validated slice need not rescan missing disk root");
+ for(int i=0;i<2;++i) rejects([&]{SnapshotView::load_metadata(keys[2]);});
+ std::filesystem::rename(segment+".held",segment);
+ std::fstream bytes(segment,std::ios::binary|std::ios::in|std::ios::out); bytes.exceptions(std::ios::badbit|std::ios::failbit);
+ char original;bytes.seekg(entry.offset);bytes.read(&original,1);const char corrupt=original^0xff;bytes.seekp(entry.offset);bytes.write(&corrupt,1);bytes.flush();
+ for(int i=0;i<2;++i) rejects([&]{SnapshotView::load_metadata(keys[2]);});
+ bytes.seekp(entry.offset);bytes.write(&original,1);bytes.close();
+ require(!SnapshotView::load_metadata(keys[2])->empty(),"restored root validates after failed misses");
+ store.shutdown(); store.init(config);
+ puts("PASS compact snapshot metadata: full/pages, tiny/zero/cold, fresh graph, bounded single LRU, concurrency, oversized bypass, archive/I-O/lifecycle/eviction integrity");
+}
 int main(int argc, char** argv) {
  require(argc==4,"expected two distinct DWARF binaries and changed-layout fixture");
  char directory[]="/tmp/detsim-view-XXXXXX";
@@ -123,6 +234,7 @@ int main(int argc, char** argv) {
   StateStore::Config cfg; cfg.packed_storage_path=std::string(directory)+"/packed"; cfg.hot_cache_size=1; cfg.warm_cache_size=1; cfg.prefetch_threads=0;
   auto& store=StateStore::instance(); store.init(cfg);
   captured_stdio_observation(store,cfg);
+  compact_metadata_constructor(store,cfg);
   RegionInfo r{}; r.start=0x1000; r.end=0x2000; r.prot=PROT_READ|PROT_WRITE; memcpy(r.flags,"rw-p",5);
   std::vector<uint8_t> bytes(4096); long value=123; memcpy(bytes.data(),&value,sizeof(value));
   auto page=store.save(bytes.data(),bytes.size());

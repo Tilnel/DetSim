@@ -375,9 +375,8 @@ tracee_state::tracee_state(hash_type hash)
   : threads(), thread_create_records(), main_tid(0), current_thread_idx(0), futex_state()
 {
   if (!hash) return;
-  const auto snapshot = SnapshotView::open(hash);
-  const auto metadata = snapshot->metadata();
-  std::istringstream encoded(std::string(reinterpret_cast<const char*>(metadata.data()), metadata.size()));
+  const auto metadata = SnapshotView::load_metadata(hash);
+  std::istringstream encoded(std::string(reinterpret_cast<const char*>(metadata->data()), metadata->size()));
   try {
     cereal::BinaryInputArchive archive(encoded);
     archive(*this);

@@ -63,6 +63,15 @@ worker 压缩一次，生成磁盘记录并复用压缩结果填充 L2。
 淘汰、重载和关闭只移除缓存的所有权，不会清空调用者手上的数据。
 因此缓存预算不等于总RSS：调用者缓冲区、pending、索引、压缩上下文、分配器，
 以及页后端的工作图像、上次页owner和4MiB/256项解析缓存另计。
+
+解析缓存现在也允许同一 LRU 条目持有独立的序列化 tracee metadata 小块，
+与完整 SnapshotView 共用上述预算，未增加第二套缓存。大 full root 的 metadata
+miss 仍完整读取并验证 root，再复制所需字节；hit 不再物化整幅内存。
+小 root 的完整 reader 保留，metadata-only 条目不能回答内存、映射或寄存器读取。
+每次 tracee 解码仍独立执行 Cereal、尾部检查及 I/O 图校验，不共享可变资源图。
+每次缓存查询检查 store ready/poison 和 generation；关闭立即使旧 epoch 无效，
+LRU 在后续访问时惰性清理。已验证的 warm bytes 不逐次重扫物理磁盘，淘汰或
+重开后的 miss 必须重新验证；页和外部 VFS payload 维持原来的按需读取规则。
 L1/L2预算为零时仍可保存和读取。
 
 未完成写入默认最多 50 个、64 MiB；队列和正在执行的任务都计入。

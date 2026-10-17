@@ -36,6 +36,10 @@ class SnapshotView {
   // Backend dispatch occurs once per chunk, never once per byte.
   class Memory;
   static std::shared_ptr<const SnapshotView> open(hash_type hash);
+  // Independently owned serialized bytes, acquired only from a fully validated
+  // snapshot root; referenced pages retain their existing lazy validation. Large
+  // roots need not stay resident for metadata-only observations.
+  static std::shared_ptr<const std::vector<uint8_t>> load_metadata(hash_type hash);
   const std::vector<RegionInfo>& regions() const { check_generation(); return regions_; }
   std::span<const uint8_t> metadata() const;
   std::string_view maps_text() const;

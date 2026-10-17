@@ -88,6 +88,24 @@
 
 新输出分别为 `/mnt/k2/detsim-modelcheck/iteration24-healthy-pages/run-wgoqt31e` 和 `iteration24-healthy-full/run-ew6f3cmk`，监督器、不可变源码档案与实际 PID incarnation 见 `build/case-jobs/iteration24-module-healthy-{pages,full}/`。只对此次各自输出树应用已测试的 96 GiB 软上限及 32 GiB 空闲保留；不删除旧镜像。最新选中矩阵恢复为 **56 已核验、3 在途、1 旧 full 注错失败**，中止的两个正常旧实验保留在 earlier evidence。旧 mutant/pages22 原进程继续运行，不能将新接口或自适应 driver 的性能归因给它。
 
+### 补齐 full 注错尝试与 CPU 分析：2026-10-17 07:24 UTC
+
+07:16 UTC 启动缺失的 mutant/full24：`/mnt/k2/detsim-modelcheck/iteration24-mutant-full/run-sted923t`，同一固定 tracer/checker、同一已审阅监督器及 full 的 12 小时预算。自己的 native 前置已通过预期反例验收：client exit42、checker exit1，精确诊断为 node3 的已确认 alpha 本地值缺失。model 尚在真实控制执行，不能把 native 反例算 model-checking 结果。此前 mutant/full 超时仍保留，选中矩阵现在 **56 已核验、4 组在途**。旧 mutant/pages22 的候选执行已出现 `ack beta=29,index=8`；仍未取得保留路径的终态与三次反例重放。
+
+另整理先前 healthy/full23 的真实 INIT/JOIN CPU 采样：10 秒、99 Hz DWARF、1,136 个 tracer 栈，原 record 未报告丢样。以下分类按栈和线程取互斥优先级，不是墙钟时间，也不是业务搜索阶段占比：
+
+| 阶段 | 样本 | 全部 tracer CPU 样本占比 |
+| --- | ---: | ---: |
+| capture_stopped | 612 | 53.87% |
+| 插件读取 metadata 时完整解压 root | 229 | 20.16% |
+| IO worker | 119 | 10.48% |
+| 其他 tracee metadata 加载 | 62 | 5.46% |
+| 其余线程及控制路径 | 114 | 10.04% |
+
+capture 内部 229 个样本是 reference/duplicate 原始镜像解压，146 个是其他 save/hash/compare/copy，119 个是跨进程读，112 个是 buffer 清零，6 个其他。它们与“插件 metadata 完整解压”是不同调用路径，不能相加后称为可直接删除的开销。原始栈和分类方法见 `build/case-jobs/iteration23-module-healthy-full/prefix-profile/{stacks.txt,analysis.json}`。
+
+metadata 路径的机制是：`StateView::metadata` 调用 `tracee_state(hash)`，后者通过完整 SnapshotView 获取少量序列化 metadata；约 275 MiB 的 full root 超过现有 reader 的 4 MiB 缓存预算，所以再次观察同一进程仍完整加载/解压。正在验证的优化是在**同一个有界 LRU** 中保留独立的小 metadata 字节块；miss 仍完整验证 root，每次仍独立反序列化，不能 alias 大镜像或改信 caller 的 child。运行 RED 已证明有效 full root 在 hot/warm 为 0 时，两次真实 constructor 产生两次 root disk load；新实现和整体收益尚待验证，不能将它归因给当前 immutable24 的在途实验。
+
 ## 2. 实验数据
 
 <!-- CASE_METRICS_START -->
@@ -343,6 +361,27 @@ pages 也先完整读取，然后按 4 KiB 页面分块；地址、长度和实�
 | pages / discard | 2.599→2.407 | 3.243→3.093 | -4.62% | 243,400→243,228 |
 
 full 的命令最大 RSS 减少约 192 MiB，pages 基本不变。GNU time 的命令最大值不是所有进程同时 RSS 之和；这些是存在并行 module/runtime 任务时的合成整体案例测量，不是 Redis 加速保证。证据：`build/packed-stream-whole-benchmark/run-ldv5lw7m/results.json` 及 `build/packed-stream-audit/benchmark-audit.json`。
+
+### 3.5 后续优化：metadata 查询不再反复物化大 root
+
+根据上文真实 full INIT/JOIN 栈的重复解压证据，新增内部 `SnapshotView::load_metadata(hash)`。它复用同一 4 MiB／256 项 LRU：条目可以持有完整小 reader，或者独立的序列化 metadata 字节块。大 root 的 miss 仍走完整 root 加载、内容 key、格式及区间验证，随后只复制 metadata；缓存不持有该大镜像的别名。完整内存读取仍通过 `open()`，不会把 metadata-only 条目当 reader。
+
+每次 `tracee_state(hash)` 仍独立反序列化，并检查 trailing bytes 和 I/O 图；没有缓存可变 tracee 或改信调用者的 child。每次缓存查询仍检查 store ready/poison 和 generation。关闭使旧 epoch 失效、后续访问惰性清理；并不承诺立刻释放外部 owner，也不承诺 warm 命中逐次重验物理磁盘。pages 子页及 VFS 外部 payload 的验证仍按既有读取路径进行。格式37/38、kernel24、语义身份与 guest 行为不变。
+
+真实 constructor 的运行 RED 为两次读取同一大 full root 时发生两次 root disk load；GREEN 在 full/pages × hot/warm0或1 中均为一次。回归还覆盖 metadata-first 后内存读取、独立资源图、小 reader 保留、4 MiB 和256项正负容量边界、超大 metadata 不缓存、同 epoch 的8线程同 key miss、重复坏 archive/trailing/I/O、poison、关闭重开及淘汰后的缺失/损坏。并发测试不是所有 close/reopen 竞态的穷举证明。
+
+整体对照使用同一个编译出的 C fixture、192 MiB 零 guard、原有输入 oracle，加一个公共 ABI 插件在每步同时观察 before/after 的保存时钟、资源 JSON 和捕获 stdout。三轮 old24/new25 交替、两种 backend，共12行；**每行18个 visited、正常退出及3次终点重放**。计时覆盖启动、搜索、检查、保存恢复、重放和清理，排除编译与 native oracle：
+
+| backend | 搜索秒：旧→新 | visited/搜索秒：旧→新 | whole-driver秒：旧→新 | whole-driver变化 | 命令最大RSS KiB：旧→新 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| full | 17.071746→8.217284 | 1.054→2.191 | 23.251298→11.136132 | -52.11% | 434,684→434,576 |
+| pages | 2.291935→2.269036 | 7.854→7.933 | 2.863785→2.838586 | -0.88% | 243,756→243,824 |
+
+这是刻意包含前后资源查询的**合成探索负载**；其命中率、进程数和镜像内容不同于 RedisRaft。pages 的差异很小，不能宣称普遍改善，最大 RSS 也基本不变。正式对照期间仍有四组 module 实验并发，未与额外 production build/native suite 并行，仍不是隔离环境。此前与 build/native tests 重叠的 pilot 和 old/old smoke 也保留，但不作为正式数字。正式数据：`build/compact-metadata-benchmark/run-zk6tq6ok/results.json`；pilot `run-d3uaiii3`；smoke `run-ry_wxts0`。
+
+新 NP1/NP4 构建、`make check`、NP2 state-view/plugins/page、NP1 storage/page/state-I/O、全部30个原生场景及8个输入/4个 pthread 案例通过，reader 的 targeted Clang 分析无诊断。此外，新 NP4 只读工具对**已关闭的真实 module full/pages 镜像**各独立观察三轮四个进程，逐字节核对捕获流、核对资源 JSON/时钟并在 metadata 后重新打开完整内存 root；store 文件长度和mtime保持不变。该只读检查不是新模型搜索或 full/page 性能对照。证据：`build/compact-snapshot-metadata/`。
+
+当前在途真实 module 仍使用原 immutable22/24，不能把本优化或合成提速归因给它们。新工具为 immutable25。接下来优先修实际 native CLI 的线程/timeout 后继枚举，使 DFS/BFS 留在 tracer 内；Python 的逐候选往返只是此前 C03 缺口下的临时案例策略，不应成为框架的主要探索流水线。
 
 ## 4. 一次转换、捕获与恢复的详细流程
 

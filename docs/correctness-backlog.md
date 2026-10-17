@@ -1132,3 +1132,26 @@ This is not evidence that either module reached its terminal business result.
 Old mutant/pages continues independently; full module acceptance is still open.
 See [current report](technical-report-2026-10-17.md) and
 `build/captured-stdio-{observation,regression}/`. C03/C08/C25 remain open.
+
+### Bounded saved-metadata observations (2026-10-17)
+
+Actual module full INIT/JOIN perf has229/1136 tracer stacks in plugin metadata
+inspection loading/decompressing a full image; this is CPU sampling, not search
+walltime. SnapshotView now reuses its existing4MiB/256entry LRU for independent
+serialized metadata slices when a large root cannot remain cached. Misses retain
+complete root validation; every tracee constructor independently runs Cereal,
+trailing and I/O checks. Memory reads still require the complete reader. Poison,
+ready and epoch guards remain; no formats, identity or kernel-model change.
+
+A runtimeRED old constructor reads a>5MiBflatroot twice; GREEN full/pages with
+zero/tiny store caches reads its root once. Component tests cover bothcapacity
+limits and positives, oversized bypass, sameepoch concurrent misses, independent
+branches, metadata-first memory, repeated invalid archives/I/O, poison, reopen
+and posteviction missing/corrupt roots. NP1/4production, NP2framework/page,
+NP1storage/page/stateIO,30native and12input/pthread rows pass. Readonly NP4
+observations consume actual closed module images in both formats without writes.
+Paired synthetic full resource-observation wholecase improves23.251→11.136s,
+pages2.864→2.839s;18visited and3replays everyrow. These are not Redis speedups.
+See [report](technical-report-2026-10-17.md) and build/compact-snapshot-metadata/.
+C03/C08/C25 remain open; nextpriority is actual CLI BFS/DFS actor+timeout coverage,
+not extending the Python workaround. Existing immutable22/24jobs retain versions.

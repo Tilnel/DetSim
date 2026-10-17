@@ -17,12 +17,26 @@ size_t chunk_length(uint64_t address, uint64_t end) {
 struct CacheEntry {
   hash_type hash;
   std::shared_ptr<const SnapshotView> view;
+  std::shared_ptr<const std::vector<uint8_t>> metadata;
   size_t bytes;
 };
 std::mutex cache_mutex;
 std::list<CacheEntry> cache;
 uint64_t cache_generation = 0;
 size_t cache_bytes = 0;
+// Caller holds cache_mutex; generations are monotonic. Never let an older
+// in-flight load clear entries already published for a newly opened store.
+void reset_cache(uint64_t generation) {
+  require(cache_generation<=generation,"Store changed while accessing snapshot cache");
+  if (cache_generation!=generation) {
+    cache.clear(); cache_bytes=0; cache_generation=generation;
+  }
+}
+void make_cache_room(size_t size) {
+  while (!cache.empty() && (cache.size()>=256 || cache_bytes>cache_limit-size)) {
+    cache_bytes-=cache.back().bytes; cache.pop_back();
+  }
+}
 }
 
 // Both storage encodings expose the same immutable chunk reader. SnapshotView
@@ -167,35 +181,95 @@ void SnapshotView::check_generation() const {
 }
 std::shared_ptr<const SnapshotView> SnapshotView::open(hash_type hash) {
   auto& store = StateStore::instance();
-  uint64_t generation = store.snapshot_generation();
+  const uint64_t generation = store.snapshot_generation();
+  std::shared_ptr<const SnapshotView> cached;
   {
     std::lock_guard lock(cache_mutex);
-    if (cache_generation != generation) { cache.clear(); cache_bytes = 0; cache_generation = generation; }
-    for (auto it = cache.begin(); it != cache.end(); ++it) {
-      if (it->hash == hash) {
-        auto result = it->view;
-        cache.splice(cache.begin(), cache, it);
-        return result;
+    reset_cache(generation);
+    for (auto it=cache.begin();it!=cache.end();++it) {
+      // A compact metadata entry cannot answer memory/register/map queries.
+      if (it->hash==hash && it->view) {
+        cached=it->view; cache.splice(cache.begin(),cache,it); break;
       }
     }
   }
+  if (cached) {
+    require(store.snapshot_generation()==generation,"Store changed while opening snapshot");
+    return cached;
+  }
   auto bytes = store.load_shared(hash);
   require(bool(bytes), "Missing state snapshot");
-  uint64_t loaded_generation = store.snapshot_generation();
+  const uint64_t loaded_generation = store.snapshot_generation();
   require(generation == loaded_generation, "Store changed while opening snapshot");
   // StateStore validates content keys before publishing immutable loaded buffers.
   auto result = std::shared_ptr<const SnapshotView>(new SnapshotView(bytes, loaded_generation));
   const size_t reader_size = result->header_.version == PAGE_SNAPSHOT_VERSION ? sizeof(PagedMemory) : sizeof(FlatMemory);
   const size_t size = sizeof(SnapshotView) + reader_size + bytes->size() +
       result->regions_.size() * sizeof(RegionInfo) + result->pages_.size() * sizeof(PageRef) + page_size;
+  require(store.snapshot_generation()==loaded_generation,"Store changed while opening snapshot");
   if (size <= cache_limit) {
     std::lock_guard lock(cache_mutex);
-    if (cache_generation != loaded_generation) { cache.clear(); cache_bytes = 0; cache_generation = loaded_generation; }
-    while (!cache.empty() && (cache.size() >= 256 || cache_bytes > cache_limit - size)) {
-      cache_bytes -= cache.back().bytes; cache.pop_back();
+    reset_cache(loaded_generation);
+    for (auto it=cache.begin();it!=cache.end();++it) {
+      if (it->hash!=hash) continue;
+      if (it->view) {
+        result=it->view; cache.splice(cache.begin(),cache,it);
+      } else {
+        cache_bytes-=it->bytes; cache.erase(it);
+      }
+      break;
     }
-    cache.push_front({hash, result, size}); cache_bytes += size;
+    if (cache.empty() || cache.front().hash!=hash) {
+      make_cache_room(size);
+      cache.push_front({hash,result,{},size}); cache_bytes+=size;
+    }
   }
+  require(store.snapshot_generation()==loaded_generation,"Store changed while opening snapshot");
+  return result;
+}
+std::shared_ptr<const std::vector<uint8_t>> SnapshotView::load_metadata(hash_type hash) {
+  auto& store=StateStore::instance();
+  const uint64_t generation=store.snapshot_generation();
+  std::shared_ptr<const std::vector<uint8_t>> result;
+  std::shared_ptr<const SnapshotView> view;
+  {
+    std::lock_guard lock(cache_mutex);
+    reset_cache(generation);
+    for (auto it=cache.begin();it!=cache.end();++it) {
+      if (it->hash==hash) {
+        result=it->metadata; view=it->view;
+        cache.splice(cache.begin(),cache,it); break;
+      }
+    }
+  }
+  if (result) {
+    require(store.snapshot_generation()==generation,"Store changed while loading snapshot metadata");
+    return result;
+  }
+  // Do not decode just a header/prefix: a miss follows the complete existing
+  // validation path, including layout/region tables and the content key.
+  if (!view) view=open(hash);
+  const auto bytes=view->metadata();
+  result=std::make_shared<const std::vector<uint8_t>>(bytes.begin(),bytes.end());
+  const size_t size=sizeof(CacheEntry)+sizeof(std::vector<uint8_t>)+result->size();
+  require(store.snapshot_generation()==generation,"Store changed while loading snapshot metadata");
+  if (size<=cache_limit) {
+    std::lock_guard lock(cache_mutex);
+    reset_cache(generation);
+    bool found=false;
+    for (auto it=cache.begin();it!=cache.end();++it) {
+      if (it->hash!=hash) continue;
+      // Keep small cached views intact. A concurrent metadata fill also wins
+      // without introducing duplicate keys or retaining this full root.
+      if (it->metadata) result=it->metadata;
+      cache.splice(cache.begin(),cache,it); found=true; break;
+    }
+    if (!found) {
+      make_cache_room(size);
+      cache.push_front({hash,{},result,size}); cache_bytes+=size;
+    }
+  }
+  require(store.snapshot_generation()==generation,"Store changed while loading snapshot metadata");
   return result;
 }
 std::span<const uint8_t> SnapshotView::metadata() const {

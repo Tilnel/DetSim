@@ -72,7 +72,9 @@ int main(int argc, char** argv) {
     for (uint32_t unsupported : {5u,6u,7u,8u,FLAT_SNAPSHOT_VERSION-2,PAGE_SNAPSHOT_VERSION-2}) {
       auto older=manifest;
       reinterpret_cast<StateDataHeader*>(older.data())->version=unsupported;
-      rejects([&]{SnapshotView::open(save(older));});
+      const auto invalid=save(older);
+      rejects([&]{SnapshotView::open(invalid);});
+      for(int attempt=0;attempt<2;++attempt) rejects([&]{SnapshotView::load_metadata(invalid);});
     }
     char root_argument[32]; snprintf(root_argument,sizeof(root_argument),"%llx",(unsigned long long)key);
     const auto reader=fork(); require(reader>=0,"fork fresh reader");
@@ -86,6 +88,7 @@ int main(int argc, char** argv) {
     auto view = SnapshotView::open(key);
     require(view->format_version()==PAGE_SNAPSHOT_VERSION && view->main_regs().rip==42 && view->maps_text()=="maps", "Manifest metadata");
     require(view->metadata().size()==3 && view->page_count(0)==2 && view->page_count(1)==2, "Manifest tables");
+    require(*SnapshotView::load_metadata(key)==metadata,"Metadata API preserves exact saved manifest bytes");
     std::vector<uint8_t> output(bytes.size()); view->read_into(0x1003, output.data(), output.size());
     require(output==bytes, "Cross-page and adjacent-region read");
     auto pinned = view->page(0,0); view->page(1,1);
@@ -101,8 +104,10 @@ int main(int argc, char** argv) {
     auto wrong=pages; wrong[0].address++;
     rejects([&]{SnapshotView::open(save(encode_page_manifest(regions,metadata,"maps",regs,wrong)));});
     wrong=pages; wrong[0].key=UINT64_MAX;
-    auto missing=SnapshotView::open(save(encode_page_manifest(regions,metadata,"maps",regs,wrong)));
+    const auto missing_root=save(encode_page_manifest(regions,metadata,"maps",regs,wrong));
+    auto missing=SnapshotView::open(missing_root);
     rejects([&]{missing->page(0,0);});
+    require(*SnapshotView::load_metadata(missing_root)==metadata,"Metadata validates root while child pages retain lazy validation");
     wrong=pages; wrong[0].key=store.save(metadata.data(),metadata.size());
     auto shortpage=SnapshotView::open(save(encode_page_manifest(regions,metadata,"maps",regs,wrong)));
     rejects([&]{shortpage->page(0,0);});
@@ -113,6 +118,7 @@ int main(int argc, char** argv) {
     constexpr hash_type false_manifest = 0x123456789abcdef0ULL;
     packed.save(manifest.data(), manifest.size(), false_manifest);
     rejects([&]{SnapshotView::open(false_manifest);});
+    for(int attempt=0;attempt<2;++attempt) rejects([&]{SnapshotView::load_metadata(false_manifest);});
     constexpr hash_type false_page = 0x123456789abcdef1ULL;
     packed.save(bytes.data(), pages[0].length, false_page);
     wrong=pages; wrong[0].key=false_page;
@@ -134,9 +140,20 @@ int main(int argc, char** argv) {
     cfg.read_only=true; store.init(cfg); auto reopened=SnapshotView::open(key);
     reopened->read_into(0x1003,output.data(),output.size()); require(output==bytes,"Cold reopen");
     rejects([&]{view->metadata();}); store.shutdown();
+    rejects([&]{SnapshotView::load_metadata(key);});
     // Cached flat bytes and pages must not bypass a poisoned store.
     cfg.read_only=false; cfg.hot_cache_size=65536; cfg.warm_cache_size=65536;
     store.init(cfg);
+    auto large=legacy; const size_t extra=5*1024*1024;
+    auto large_header=h; large_header.regs_offset+=extra;
+    RegionInfo large_last; const size_t last_offset=sizeof(h)+(regions.size()-1)*sizeof(RegionInfo);
+    memcpy(&large_last,large.data()+last_offset,sizeof(large_last)); large_last.end+=extra;
+    large.resize(large.size()+extra);
+    memcpy(large.data(),&large_header,sizeof(large_header)); memcpy(large.data()+last_offset,&large_last,sizeof(large_last));
+    memcpy(large.data()+large_header.regs_offset,&regs,sizeof(regs));
+    const auto large_key=save(large); store.wait_for_completion();
+    const auto compact=SnapshotView::load_metadata(large_key);
+    require(*compact==metadata && SnapshotView::load_metadata(large_key)==compact,"Large flat root caches an owned metadata-only slice");
     const auto legacy_key=save(legacy);
     auto warm_old=SnapshotView::open(legacy_key);
     auto warm_new=SnapshotView::open(key);
@@ -157,6 +174,7 @@ int main(int argc, char** argv) {
     }
     rejects([&]{SnapshotView::open(key);});
     rejects([&]{SnapshotView::open(legacy_key);});
+    for(auto poisoned_key:{key,legacy_key,large_key}) rejects([&]{SnapshotView::load_metadata(poisoned_key);});
     rejects([&]{store.shutdown();});
     std::filesystem::remove_all(directory);
     puts("page_snapshot_integration: PASS (cold/tiny, flat/pages, coverage, bounds, missing/length/key integrity, lifecycle/poison)");
