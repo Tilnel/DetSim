@@ -1,5 +1,8 @@
 # Developing DetSim
 
+[2026-10-17 技术与实验报告](technical-report-2026-10-17.md)列出逐案例探索、
+镜像尺寸、syscall 边界，以及当前保存、恢复和线程控制流程；其中在途数据有明确采样时间。
+
 For storage APIs, persistence boundaries and memory limits, see the
 [current storage contract](state_store_full_guide.md).
 
