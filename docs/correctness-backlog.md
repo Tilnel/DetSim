@@ -663,6 +663,21 @@ protocol capability under current actor policy; Go runtime OS-thread count does
 not establish goroutine-to-OS-thread assignment or exhaustive scheduling.
 
 
+Fresh immutable22 runtime admission reruns independently pass all 12 full/pages
+rows: C 4 states, C++ 10, Rust 20, Python 274, gc Go 201/201, gccgo 237/235.
+The audit checks 24 sessions, 12 control-edge replays, 36 terminal replays,
+48 absent owned PIDs, and 1,413 captured-rootfs input entries; all six native
+commands were also rerun to exact RUNTIME_OK/exit0. Actual ELF identity separates
+gc and gccgo. Evidence: build/case-jobs/iteration22-admission-audit/results.json.
+These jobs used the archived pre-adaptive helper. Admission-other lacks an
+embedded helper provenance field; its Git revision and clean product diff plus
+the archived Git blob support historical attribution; an exact helper hash was
+not recorded at launch for that job. Config digests computed by the audit are additional evidence, not original launch-time records. The
+gccgo state-count difference is not a claim of backend exploration equivalence.
+Current22 runtime concurrency reruns remain in progress; older protocol results
+above must not be presented as fresh results from this binary.
+
+
 ### EOF fault backing: native feasibility evidence only
 
 Independent native oracle tests/file_eof_native_oracle.cpp compares ordinary file
@@ -935,6 +950,29 @@ after (median); reply hashes match. See build/case-session/benchmark.json and
 verification.json. This is polling-only improvement, not full exploration speedup.
 Real full/pages actor equivalence and the runner's incomplete/missing-tool failure
 gates pass; current binary C/C++/pthread12row cases pass with the final reader.
+
+The reply loop now starts at 100µs and doubles its sleep up to the existing 5ms
+cap, preserving the same deadline and prompt/EOF rules. The 17 component tests
+include backoff order, cap and timeout overshoot. A paired three-trial experiment
+issuing 300 read-only scalar queries to one stopped tracee measured median 1.578s
+with fixed polling versus 0.216s with adaptive polling; driver CPU was 0.0632s
+versus 0.0350s. This measures inspection latency only, not transition or whole-search
+throughput. Raw trials: build/case-session-adaptive/run-a3z71zik/results.json
+(pre-commit prototype wrapper, explicitly attributed to its archived helper).
+
+Fresh immutable22 NP3 quorum regression with the committed adaptive loop passes
+healthy/mutant × full/pages: 444 executed sibling actions and 12 terminal replays.
+Per-row action/layer/alias/pruning counters match the earlier fixed-poll run.
+That run used iteration19, so this is not a same-binary isolation of polling
+effects. Healthy reaches its first NORMAL commit and mutant reaches the specific quorum
+violation. Both use bounded beam-1 exploration, not exhaustive schedule coverage.
+Evidence: build/polling-quorum-regression/run-2sksjtwh/result.json; independent
+raw action/observation/replay audit: build/case-jobs/iteration22-admission-audit/
+polling-quorum.json. The 17 session tests and make check pass. Already-running module drivers retain the exact older
+helper archived under build/case-jobs/iteration22-source-archive/manifest.json;
+its SHA256 is checked against Git 3c72939. Their outcomes are not attributed to
+adaptive polling, and no execution equivalence of the two helper versions is
+assumed merely to accept historical evidence.
 
 ### Compression output allocation
 
