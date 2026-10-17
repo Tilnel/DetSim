@@ -26,6 +26,7 @@ check-raft-plugin-contract: $(BUILD_DIR)/tests/raft_checker_unit $(BUILD_DIR)/te
 	python3 tests/raft_case_runner_test.py
 	python3 tests/redisraft_case_runner_test.py
 	python3 tests/redisraft_quorum_runner_test.py
+	python3 tests/redisraft_repair_runner_test.py
 check-plugins: check-raft-plugin-contract
 $(BUILD_DIR)/tests/raft_checker_unit: tests/raft_checker_unit.cpp examples/raft/plugins/check_common.hpp src/api/plugin.h $(BUILD_DIR)/.config
 	@mkdir -p $(dir $@)

@@ -92,6 +92,19 @@
       "status": "native healthy/mutant and full/pages pre-NORMAL sibling search with3x exact terminal replay pass",
       "scope": "real election and callbacks; root before any NORMAL append; beam1, six actor/preset candidates per source; first NORMAL committed/applied on leader, fixed voters, no restart/reconfiguration/compaction; UDP queue capacity3",
       "documentation": "docs/redisraft-benchmark.md"
+    },
+    {
+      "id": "redisraft-log-repair",
+      "path": "examples/cases/redisraft_repair_fixture.c",
+      "processes": 3,
+      "threads_per_process": 1,
+      "build": "make NP=3 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4",
+      "command": "python3 examples/cases/redisraft_repair_run.py --tracer ./tracer --depth 96 --timeout 600",
+      "property": "after scripted isolation and real term2 election, replace the old leader uncommitted suffix and preserve identical committed log bytes",
+      "mutation": "disable the previous-log-term mismatch guard in an owned library copy",
+      "status": "native pair and full/pages healthy/mutant preheal search with3x exact terminal replay pass",
+      "scope": "fixed three voters; snapshotted workload link phases; real election, rejection, truncation and retry; six actor/preset sibling beam1; no crash/restart/compaction or exhaustive partition claim",
+      "documentation": "docs/redisraft-benchmark.md"
     }
   ],
   "next_targets": [
@@ -101,7 +114,7 @@
       "servers": 3,
       "build": "make NP=4 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4",
       "command": "python3 examples/cases/redisraft_full_run.py --tracer ./tracer --timeout 2400 --max-control-steps 6000 --search-depth 2000 --search-seconds 1800",
-      "status": "native pair and finite actor oracle pass; actual pages healthy/mutant timed out before ACK checkpoints; full pair still running; model matrix non-green",
+      "status": "native pair and finite actor oracle pass; healthy/mutant full/pages model attempts all timed out without final business acceptance; model matrix non-green",
       "scope": "three real loaded modules plus RESP client; public saved protocol/log oracle; case-side guided beam1 with explicit pruning and timeout actions",
       "documentation": "examples/cases/redisraft_full/README.md",
       "evidence": "docs/redisraft-benchmark.md#真实-redisraft-模块的搜索吞吐与边界2026-10-16"

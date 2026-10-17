@@ -21,7 +21,10 @@ struct packet {
     struct wire_entry { raft_term_t term; raft_entry_id_t id; int type; raft_size_t length; } entries[MAX_ENTRIES];
     char payload[MAX_ENTRIES][PAYLOAD];
 };
-struct context { int id, fd, generated; raft_server_t *server; };
+struct context {
+    int id, fd, generated; raft_server_t *server;
+    int (*route)(struct context *, const struct packet *);
+};
 /* Public DWARF root used by the case checker, not a mirror of library state. */
 raft_server_t *r;
 raft_server_t *raft;
@@ -48,6 +51,7 @@ static int emit(struct context *c, struct packet *p) {
     p->from=c->id;
     last_sent=*p;
     sent_events++;
+    if (c->route && !c->route(c,p)) return 0;
 #ifdef RAFT_NATIVE_REFERENCE
     assert(queued < (int)(sizeof(queue)/sizeof(*queue)));
     queue[queued++]=*p;
@@ -117,6 +121,7 @@ static void receive(struct context *c, const struct packet *wire) {
     }
     assert(!raft_apply_all(c->server));
 }
+#ifndef RAFT_FIXTURE_ADAPTER_ONLY
 static void generate(struct context *c) {
 #ifdef RAFT_QUORUM_CASE
     /* Bootstrap must replicate the no-op before submitting application input. */
@@ -244,3 +249,5 @@ int main(int argc,char **argv) {
     }
 }
 #endif
+
+#endif /* RAFT_FIXTURE_ADAPTER_ONLY */

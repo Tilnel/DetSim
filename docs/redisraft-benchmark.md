@@ -541,3 +541,101 @@ make NP=2 check-plugins CC=/usr/bin/gcc CXX=/usr/bin/g++
 这些是有剪枝的协议级有限案例，不等于协议完备证明，也不替代仍未通过的完整
 RedisRaft模块矩阵。后续协议目标包括网络分区、重新选主与冲突日志修复；C03/C25
 的一般调度/原子边界缺口仍然存在。
+
+
+### 完整模块 full 两轮的最终截止（2026-10-17）
+
+此前仍在后台的 iteration19 full 两轮现已结束，均是timeout，不能通过。
+
+| 指标 | healthy/full | mutant/full |
+| --- | ---: | ---: |
+| 搜索阶段秒数 | 12700.514 | 12729.536 |
+| 完整展开层 | 947 | 950 |
+| 记录的候选边 | 5751 | 5770 |
+| 明确完成的候选边 | 5751 | 5769 |
+| 不同后继哈希 | 3974 | 3986 |
+| 候选边/秒 | 0.453 | 0.453 |
+
+两轮总作业预算21600秒，受控初始化和成员加入消耗了约149分钟，搜索实际剩余
+约212分钟；不是完整跑满配置的18000秒搜索预算。与pages的不同二进制、并行
+负载和执行时间窗不可直接组成受控性能对照。原始 `result.json` 分别位于
+`build/redisraft-full-cases/run-ltq0ircj/`、`run-nmzicegr/`。
+
+进一步检查实际保留路径：两轮均在第780层客户端read收到SET alpha的 `+OK`，
+第784层发送 INFO raft，第788层等待INFO回复。pages保留路径也有同一SET回复。
+因此“没有ACK标记”不代表SET没有返回；客户端还未完成用于ACK标记的commit查询。
+仍未达到第二条写入、完整进度/本地值检查及终点重放，四项模块验收继续非绿色。
+四轮均保存了结束报告、tracer正常退出及owned进程清理证据。没有自动扩大预算重跑。
+
+
+## 脚本化隔离、重新选主与冲突后缀修复（2026-10-17）
+
+`examples/cases/redisraft_repair_fixture.c` 复用已有库适配器，增加位于guest普通
+内存中的链路phase和收发凭据。A提交初始no-op后提出alpha2并隔离，A与B/C之间
+发出的包被测试路由回调丢弃；B/C之间继续通信。B/C通过真实超时/pre-vote/vote
+选举B为term2 leader，提交term2 no-op2和beta3。B提交3后恢复发包，A收到其真实
+healing AppendEntries才恢复回复。这是明确的非对称、脚本化网络环境，不是任意
+网络分区枚举；没有写入伪造Raft内部字段，没有修改通用框架调度或网络实现。
+
+搜索根在A收到healing请求前，严格检查：A仍为term1 leader，保留no-op1与
+term1 alpha2，commit/apply1；B为term2 leader、C为term2 follower，两者保留
+no-op1、term2 no-op2和term2 beta3，commit/apply3；A healing-receipt为0。
+
+正常库先拒绝缺失的prev3，再拒绝本地term1与请求term2不匹配的prev2，并删除
+冲突后缀，最后接受prev1携带的两项新日志。owned副本只将previous-log-term
+检查改为恒不执行；它错误接受prev2+beta3，导致A提交alpha2，而B/C已提交no-op2。
+plain Raft插件在提交后、应用前准确报告：
+`redisraft.safety: property violation: conflicting committed entry 2`。
+
+独立native oracle直接使用真实库API和消息回调：正常版3次请求/2次拒绝后完整
+收敛，注错版2次请求/1次拒绝后验证精确冲突日志字节。模型中存在排队的重复
+heartbeat，因此实际请求次数更多；不把native最短消息顺序冒充模型执行路径。
+
+| 版本/后端 | 完成候选转移 | 展开层 | 层内不同后继之和 | 重复候选 | 剪枝不同子节点之和 | 终点重放 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| healthy/full | 300 | 50 | 241 | 59 | 191 | 3 |
+| healthy/pages | 300 | 50 | 241 | 59 | 191 | 3 |
+| mutant/full | 138 | 23 | 112 | 26 | 89 | 3 |
+| mutant/pages | 138 | 23 | 112 | 26 | 89 | 3 |
+
+每个源执行三个actor各两个preset，全部候选从同一源恢复且逐一检查后才选一个
+后继继续，beam=1。正常最终三节点精确日志和commit/apply均到3，实际5次healing
+请求、4次拒绝（含重复heartbeat）；保存的中间观察确实包含prev2/term2→NACK1，
+旧alpha后缀被截去，随后prev1带两项日志成功。注错最终A commit3/apply1，保留
+term1 alpha2与term2 beta3；实际3次healing请求、2次拒绝，最后错误成功确认了
+prev2/term2的一项beta日志。不是无关诊断或客户端断言失败。
+
+独立审查逐一核对876个实际load源/actor/si回复/目标hash以及全部观察查询，
+12次终点重放逐一匹配前驱、动作、目标、verdict、diagnostic与观察值；核对所有
+库/适配器/fixture/runner/helper/二进制/插件/config/tracer哈希，每轮4个owned
+PID均消失且tracer exit0。实际depth1负例完成6个候选后failed、passed=false，
+清理通过。16项原有Python方法和新增5项修复验收方法通过，`make check`、
+`make NP=2 check-plugins`、编译警告检查和C静态分析通过。
+
+搜索、日志投影和重放由共用的 `examples/cases/raft_search.py` 提供，两个协议
+case只保留各自root和性质。提取前通过现有负例测试锁定行为，再用原始四轮
+transcript离线重放全部CLI命令，确认444个旧候选的ledger、计数和重放完全相同。
+这是解析/行为回归证据，不冒充新的ptrace执行；另行fresh运行quorum四项和旧
+选举四项均通过。helper源码hash进入每行验收，避免共享实现缺失版本归属。
+
+产物：
+
+- 四项聚合：`build/redisraft-repair-final/result.json`。
+- healthy/full：`build/redisraft-repair-final/healthy-full/run-ogtv3u2e/result.json`。
+- healthy/pages：`build/redisraft-repair-final/healthy-pages/run-fa3zgfph/result.json`。
+- mutant/full：`build/redisraft-repair-final/mutant-full/run-ru8sk25p/result.json`。
+- mutant/pages：`build/redisraft-repair-final/mutant-pages/run-9o0trs94/result.json`。
+- 独立审计与拒绝/截断证据：`build/redisraft-repair-audit/results.json`、
+  `verify_rows.py`、`repair-receipt-changes.json`。
+- 截止负例：`build/redisraft-repair-cutoff/run-n77ved8d/result.json`。
+- 共享提取的离线回归：`build/shared-search-extraction-equivalence.json`；fresh
+  quorum回归在 `build/redisraft-quorum-shared-regression/`，选举回归在
+  `build/redisraft-repair-election-regression/run-8hj4bjst/result.json`。
+
+```sh
+make NP=3 CC=/usr/bin/gcc CXX=/usr/bin/g++ -j4
+python3 examples/cases/redisraft_repair_run.py --tracer ./tracer --depth 96 --timeout 600
+```
+
+原有60行汇总仍是56通过、4项完整模块timeout。新增协议案例补充了提交前搜索和
+日志修复路径，不替代模块验收，也不关闭C03/C25的一般控制与交织覆盖缺口。

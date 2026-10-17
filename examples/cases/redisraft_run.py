@@ -20,7 +20,7 @@ SOURCES = ("raft_server.c", "raft_server_properties.c", "raft_node.c", "raft_log
 MUTATION = ("if (resp->vote_granted) {\n        if (node) {", "if (1) {\n        if (node) {")
 
 
-def build_variant(output, variant, cc, *, quorum=False):
+def build_variant(output, variant, cc, *, quorum=False, fixture=None, mutation=None, extra_defines=()):
     """Copy only library inputs, never vendor objects/Makefiles/git metadata."""
     owned = output / variant
     owned.mkdir(parents=True, exist_ok=True)
@@ -37,7 +37,8 @@ def build_variant(output, variant, cc, *, quorum=False):
             inputs[str(path.relative_to(LIBRARY))] = common.digest(path)
     server = sources / "src/raft_server.c"
     original = server.read_text()
-    mutation = ("raft_index_t commit = indexes[num_voters / 2];", "raft_index_t commit = indexes[0];") if quorum else MUTATION
+    mutation = mutation or (("raft_index_t commit = indexes[num_voters / 2];", "raft_index_t commit = indexes[0];") if quorum else MUTATION)
+    fixture = Path(fixture) if fixture is not None else HERE / "redisraft_fixture.c"
     common.require(original.count(mutation[0]) == 1, "mutation match must occur exactly once")
     if variant == "mutant":
         server.write_text(original.replace(*mutation))
@@ -46,17 +47,20 @@ def build_variant(output, variant, cc, *, quorum=False):
         "mutation": {"file": "src/raft_server.c", "before": mutation[0],
                      "after": mutation[1], "count": 1} if variant == "mutant" else None,
         "mutated_source_sha256": common.digest(server),
-        "driver_sha256": common.digest(HERE / "redisraft_fixture.c"),
+        "driver_sha256": common.digest(fixture),
+        "adapter_sha256": common.digest(HERE / "redisraft_fixture.c"),
         "toolchain": common.command(cc + ["--version"], ROOT).stdout,
         "runner_sha256": common.digest(HERE / "redisraft_run.py"),
         "profile": {"nodes": 3, "commands": ["set alpha 17", "set beta 29"],
                     "raft_compaction": False, "snapshot_backends": ["full", "pages"]}}
     flags = ["-std=gnu11", "-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie",
              "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter", "-I" + str(sources / "include")]
+    flags.extend(extra_defines)
     if quorum:
         flags.append("-DRAFT_QUORUM_CASE")
-    manifest["scenario"] = "replication-quorum" if quorum else "election"
-    paths = [str(HERE / "redisraft_fixture.c")] + [str(sources / "src" / name) for name in SOURCES]
+    manifest["scenario"] = ("log-repair" if fixture.name == "redisraft_repair_fixture.c"
+                            else "replication-quorum" if quorum else "election")
+    paths = [str(fixture)] + [str(sources / "src" / name) for name in SOURCES]
     manifest["build_commands"] = []
     for name, defines in (("native-reference", ["-DRAFT_NATIVE_REFERENCE"]), ("raft-case", [])):
         argv = cc + flags + defines + paths + ["-o", str(owned / name)]

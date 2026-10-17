@@ -990,3 +990,13 @@ and reproduce the terminal edge three times. This is a pruned beam1 case, not
 closure of C03/C25 or general snapshot-state completeness. The full RedisRaft
 module pages pair timed out without business acceptance; full pair remains
 non-green pending actual results. See [protocol and module evidence](redisraft-benchmark.md).
+
+
+Log-repair evidence (2026-10-17): scripted three-voter isolation, real term2
+re-election and preheal search now exercise previous-term rejection, truncation
+and retry in the real RedisLabs library. Healthy full/pages converge through
+index3; the owned-copy guard regression reaches exact committed-entry2 conflict.
+876 raw sibling transitions and12 terminal replays were independently checked.
+This is a case-side pruned beam, not generic scheduler coverage; full module
+healthy/mutant full/pages all timed out. C03/C25 remain open. See the linked
+[protocol evidence](redisraft-benchmark.md).
