@@ -439,6 +439,40 @@ static void restore_protection(pid_t pid, uint64_t start, uint64_t end, int prot
     throw std::runtime_error("Cannot restore snapshot memory protection");
 }
 
+static bool discard_zero_guards()
+{
+  const char* mode = getenv("DETSIM_ZERO_GUARD_RESTORE");
+  if (!mode || !strcmp(mode, "discard")) return true;
+  if (!strcmp(mode, "write")) return false;
+  throw std::runtime_error("Invalid DETSIM_ZERO_GUARD_RESTORE: expected discard or write");
+}
+
+static bool private_anonymous_coverage(const std::vector<maps_item>& maps,
+                                       uint64_t start, uint64_t end)
+{
+  uint64_t cursor = start;
+  for (const auto& item : maps) {
+    if (item.end <= cursor) continue;
+    if (item.start > cursor || item.start >= end || item.flags[3] != 'p' ||
+        item.inode || item.name[0] || item.a || item.b) return false;
+    cursor = std::min(end, item.end);
+    if (cursor == end) return true;
+  }
+  return false;
+}
+
+static bool has_virtual_file_origin(const FileSystemState& state, uint64_t start, uint64_t end)
+{
+  if (state.overlaps_virtual_file_mapping(start, end)) return true;
+  // Check origins independently, including low-level callers with incomplete
+  // coverage metadata. A native anonymous VMA can carry a modeled file image.
+  for (const auto& [address, origin] : state.virtual_file_mapping_sources) {
+    if (address >= end) break;
+    if (origin.first > start) return true;
+  }
+  return false;
+}
+
 static bool same_backing(const maps_item& saved, const maps_item& live, uint64_t address)
 {
   if (saved.flags[3] != live.flags[3] || saved.inode != live.inode ||
@@ -461,6 +495,7 @@ static void require_no_process_rseq(pid_t pid)
 void tracee_state::restore_memory_mappings(
     hash_type ts_hash, int pid, std::vector<maps_item> &maps_out) const
 {
+  (void)discard_zero_guards();
   require_no_process_rseq(pid);
   const auto snapshot = SnapshotView::open(ts_hash);
   std::vector<maps_item> maps_saved;
@@ -543,6 +578,7 @@ void tracee_state::restore_memory_mappings(
 void tracee_state::recover_mem_reg_snapshot(std::vector<maps_item> &maps,
                                             hash_type ts_hash, int pid) const
 {
+  const bool discard_guards = discard_zero_guards();
   require_no_process_rseq(pid);
   const auto snapshot = SnapshotView::open(ts_hash);
   const auto& regions = snapshot->regions();
@@ -567,6 +603,8 @@ void tracee_state::recover_mem_reg_snapshot(std::vector<maps_item> &maps,
   auto current_maps_file = fileutils::open_cfile(fmt::format("/proc/{}/maps", pid), "r");
   if (!current_maps_file) throw std::runtime_error("Cannot inspect restore memory permissions");
   get_maps_item(current_maps, current_maps_file.get());
+  if (ferror(current_maps_file.get()) || current_maps.empty())
+    throw std::runtime_error("Incomplete current memory mappings for restore");
   std::vector<size_t> protected_regions;
   std::vector<uint8_t> comparison;
 
@@ -583,6 +621,37 @@ void tracee_state::recover_mem_reg_snapshot(std::vector<maps_item> &maps,
     }
     if (!valid) throw std::runtime_error("Snapshot private region missing during restore");
 
+    bool force_guard_write = false;
+    constexpr size_t page_size = 4096;
+    if (discard_guards && region.prot == PROT_NONE &&
+        start % page_size == 0 && end % page_size == 0 &&
+        private_anonymous_coverage(maps, start, end) &&
+        private_anonymous_coverage(current_maps, start, end) &&
+        !has_virtual_file_origin(fs_state, start, end)) {
+      static constexpr uint8_t zero_page[page_size]{};
+      bool all_zero = true;
+      // Validate every saved page before discarding anything in this region.
+      // Neither a zero-page key nor unreadable live memory proves its contents.
+      for (size_t page_index = 0; page_index < snapshot->page_count(i); ++page_index) {
+        const auto page = snapshot->page(i, page_index);
+        if (page.length > sizeof zero_page || memcmp(page.data, zero_page, page.length))
+          all_zero = false;
+      }
+      if (all_zero) {
+        flush();
+        if (tracee_do_syscall(pid, SYS_madvise, start, size, MADV_DONTNEED, 0, 0, 0) == 0) {
+          restore_protection(pid, start, end, PROT_NONE);
+          detsim::page_restore::zero_guard_bytes.fetch_add(size, std::memory_order_relaxed);
+          detsim::page_restore::zero_guard_regions.fetch_add(1, std::memory_order_relaxed);
+          continue;
+        }
+        // A failed call may already have discarded part of the range. Repair
+        // its entire saved image through the baseline path, without comparison.
+        force_guard_write = true;
+        detsim::page_restore::zero_guard_fallbacks.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+
     uint64_t readable_end = start;
     bool original_permissions = true;
     for (const auto& live : current_maps) {
@@ -592,7 +661,7 @@ void tracee_state::recover_mem_reg_snapshot(std::vector<maps_item> &maps,
       readable_end = std::min(end, live.end);
       if (readable_end == end) break;
     }
-    const bool comparable = readable_end == end;
+    const bool comparable = readable_end == end && !force_guard_write;
     if (comparable) {
       comparison.resize(size);
       iovec local{comparison.data(), size}, remote{reinterpret_cast<void*>(start), size};
@@ -792,6 +861,7 @@ void tracee_state::bind_threads_for_restore(int index, hash_type hash)
 
 void tracee_state::recover_running_state(int index, hash_type ts_hash) const
 {
+  (void)discard_zero_guards();
   const auto resolved = resolve_thread_bindings(index, ts_hash);
   ptmc_state.tracee_image_dirty[index] = true;
   restore_thread_signal_masks(index, resolved);
@@ -802,6 +872,7 @@ void tracee_state::recover_running_state(int index, hash_type ts_hash) const
 
 void tracee_state::recover_stopped(int index, hash_type ts_hash) const
 {
+  (void)discard_zero_guards();
   const pid_t main_pid = ptmc_state.pids[index];
   /* Restore the kernel heap extent before reconciling VMAs. */
   if (tracee_do_syscall(main_pid, SYS_brk, brk, 0, 0, 0, 0, 0) != brk)
@@ -1380,6 +1451,7 @@ void show_state_stats()
 
 void sys_state::recover_running_state() const
 {
+  (void)discard_zero_guards();
   if (!ptmc_state.model_identity.empty() && model_identity != ptmc_state.model_identity)
     throw std::runtime_error("Snapshot execution model differs from the configured model");
   // Resolve and verify every node before changing any live or modeled state.

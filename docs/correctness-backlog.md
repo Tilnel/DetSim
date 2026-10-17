@@ -1000,3 +1000,12 @@ index3; the owned-copy guard regression reaches exact committed-entry2 conflict.
 This is a case-side pruned beam, not generic scheduler coverage; full module
 healthy/mutant full/pages all timed out. C03/C25 remain open. See the linked
 [protocol evidence](redisraft-benchmark.md).
+
+
+Zero anonymous guard restore (2026-10-17): saved/current mapping and target VFS
+provenance proofs plus complete saved-byte validation permit MADV_DONTNEED only
+for verified-zero private anonymous PROT_NONE regions. Negative/partial failure
+falls back to full saved writes; unexpected exceptions retain the existing dirty
+contract. Six backend/cache mapping oracles, native regressions and a paired
+finite-search benchmark pass; this optimizes restore, not capture, and does not
+close C08 or certify physical-memory observations. See [scope and measurements](page-snapshots.md).

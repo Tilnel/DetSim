@@ -146,3 +146,4 @@
 !redisraft_quorum_checker_unit.cpp
 !redisraft_quorum_runner_test.py
 !redisraft_repair_runner_test.py
+!zero_guard_benchmark.py
