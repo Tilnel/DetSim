@@ -122,6 +122,13 @@ class BuildContractTest(unittest.TestCase):
         self.assertTrue((self.root / "memory/snapshot").exists())
         self.assertTrue((self.root / "sstate/snapshot").exists())
 
+    def test_xxhash_benchmark_links_its_library(self):
+        source = self.root / "perf/xxhash_benchmark.cpp"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("/* fixture */\n")
+        self.make("NP=1", "xxh_bench")
+        self.assertIn("'-lxxhash'", (self.root / "calls").read_text().splitlines()[-1])
+
     def test_pgo_phase_change_rebuilds_without_parallel_clean_race(self):
         self.make("NP=1", "pgo-generate", "-j4")
         self.make("NP=1", "pgo-use", "-j4")

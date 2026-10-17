@@ -100,7 +100,7 @@ ss_bench: $(BUILD_DIR)/perf/state_store_benchmark.o $(TRACER_OBJS_NO_MAIN) $(BUI
 sys_bench: $(BUILD_DIR)/perf/sysstate_store_benchmark.o $(TRACER_OBJS_NO_MAIN) $(BUILD_DIR)/nr2call.o
 	$(LD) $^ $(LDFLAGS) $(LDLIBS) -o $@
 xxh_bench: $(BUILD_DIR)/perf/xxhash_benchmark.o $(BUILD_DIR)/nr2call.o
-	$(LD) $^ $(LDFLAGS) -o $@
+	$(LD) $^ $(LDFLAGS) -lxxhash -o $@
 tools: tools/sstate_query tools/verify_sstate
 tools/sstate_query: $(BUILD_DIR)/tools/sstate_query.o $(TRACER_OBJS_NO_MAIN) $(BUILD_DIR)/nr2call.o
 	$(LD) $^ $(LDFLAGS) $(LDLIBS) -o $@
