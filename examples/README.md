@@ -19,7 +19,7 @@
 `loop`、`loop_inf`、`malloc`、`member`、`parentheses_test`、`simple_complex`、`write`
 是历史手动示例：各自的源码、Makefile和JSON在本目录内。[redis](redis/README.md)保留Redis手动
 配置和客户端，`paxos`保留Paxos依赖与适配实验。它们的存在不代表当前验证通过；
-Paxos子模块还有未提交适配源码，见[子模块审计](../docs/repository-layout.md)。
+Paxos适配源码已提交到其fork；构建方式和未验证边界见[Paxos案例说明](paxos/README.md)。
 
 ## 配置和产物
 
