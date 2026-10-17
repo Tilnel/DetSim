@@ -47,7 +47,7 @@ class QuorumAcceptance(unittest.TestCase):
                 edges=[edge | dict(node=n,preset=p) for n in range(3) for p in range(2)]
                 rows.append(dict(variant=variant,backend=backend,status=verdict,native='pass',tracer_exit=0,
                     owned_pids_before_close=[123,124,125,126],owned_pids_remaining=[],root_leader_matches=[1,0,0],
-                    scenario_runner_sha256='a'*64,binary_sha256='b'*64,checker_sha256='c'*64,
+                    scenario_runner_sha256='a'*64,search_driver_sha256='a'*64,binary_sha256='b'*64,checker_sha256='c'*64,
                     choose_sha256='d'*64,config_sha256='e'*64,tracer_sha256='f'*64,root='root',root_before_NORMAL=True,
                     root_observation=[dict(node=i,commit_idx=0,entries=[dict(index=1,term=1,type=4,data_len=0,bytes_hex='')]) for i in range(3)],search_edges=edges,retained_sources=[],
                     search_counters=dict(attempted_actions=6,partial_layer=False,depth_cutoff=False,source_layers=1,
