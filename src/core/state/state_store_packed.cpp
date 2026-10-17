@@ -1,6 +1,7 @@
 #include "state_store_packed.h"
 #include "utils.h"
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -95,6 +96,49 @@ struct Context
   }
 };
 thread_local Context context;
+// Validate every decoded byte without retaining a second, snapshot-sized raw image.
+// The decoder still owns its Zstd history window; this bounds only our output scratch.
+bool validate_encoded(const std::vector<uint8_t> &data, size_t size)
+{
+  if (!context.d)
+    fail("invalid decompression context");
+  if (ZSTD_getFrameContentSize(data.data(), data.size()) != size ||
+      ZSTD_findFrameCompressedSize(data.data(), data.size()) != data.size())
+    fail("frame size mismatch");
+  // Streaming defaults to a smaller window limit than one-shot decompression.
+  // Preserve accepted frames by allowing the full range supported by this library.
+  const auto bounds = ZSTD_dParam_getBounds(ZSTD_d_windowLogMax);
+  if (ZSTD_isError(bounds.error) ||
+      ZSTD_isError(ZSTD_DCtx_reset(context.d, ZSTD_reset_session_and_parameters)) ||
+      ZSTD_isError(ZSTD_DCtx_setParameter(context.d, ZSTD_d_windowLogMax,
+                                         bounds.upperBound)))
+    fail("decompression initialization failed");
+  std::array<uint8_t, 128 * 1024> scratch;
+  ZSTD_inBuffer input{data.data(), data.size(), 0};
+  size_t decoded = 0;
+  for (;;)
+  {
+    const auto previous_input = input.pos;
+    ZSTD_outBuffer output{scratch.data(), scratch.size(), 0};
+    const size_t remaining = ZSTD_decompressStream(context.d, &output, &input);
+    // One-shot decoding also accepts windows above the streaming API's maximum
+    // (e.g. 3.75 GiB versus a 2 GiB limit). Let the unchanged decoder validate
+    // those rare frames; no other streaming error permits a fallback.
+    if (ZSTD_getErrorCode(remaining) == ZSTD_error_frameParameter_windowTooLarge)
+      return false;
+    if (ZSTD_isError(remaining) || output.pos > size - decoded)
+      fail("decompression failed/size mismatch");
+    decoded += output.pos;
+    if (!remaining)
+    {
+      if (input.pos != input.size || decoded != size)
+        fail("decompression failed/size mismatch");
+      return true;
+    }
+    if (input.pos == previous_input && !output.pos)
+      fail("decompression made no progress");
+  }
+}
 } // namespace
 StateStorePacked &StateStorePacked::instance()
 {
@@ -450,9 +494,14 @@ hash_type StateStorePacked::save(const void *data, size_t len, hash_type hash,
     fail("store unavailable for writing");
   std::vector<uint8_t> input(static_cast<const uint8_t *>(data),
                              static_cast<const uint8_t *>(data) + len);
-  std::vector<uint8_t> raw =
-      encoded ? decompress(input, original_size) : std::move(input);
   auto it = index_.find(hash);
+  std::vector<uint8_t> raw;
+  if (!encoded)
+    raw = std::move(input);
+  else if (it != index_.end())
+    raw = decompress(input, original_size);
+  else if (!validate_encoded(input, original_size))
+    decompress(input, original_size);
   if (it != index_.end())
   {
     std::vector<uint8_t> previous;
@@ -475,7 +524,8 @@ hash_type StateStorePacked::save(const void *data, size_t len, hash_type hash,
     auto offset = file_size(active_segment_fd_);
     PackedDataHeader h{
         DATA_MAGIC, hash, static_cast<uint32_t>(compressed.size()),
-        static_cast<uint32_t>(raw.size()), compute_checksum(compressed)};
+        static_cast<uint32_t>(encoded ? original_size : raw.size()),
+        compute_checksum(compressed)};
     write_all(active_segment_fd_, &h, sizeof(h));
     write_all(active_segment_fd_, compressed.data(), compressed.size());
     PackedIndexEntry e{active_segment_id_, offset + sizeof(h),

@@ -14,12 +14,23 @@
 extern "C" detsim::ui::NCursesUI *get_ncurses_ui() { return nullptr; }
 static bool short_io = false, fail_write = false, fail_sync = false;
 static unsigned sync_count = 0;
+static bool bound_allocations = false;
+static size_t largest_allocation = 0;
+extern "C" void* __real__Znwm(size_t);
+extern "C" void* __wrap__Znwm(size_t size)
+{
+  if (bound_allocations)
+    largest_allocation = std::max(largest_allocation, size);
+  return __real__Znwm(size);
+}
 static bool poison_arrays = false;
 static size_t poison_expected_size = 0, poison_hits = 0;
 static uint8_t poison_value = 0;
 extern "C" void* __real__Znam(size_t);
 extern "C" void* __wrap__Znam(size_t size)
 {
+  if (bound_allocations)
+    largest_allocation = std::max(largest_allocation, size);
   void* result = __real__Znam(size);
   if (poison_arrays && size == poison_expected_size) {
     std::memset(result, poison_value, size);
@@ -134,6 +145,109 @@ static void compression_output_ignores_initial_array_contents(StateStorePacked& 
   std::cout << "compression output PASS: " << comparisons
             << " exact poisoned-array frame/roundtrip/capacity comparisons; 3 empty-input checks\n";
 }
+static void encoded_validation(StateStorePacked& store, int level)
+{
+  const std::vector<uint8_t> raw(8 * 1024 * 1024, 0x39);
+  const auto frame = zero_filled_reference(raw, level);
+  const auto entries = store.get_entry_count();
+  auto invalid = [&](const std::vector<uint8_t>& bytes, size_t size) {
+    rejects([&] { store.save(bytes.data(), bytes.size(), 900001, true, size); },
+            "invalid encoded frame published");
+    require(store.get_entry_count() == entries, "invalid encoded save changed index");
+    std::vector<uint8_t> missing;
+    require(store.load(900001, missing) == -1, "invalid encoded key visible");
+  };
+  auto truncated = frame; truncated.pop_back();
+  invalid(truncated, raw.size());
+  invalid(frame, raw.size() - 1);
+  invalid(frame, raw.size() + 1);
+  auto trailing = frame; trailing.push_back(0);
+  invalid(trailing, raw.size());
+  auto concatenated = frame;
+  concatenated.insert(concatenated.end(), frame.begin(), frame.end());
+  invalid(concatenated, raw.size());
+  // Reserved block type preserves frame header and declared size, but is undecodable.
+  auto malformed = frame;
+  const size_t header = 4 + 1 + ((frame[4] & 0x20) ? 0 : 1) +
+      ((frame[4] >> 6) == 0 ? ((frame[4] & 0x20) ? 1 : 0) :
+       ((frame[4] >> 6) == 1 ? 2 : ((frame[4] >> 6) == 2 ? 4 : 8)));
+  malformed[header] |= 6;
+  require(ZSTD_getFrameContentSize(malformed.data(), malformed.size()) == raw.size(),
+          "malformed fixture lost valid content-size header");
+  invalid(malformed, raw.size());
+
+  auto* checksum_context = ZSTD_createCCtx();
+  require(checksum_context != nullptr, "checksum context");
+  require(!ZSTD_isError(ZSTD_CCtx_setParameter(checksum_context, ZSTD_c_checksumFlag, 1)),
+          "checksum parameter");
+  std::vector<uint8_t> corrupt_checksum(ZSTD_compressBound(raw.size()));
+  const size_t checksum_size = ZSTD_compress2(checksum_context, corrupt_checksum.data(),
+      corrupt_checksum.size(), raw.data(), raw.size());
+  ZSTD_freeCCtx(checksum_context);
+  require(!ZSTD_isError(checksum_size), "checksum fixture compression");
+  corrupt_checksum.resize(checksum_size);
+  corrupt_checksum.back() ^= 1;
+  require(ZSTD_findFrameCompressedSize(corrupt_checksum.data(), corrupt_checksum.size()) ==
+              corrupt_checksum.size(), "checksum fixture no longer complete frame");
+  invalid(corrupt_checksum, raw.size());
+
+  largest_allocation = 0;
+  bound_allocations = true;
+  try {
+    require(store.save(frame.data(), frame.size(), 900001, true, raw.size()) == 900001,
+            "valid encoded save");
+  } catch (...) { bound_allocations = false; throw; }
+  bound_allocations = false;
+  require(largest_allocation < 256 * 1024,
+          "new encoded save allocates discarded snapshot-sized C++ buffer");
+  std::vector<uint8_t> loaded;
+  require(store.load(900001, loaded) == static_cast<ssize_t>(raw.size()) && loaded == raw,
+          "encoded round trip");
+  // Equal raw bytes encoded at another level must deduplicate; unequal bytes collide.
+  const auto alternative = zero_filled_reference(raw, level == 1 ? 3 : 1);
+  require(store.save(alternative.data(), alternative.size(), 900001, true, raw.size()) == 900001,
+          "different encoding of equal bytes rejected");
+  auto other = raw; other.back() ^= 1;
+  const auto collision = zero_filled_reference(other, level);
+  rejects([&] { store.save(collision.data(), collision.size(), 900001, true, raw.size()); },
+          "encoded raw-byte collision accepted");
+  require(store.load(900001, loaded) == static_cast<ssize_t>(raw.size()) && loaded == raw,
+          "collision changed saved bytes");
+  // Large advertised windows accepted by the one-shot API must stay accepted.
+  for (uint8_t descriptor : {uint8_t(0x90), uint8_t(0xa8), uint8_t(0xa9), uint8_t(0xaf)}) {
+    // 256 MiB, 2 GiB, 2.25 GiB and 3.75 GiB advertised windows.
+    auto wide = frame;
+    require(!(wide[4] & 3), "wide-window fixture has dictionary ID");
+    if (wide[4] & 0x20) {
+      wide[4] &= ~0x20;
+      wide.insert(wide.begin() + 5, descriptor);
+    } else {
+      wide[5] = descriptor;
+    }
+    require(store.decompress(wide, raw.size()) == raw, "wide-window reference decode");
+    const hash_type key = 900002 + descriptor;
+    require(store.save(wide.data(), wide.size(), key, true, raw.size()) == key,
+            "valid wide-window frame rejected");
+    require(store.load(key, loaded) == static_cast<ssize_t>(raw.size()) && loaded == raw,
+            "wide-window stored round trip");
+    auto corrupt_wide = corrupt_checksum;
+    if (corrupt_wide[4] & 0x20) {
+      corrupt_wide[4] &= ~0x20;
+      corrupt_wide.insert(corrupt_wide.begin() + 5, descriptor);
+    } else {
+      corrupt_wide[5] = descriptor;
+    }
+    const auto before = store.get_entry_count();
+    rejects([&] { store.decompress(corrupt_wide, raw.size()); },
+            "corrupt wide-window reference accepted");
+    rejects([&] { store.save(corrupt_wide.data(), corrupt_wide.size(), 900003,
+                             true, raw.size()); }, "corrupt wide-window save accepted");
+    require(store.get_entry_count() == before && store.load(900003, loaded) == -1,
+            "corrupt wide-window key published");
+  }
+  std::cout << "encoded validation PASS: bounded C++ allocation, malformed/truncated/size/trailing/"
+               "concatenated rejection, exact collisions, context reuse, wide window\n";
+}
 static void run_child(const char *self, const std::string &dir)
 {
   pid_t p = fork();
@@ -222,6 +336,7 @@ int main(int argc, char **argv)
     std::filesystem::create_directories(dir);
     c.max_entries_per_segment = 10000;
     s.init(c);
+    encoded_validation(s, c.compression_level);
     sync_count = 0;
     for (unsigned i = 1; i <= 1000; ++i)
       s.save(a.data(), a.size(), i);

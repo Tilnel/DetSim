@@ -597,6 +597,18 @@ case capability, not full language/runtime or exhaustive interleaving support.
 Go gc/gccgo concurrency and OpenJDK conditional target remain separately pending.
 
 
+Current immutable22 reruns of the Rust/Condition matrix independently pass all
+12 rows: four healthy completions and eight exact omitted/duplicated-output
+violations, with 36 raw terminal replays. The six native commands were rerun;
+source/binary/plugin/config hashes, 1,409 rootfs input entries and 24 absent owned
+PIDs were checked. Rust visits 45/45, 41/40 and 41/41 states (full/pages by variant);
+Python visits 410/410, 390/390 and 392/392. Helper provenance identifies the
+committed adaptive polling version. Evidence:
+build/case-jobs/iteration22-concurrency-audit/results.json. This does not establish
+backend exploration equivalence or exhaustive thread scheduling. Current22 Go
+concurrency rows are still running and are not counted from provisional stdout.
+
+
 ### RedisLabs library paired case
 
 The independent RedisLabs Raft-library fixture preserves real pre-vote and entry
@@ -674,8 +686,9 @@ embedded helper provenance field; its Git revision and clean product diff plus
 the archived Git blob support historical attribution; an exact helper hash was
 not recorded at launch for that job. Config digests computed by the audit are additional evidence, not original launch-time records. The
 gccgo state-count difference is not a claim of backend exploration equivalence.
-Current22 runtime concurrency reruns remain in progress; older protocol results
-above must not be presented as fresh results from this binary.
+Current22 Rust/Condition concurrency reruns are independently verified above;
+Go concurrency reruns remain in progress. Older Go protocol results must not be
+presented as fresh results from this binary.
 
 
 ### EOF fault backing: native feasibility evidence only
@@ -1000,6 +1013,52 @@ iteration19-runtime-gc-healthy-full); DFS took515.36/516.18s versus prior881.14/
 878.65s. These initial observations have different concurrent host loads and
 include a driver change; they are not a controlled whole-chain speedup estimate.
 The prior900s replay deadline failures remain recorded; retries declare1800s.
+
+### Streaming validation of new encoded records
+
+A 10-second DWARF perf sample of a real gc Go healthy full DFS contains 1,586
+stacks with no lost samples. Of these, 27.8% pass through full decompression in
+encoded packed save: new records allocate a raw image just to validate it, then
+publish only the supplied compressed frame. This is a tracer CPU stack share,
+not wall-time attribution. Raw data and classification:
+build/case-jobs/iteration22-go-full-profile/analysis.json.
+
+New encoded keys now validate the complete single frame through 128 KiB output
+scratch, checking exact decoded length, complete input consumption, errors and
+no-progress. Duplicate keys retain exact raw-byte collision comparison; public
+load/decompress and persisted bytes, formats and identity are unchanged. Only
+streaming window-too-large errors fall back to the original complete decoder,
+preserving valid advertised windows above the streaming API limit. This is not
+a total-memory bound: compressed input copies, Zstd history/context memory and
+wide-window fallback allocations remain.
+
+Allocation and wide-window compatibility regressions each failed before their
+fix. Final packed/storage/cache/metadata/tool, page-snapshot and state-I/O gates,
+29 native ptrace scenarios, eight input and four pthread rows pass. Independent
+raw audits verify 48 case replays, plus four quorum rows with 444 executed actions
+and 12 terminal replays. NP1/NP3/NP4 production builds, clang analysis and make
+check pass. Evidence: build/packed-stream-validation/ and build/packed-stream-audit/.
+
+Three alternating old22/new23 pairs reuse tests/zero_guard_benchmark.py with a
+192 MiB private zero guard and the same adaptive driver. Every one of 24 rows
+searches 18 states and passes three terminal replays. Median whole-driver seconds
+include startup, search, restore, checking, replay and cleanup; compilation/native
+oracles are excluded:
+
+| Backend / guard restore | Baseline | Streaming | Change |
+| --- | ---: | ---: | ---: |
+| full / write | 13.988 | 13.478 | -3.65% |
+| full / discard | 14.149 | 12.846 | -9.21% |
+| pages / write | 4.287 | 3.586 | -16.34% |
+| pages / discard | 3.243 | 3.093 | -4.62% |
+
+Full-mode median GNU time command maximum RSS falls from 630,280 to 433,980 KiB
+(write), and 629,752 to 434,008 KiB (discard), about 192 MiB less; page-mode RSS is
+nearly unchanged. This is command maximum RSS, not aggregate process memory.
+Other module/runtime jobs ran concurrently; paired gains vary substantially.
+These are synthetic whole-case measurements, not Redis throughput or a general
+speedup guarantee. Raw trials: build/packed-stream-whole-benchmark/run-ldv5lw7m/
+results.json; independent audit: build/packed-stream-audit/benchmark-audit.json.
 
 ### Offline module evidence validation
 
